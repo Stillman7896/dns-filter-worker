@@ -12,7 +12,7 @@ const BLOCKLIST_URL =
 const UPSTREAM = 'https://dns.quad9.net/dns-query';
 const DNS_MEDIA_TYPE = 'application/dns-message';
 const BLOCKLIST_CACHE_KEY = 'https://blocklist.internal/v1';
-const BLOCKLIST_TTL = 6 * 60 * 60; // seconds
+const BLOCKLIST_TTL = 24 * 60 * 60; // seconds
 
 const blocklist = new Blocklist();
 
