@@ -121,6 +121,56 @@ export async function handleApi(request, env, url, rules) {
     return json({ ok: true, added: unique.length, skipped });
   }
 
+  // ---- logs (D1) ----
+  const logs = env.LOGS;
+
+  // DELETE /api/logs/:id  -> delete one row
+  if (path.startsWith('/api/logs/') && request.method === 'DELETE') {
+    const id = path.slice('/api/logs/'.length);
+    if (!/^\d+$/.test(id)) return json({ error: 'bad id' }, { status: 400 });
+    await logs.prepare('DELETE FROM dns_logs WHERE id = ?').bind(parseInt(id, 10)).run();
+    return json({ ok: true });
+  }
+
+  if (path === '/api/logs') {
+    const search = (url.searchParams.get('search') || '').trim();
+    const status = url.searchParams.get('status') || '';
+
+    // GET /api/logs?search=&status=&limit=&offset=
+    if (request.method === 'GET') {
+      const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 500);
+      const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0);
+
+      let where = '';
+      const args = [];
+      if (search) { where += ' WHERE domain LIKE ?'; args.push('%' + search + '%'); }
+      if (status) { where += (where ? ' AND' : ' WHERE') + ' status = ?'; args.push(status); }
+
+      const total = (await logs.prepare('SELECT COUNT(*) AS n FROM dns_logs' + where).bind(...args).first()).n;
+      const { results } = await logs
+        .prepare('SELECT id, domain, status, filter, ts FROM dns_logs' + where + ' ORDER BY ts DESC LIMIT ? OFFSET ?')
+        .bind(...args, limit, offset)
+        .all();
+
+      return json({ logs: results, total });
+    }
+
+    // DELETE /api/logs?search=&status=&clear=1  -> delete matching (or all with clear=1)
+    if (request.method === 'DELETE') {
+      let where = '';
+      const args = [];
+      if (search) { where += ' WHERE domain LIKE ?'; args.push('%' + search + '%'); }
+      if (status) { where += (where ? ' AND' : ' WHERE') + ' status = ?'; args.push(status); }
+
+      if (!where && url.searchParams.get('clear') !== '1') {
+        return json({ error: 'use ?clear=1 to delete all logs' }, { status: 400 });
+      }
+
+      await logs.prepare('DELETE FROM dns_logs' + where).bind(...args).run();
+      return json({ ok: true });
+    }
+  }
+
   return json({ error: 'not found' }, { status: 404 });
 }
 
@@ -226,6 +276,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <button class="tab active" data-tab="single">Add rule</button>
       <button class="tab" data-tab="bulk">Bulk import</button>
       <button class="tab" data-tab="test">Test domain</button>
+      <button class="tab" data-tab="logs">Logs</button>
     </div>
 
     <section id="tab-single" class="tab-panel">
