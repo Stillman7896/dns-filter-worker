@@ -1,5 +1,4 @@
-
-const BLOCKLIST_URL =
+export const BLOCKLIST_URL =
   'https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/pro-plus/domains';
 
 export class Blocklist {
@@ -64,3 +63,5 @@ export class Blocklist {
     }
   }
 }
+
+export { BLOCKLIST_URL };
