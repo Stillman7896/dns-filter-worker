@@ -63,5 +63,3 @@ export class Blocklist {
     }
   }
 }
-
-export { BLOCKLIST_URL };
