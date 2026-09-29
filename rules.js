@@ -1,12 +1,3 @@
-
-// Storage layout:
-//   key   = "rule:<domain>"
-//   value = "allow" | "deny"
-//
-// We keep an in-isolate cache so hot lookups don't hit KV on every query.
-// The cache is invalidated by bumping a version key that every isolate
-// re-checks at most once per CACHE_TTL_MS.
-
 const VERSION_KEY = 'rules:version';
 const CACHE_TTL_MS = 30_000; // how long an isolate trusts its cached rules
 const KEY_PREFIX = 'rule:';
@@ -14,26 +5,20 @@ const KEY_PREFIX = 'rule:';
 export class RuleStore {
   constructor(kv) {
     this.kv = kv;
-
-    /** @type {Map<string, 'allow'|'deny'>} */
-    this.cache = new Map();
+    this.cache = new Map(); // domain -> 'allow'|'deny'
     this.cachedVersion = null;
     this.cachedAt = 0;
   }
 
-  /** Refresh rules from KV if the version changed or TTL expired. */
   async refresh(force = false) {
     const now = Date.now();
-    if (!force && this.cachedAt && now - this.cachedAt < CACHE_TTL_MS) {
-      return;
-    }
+    if (!force && this.cachedAt && now - this.cachedAt < CACHE_TTL_MS) return;
 
     let version;
     try {
       version = (await this.kv.get(VERSION_KEY)) || '0';
     } catch {
-      // KV unavailable — keep serving from stale cache rather than fail closed.
-      this.cachedAt = now;
+      this.cachedAt = now; // keep serving stale rather than fail closed
       return;
     }
 
@@ -42,8 +27,6 @@ export class RuleStore {
       return;
     }
 
-    // List all rules. Hagezi-scale custom rules are user-curated and small
-    // (thousands at most), so a single list() is fine.
     const map = new Map();
     let cursor;
     do {
@@ -51,13 +34,10 @@ export class RuleStore {
       cursor = page.list_complete ? undefined : page.cursor;
 
       const keys = page.keys.map((k) => k.name);
-      // KV doesn't support multi-get; fan out. Cap concurrency to be polite.
       const CONC = 20;
       for (let i = 0; i < keys.length; i += CONC) {
         const batch = keys.slice(i, i + CONC);
-        const values = await Promise.all(
-          batch.map((k) => this.kv.get(k, 'text'))
-        );
+        const values = await Promise.all(batch.map((k) => this.kv.get(k, 'text')));
         for (let j = 0; j < batch.length; j++) {
           const v = values[j];
           if (v === 'allow' || v === 'deny') {
@@ -73,34 +53,34 @@ export class RuleStore {
   }
 
   /**
-   * Returns 'allow' | 'deny' | null for a domain, using subdomain-walk
-   * precedence so `example.com` in the allowlist also allows `a.example.com`.
+   * Returns the winning rule for a domain: { kind, at } where `at` is the
+   * rule that matched (may be a parent of `domain`).
    *
-   * Allow is checked first across all parents; if any parent is allowed,
-   * the request is allowed. Otherwise the *most specific* deny wins.
+   * Allow wins globally across all parent levels; otherwise the most specific
+   * deny wins.
+   * @param {string} domain
+   * @returns {{kind:'allow'|'deny', at:string}|null}
    */
-  lookup(domain) {
+  match(domain) {
     const map = this.cache;
     if (map.size === 0) return null;
 
     let d = domain;
     if (d.charCodeAt(d.length - 1) === 46) d = d.slice(0, -1);
 
-    // Walk labels, check allow first at every level (allow wins globally),
-    // and remember the first deny we hit (most specific deny).
     let denyHit = null;
     for (;;) {
       const hit = map.get(d);
-      if (hit === 'allow') return 'allow';
-      if (hit === 'deny' && denyHit === null) denyHit = 'deny';
+      if (hit === 'allow') return { kind: 'allow', at: d };
+      if (hit === 'deny' && denyHit === null) denyHit = { kind: 'deny', at: d };
 
       const dot = d.indexOf('.');
       if (dot === -1) break;
       d = d.slice(dot + 1);
       if (d.indexOf('.') === -1) {
         const last = map.get(d);
-        if (last === 'allow') return 'allow';
-        if (last === 'deny' && denyHit === null) denyHit = 'deny';
+        if (last === 'allow') return { kind: 'allow', at: d };
+        if (last === 'deny' && denyHit === null) denyHit = { kind: 'deny', at: d };
         break;
       }
     }
@@ -108,7 +88,15 @@ export class RuleStore {
     return denyHit;
   }
 
-  /** Add or replace a rule. kind = 'allow' | 'deny'. */
+  /**
+   * @param {string} domain
+   * @returns {'allow'|'deny'|null}
+   */
+  lookup(domain) {
+    const m = this.match(domain);
+    return m ? m.kind : null;
+  }
+
   async put(domain, kind) {
     const d = normalizeDomain(domain);
     if (!d) throw new Error('invalid domain');
@@ -116,10 +104,9 @@ export class RuleStore {
 
     await this.kv.put(KEY_PREFIX + d, kind);
     await this.kv.put(VERSION_KEY, String(Date.now()));
-    this.cachedVersion = null; // force refresh next lookup
+    this.cachedVersion = null;
   }
 
-  /** Delete a rule. Returns true if it existed. */
   async delete(domain) {
     const d = normalizeDomain(domain);
     if (!d) throw new Error('invalid domain');
@@ -131,41 +118,31 @@ export class RuleStore {
     return true;
   }
 
-  /** List all rules for the dashboard. */
   async list() {
     const out = [];
-    const map = this.cache;
-    for (const [domain, kind] of map) out.push({ domain, kind });
+    for (const [domain, kind] of this.cache) out.push({ domain, kind });
     out.sort((a, b) => a.domain.localeCompare(b.domain));
     return out;
   }
 }
 
-/**
- * Normalize a user-entered domain: strip scheme, path, leading `*.`,
- * lowercase, strip trailing dot. Returns '' if invalid.
- */
 export function normalizeDomain(raw) {
   if (typeof raw !== 'string') return '';
   let s = raw.trim().toLowerCase();
   if (!s) return '';
 
-  // Strip scheme + path
   s = s.replace(/^[a-z]+:\/\//, '');
   const slash = s.indexOf('/');
   if (slash !== -1) s = s.slice(0, slash);
 
-  // Strip port
   const colon = s.lastIndexOf(':');
   if (colon !== -1 && /^\d+$/.test(s.slice(colon + 1))) s = s.slice(0, colon);
 
-  // Strip leading wildcard / leading dot
   if (s.startsWith('*.')) s = s.slice(2);
   else if (s.startsWith('.')) s = s.slice(1);
 
   if (s.endsWith('.')) s = s.slice(0, -1);
 
-  // Basic validation: at least one dot, labels 1..63, total ≤ 253
   if (s.length < 3 || s.length > 253) return '';
   if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(s)) {
     return '';
