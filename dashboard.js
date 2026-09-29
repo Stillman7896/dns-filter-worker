@@ -1,7 +1,10 @@
-
 import { normalizeDomain } from './rules.js';
 
 const SESSION_COOKIE = 'dns_dash_session';
+
+function isConfigured(env) {
+  return typeof env.DASHBOARD_PASSWORD === 'string' && env.DASHBOARD_PASSWORD.length > 0;
+}
 
 /** Constant-time-ish string compare. */
 function safeEqual(a, b) {
@@ -12,32 +15,12 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
+/** Session is valid only if the cookie matches the configured password. */
 function authOk(request, env) {
-  if (!env.DASHBOARD_PASSWORD) return false;
-
-  // Cookie session
   const cookie = request.headers.get('cookie') || '';
   const m = cookie.match(/(?:^|;\s*)dns_dash_session=([^;]+)/);
-  if (m && safeEqual(decodeURIComponent(m[1]), env.DASHBOARD_PASSWORD)) return true;
-
-  // Basic auth (curl-friendly)
-  const auth = request.headers.get('authorization') || '';
-  if (auth.startsWith('Basic ')) {
-    try {
-      const decoded = atob(auth.slice(6));
-      const colon = decoded.indexOf(':');
-      const user = decoded.slice(0, colon);
-      const pass = decoded.slice(colon + 1);
-      if (user === 'admin' && safeEqual(pass, env.DASHBOARD_PASSWORD)) return true;
-    } catch {}
-  }
-
-  // Bearer token
-  if (auth.startsWith('Bearer ')) {
-    if (safeEqual(auth.slice(7), env.DASHBOARD_PASSWORD)) return true;
-  }
-
-  return false;
+  if (!m) return false;
+  return safeEqual(decodeURIComponent(m[1]), env.DASHBOARD_PASSWORD);
 }
 
 function json(body, init = {}) {
@@ -51,21 +34,51 @@ function json(body, init = {}) {
   });
 }
 
-/** Routes under /api/*. */
 export async function handleApi(request, env, url, rules) {
+  // ---- Login: POST /api/session { password } or Authorization: Bearer <pw> ----
+  if (url.pathname === '/api/session' && request.method === 'POST') {
+    if (!isConfigured(env)) {
+      return json({ error: 'Password not configured', code: 'unconfigured' }, { status: 503 });
+    }
+
+    let password = null;
+    const auth = request.headers.get('authorization') || '';
+    if (auth.startsWith('Bearer ')) password = auth.slice(7);
+    if (!password) {
+      try {
+        const b = await request.json();
+        if (b && typeof b.password === 'string') password = b.password;
+      } catch {}
+    }
+    if (!password || !safeEqual(password, env.DASHBOARD_PASSWORD)) {
+      return json({ error: 'Invalid password' }, { status: 401 });
+    }
+
+    const res = json({ ok: true });
+    res.headers.append(
+      'Set-Cookie',
+      `${SESSION_COOKIE}=${encodeURIComponent(env.DASHBOARD_PASSWORD)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400`
+    );
+    return res;
+  }
+
+  // ---- Everything else requires a valid session ----
+  if (!isConfigured(env)) {
+    return json({ error: 'Password not configured', code: 'unconfigured' }, { status: 503 });
+  }
   if (!authOk(request, env)) {
-    return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="dns"' } });
+    // No WWW-Authenticate header -> the browser will NOT show its native
+    // username/password dialog. The UI handles 401 itself.
+    return json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   const path = url.pathname;
 
-  // GET /api/rules
   if (path === '/api/rules' && request.method === 'GET') {
     await rules.refresh(true);
     return json({ rules: await rules.list() });
   }
 
-  // POST /api/rules  { domain, kind }
   if (path === '/api/rules' && request.method === 'POST') {
     let body;
     try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
@@ -80,7 +93,6 @@ export async function handleApi(request, env, url, rules) {
     return json({ ok: true, domain, kind: body.kind });
   }
 
-  // DELETE /api/rules?domain=example.com
   if (path === '/api/rules' && request.method === 'DELETE') {
     const domain = normalizeDomain(url.searchParams.get('domain') || '');
     if (!domain) return json({ error: 'invalid domain' }, { status: 400 });
@@ -88,7 +100,6 @@ export async function handleApi(request, env, url, rules) {
     return json({ ok: true, existed });
   }
 
-  // POST /api/rules/bulk  { kind, domains: "a.com\nb.com" }
   if (path === '/api/rules/bulk' && request.method === 'POST') {
     let body;
     try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
@@ -105,26 +116,14 @@ export async function handleApi(request, env, url, rules) {
       const d = normalizeDomain(line);
       if (d) added.push(d); else if (line.trim()) skipped.push(line.trim());
     }
-    // Dedupe
     const unique = [...new Set(added)];
     await Promise.all(unique.map((d) => rules.put(d, body.kind)));
     return json({ ok: true, added: unique.length, skipped });
   }
 
-  // GET /api/login (POST to set session cookie)
-  if (path === '/api/session' && request.method === 'POST') {
-    const res = new Response('', { status: 204 });
-    res.headers.append(
-      'Set-Cookie',
-      `${SESSION_COOKIE}=${encodeURIComponent(env.DASHBOARD_PASSWORD)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400`
-    );
-    return res;
-  }
-
   return json({ error: 'not found' }, { status: 404 });
 }
 
-/** Serve the /dashboard HTML page. */
 export function serveDashboard() {
   return new Response(DASHBOARD_HTML, {
     headers: {
@@ -158,12 +157,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     font:inherit; background:var(--panel); color:var(--fg);
     border:1px solid var(--border); border-radius:6px; padding:8px 12px;
   }
-  input[type=text] { flex:1; min-width:220px; }
+  input[type=text], input[type=password] { flex:1; min-width:220px; }
   textarea { width:100%; min-height:100px; font-family:ui-monospace,monospace; }
   button { cursor:pointer; background:var(--blue); border-color:transparent; color:#fff; font-weight:600; }
   button.ghost { background:transparent; border-color:var(--border); color:var(--fg); font-weight:400; }
   button.danger { background:transparent; border-color:var(--red); color:var(--red); }
   button:hover { filter:brightness(1.1); }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:20px; max-width:420px; }
   table { width:100%; border-collapse:collapse; background:var(--panel);
           border:1px solid var(--border); border-radius:8px; overflow:hidden; }
   th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); }
@@ -173,8 +173,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }
   .pill.allow { background:rgba(63,185,80,0.15); color:var(--green); }
   .pill.deny  { background:rgba(248,81,73,0.15); color:var(--red); }
-  .pill.blocked { background:rgba(248,81,73,0.15); color:var(--red); }
   .pill.allowed { background:rgba(63,185,80,0.15); color:var(--green); }
+  .pill.blocked { background:rgba(248,81,73,0.15); color:var(--red); }
   .muted { color:var(--muted); }
   .tabs { display:flex; gap:4px; margin-bottom:16px; }
   .tab { padding:8px 16px; border-radius:6px; cursor:pointer; border:1px solid transparent;
@@ -187,6 +187,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   #status.err { color:var(--red); }
   #status.ok { color:var(--green); }
   code { background:var(--panel); padding:2px 6px; border-radius:4px; font-size:12px; }
+  .banner { background:rgba(210,153,34,0.12); border:1px solid var(--yellow); color:var(--yellow);
+            padding:12px 14px; border-radius:6px; margin-bottom:16px; }
 </style>
 </head>
 <body>
@@ -199,11 +201,23 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </header>
 
 <main>
+  <div id="unconfigured-view" class="hidden">
+    <div class="card">
+      <h2 style="margin-top:0;">Dashboard disabled</h2>
+      <p>No <code>DASHBOARD_PASSWORD</code> secret is configured. Set it to enable rule management:</p>
+      <pre style="background:var(--panel);border:1px solid var(--border);padding:10px;border-radius:6px;overflow:auto;">wrangler secret put DASHBOARD_PASSWORD</pre>
+      <p class="muted">DoH filtering still works without it — only the dashboard is disabled.</p>
+    </div>
+  </div>
+
   <div id="login-view" class="hidden">
-    <p class="muted">Enter the dashboard password to manage rules.</p>
-    <div class="row">
-      <input type="password" id="pw" placeholder="Password" autocomplete="current-password">
-      <button id="login-btn">Sign in</button>
+    <div class="card">
+      <h2 style="margin-top:0;">Sign in</h2>
+      <p class="muted">Manage custom allow/deny rules.</p>
+      <div class="row">
+        <input type="password" id="pw" placeholder="Dashboard password" autocomplete="current-password">
+        <button id="login-btn">Sign in</button>
+      </div>
     </div>
   </div>
 
@@ -214,7 +228,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <button class="tab" data-tab="test">Test domain</button>
     </div>
 
-    <!-- Single add -->
     <section id="tab-single" class="tab-panel">
       <div class="row">
         <input type="text" id="domain" placeholder="example.com (blocks *.example.com)">
@@ -227,7 +240,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <p class="muted">Allow always wins over deny and over the remote blocklist.</p>
     </section>
 
-    <!-- Bulk -->
     <section id="tab-bulk" class="tab-panel hidden">
       <div class="row">
         <select id="bulk-kind">
@@ -241,7 +253,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
          full URLs are accepted and normalized.</p>
     </section>
 
-    <!-- Test -->
     <section id="tab-test" class="tab-panel hidden">
       <div class="row">
         <input type="text" id="test-domain" placeholder="sub.example.com">
@@ -281,6 +292,7 @@ async function api(path, opts = {}) {
     ...opts,
   });
   if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  if (res.status === 503) { showUnconfigured(); throw new Error('unconfigured'); }
   if (!res.ok) {
     const t = await res.text();
     throw new Error(t || 'HTTP ' + res.status);
@@ -289,13 +301,22 @@ async function api(path, opts = {}) {
 }
 
 function showLogin() {
+  $('unconfigured-view').classList.add('hidden');
   $('login-view').classList.remove('hidden');
   $('app-view').classList.add('hidden');
   $('logout').classList.add('hidden');
-  $('auth-status').textContent = 'not signed in';
+  $('auth-status').textContent = '';
+}
+function showUnconfigured() {
+  $('login-view').classList.add('hidden');
+  $('app-view').classList.add('hidden');
+  $('unconfigured-view').classList.remove('hidden');
+  $('logout').classList.add('hidden');
+  $('auth-status').textContent = '';
 }
 function showApp() {
   $('login-view').classList.add('hidden');
+  $('unconfigured-view').classList.add('hidden');
   $('app-view').classList.remove('hidden');
   $('logout').classList.remove('hidden');
   $('auth-status').textContent = 'signed in';
@@ -308,7 +329,7 @@ async function loadRules() {
     RULES = data.rules || [];
     render();
   } catch (e) {
-    if (e.message !== 'unauthorized') setStatus(e.message, 'err');
+    if (e.message !== 'unauthorized' && e.message !== 'unconfigured') setStatus(e.message, 'err');
   }
 }
 
@@ -350,13 +371,18 @@ function render() {
   tbody.replaceChildren(frag);
 }
 
-// --- auth ---
+// --- auth: single in-page form ---
 $('login-btn').onclick = async () => {
   const pw = $('pw').value;
   if (!pw) return;
   try {
-    const res = await fetch('/api/session', { method: 'POST', headers: { Authorization: 'Bearer ' + pw } });
-    if (!res.ok) { setStatus('Invalid password', 'err'); return; }
+    const res = await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }),
+    });
+    if (res.status === 503) { showUnconfigured(); return; }
+    if (!res.ok) { setStatus('Incorrect password', 'err'); return; }
     $('pw').value = '';
     showApp();
   } catch { setStatus('Login failed', 'err'); }
@@ -405,12 +431,11 @@ $('bulk-add').onclick = async () => {
 };
 
 // --- test ---
-$('test-btn').onclick = async () => {
+$('test-btn').onclick = () => {
   const domain = $('test-domain').value.trim().toLowerCase();
   if (!domain) return;
   const el = $('test-result');
 
-  // Subdomain-walk locally against the loaded rule set.
   const map = new Map(RULES.map((r) => [r.domain, r.kind]));
   if (map.size === 0) { el.textContent = 'No rules loaded.'; return; }
 
@@ -435,8 +460,7 @@ $('test-btn').onclick = async () => {
 
   if (result) {
     el.innerHTML = '<span class="pill ' + (result.kind === 'allow' ? 'allowed' : 'blocked') + '">' +
-      (result.kind === 'allow' ? 'ALLOWED' : 'BLOCKED') + '</span> by rule <code>' +
-      result.at + '</code>';
+      (result.kind === 'allow' ? 'ALLOWED' : 'BLOCKED') + '</span> by rule <code>' + result.at + '</code>';
   } else {
     el.textContent = 'No custom rule matches — falls through to the remote blocklist.';
   }
@@ -444,11 +468,13 @@ $('test-btn').onclick = async () => {
 
 $('filter').oninput = render;
 
-// --- bootstrap: probe auth state with an unauthenticated GET ---
+// --- bootstrap: probe auth state without triggering a browser dialog ---
 (async () => {
   try {
     const res = await fetch('/api/rules', { credentials: 'same-origin' });
-    if (res.ok) showApp(); else showLogin();
+    if (res.ok) showApp();
+    else if (res.status === 503) showUnconfigured();
+    else showLogin();
   } catch { showLogin(); }
 })();
 </script>
