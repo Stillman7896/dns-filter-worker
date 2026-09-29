@@ -1,3 +1,4 @@
+// worker.js — DoH filter: remote blocklist + custom allow/deny (KV) + dashboard
 import { Blocklist, BLOCKLIST_URL } from './blocklist.js';
 import { RuleStore } from './rules.js';
 import { handleApi } from './dashboard.js';
