@@ -16,3 +16,8 @@ persist = true
 enabled = true
 head_sampling_rate = 1
 persist = true
+
+[[d1_databases]]
+binding = "LOGS"
+database_name = "dns-logs"
+database_id = "295f7331-0f31-42bb-8610-640eb0e38de5"
