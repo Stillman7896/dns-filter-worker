@@ -48,18 +48,28 @@ export class Blocklist {
     this.loadedAt = Date.now();
   }
 
-  isBlocked(domain) {
+  /**
+   * Returns the exact blocklist entry that matches `domain` (walking up
+   * parent labels), or null if not blocked.
+   * @param {string} domain
+   * @returns {string|null}
+   */
+  match(domain) {
     const set = this.domains;
     let d = domain;
 
     if (d.charCodeAt(d.length - 1) === 46) d = d.slice(0, -1);
 
     for (;;) {
-      if (set.has(d)) return true;
+      if (set.has(d)) return d;
       const dot = d.indexOf('.');
-      if (dot === -1) return false;
+      if (dot === -1) return null;
       d = d.slice(dot + 1);
-      if (d.indexOf('.') === -1) return set.has(d);
+      if (d.indexOf('.') === -1) return set.has(d) ? d : null;
     }
+  }
+
+  isBlocked(domain) {
+    return this.match(domain) !== null;
   }
 }
