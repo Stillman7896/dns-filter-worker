@@ -1,6 +1,6 @@
 import { Blocklist, BLOCKLIST_URL } from './blocklist.js';
 import { RuleStore } from './rules.js';
-import { handleApi, serveDashboard } from './dashboard.js';
+import { handleApi } from './dashboard.js';
 import {
   Buf,
   parseQuestion,
@@ -13,7 +13,7 @@ import {
 const UPSTREAM = 'https://dns.quad9.net/dns-query';
 const DNS_MEDIA_TYPE = 'application/dns-message';
 const BLOCKLIST_CACHE_KEY = 'https://blocklist.internal/v1';
-const BLOCKLIST_TTL = 24 * 60 * 60; // seconds
+const BLOCKLIST_TTL = 6 * 60 * 60; // seconds
 
 // Per-isolate singletons.
 const blocklist = new Blocklist();
@@ -71,6 +71,31 @@ async function decide(name, env) {
   if (custom === 'deny') return { status: 'deny', filter: 'denylist' };
   if (blocklist.isBlocked(name)) return { status: 'blocklist', filter: 'blocklist' };
   return { status: 'none', filter: 'upstream' };
+}
+
+/**
+ * Full pipeline test for the "Test domain" tab. Reports which layer decided
+ * and the exact rule/blocklist entry that matched.
+ */
+async function testDomain(domain) {
+  await ensureBlocklist();
+  await ruleStore.refresh();
+
+  const custom = ruleStore.match(domain); // { kind, at } | null
+  const blockHit = blocklist.match(domain); // entry | null
+
+  let status, filter, matched = null;
+  if (custom && custom.kind === 'allow') {
+    status = 'allow'; filter = 'allowlist'; matched = custom.at;
+  } else if (custom && custom.kind === 'deny') {
+    status = 'deny'; filter = 'denylist'; matched = custom.at;
+  } else if (blockHit) {
+    status = 'blocklist'; filter = 'blocklist'; matched = blockHit;
+  } else {
+    status = 'none'; filter = 'upstream';
+  }
+
+  return { domain, status, filter, matched, blocklistSize: blocklist.size };
 }
 
 // ---- D1 audit logging ----
@@ -132,15 +157,10 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // ---- dashboard UI ----
-    if (url.pathname === '/dashboard' || url.pathname === '/dashboard/') {
-      return serveDashboard();
-    }
-
     // ---- dashboard API ----
     if (url.pathname.startsWith('/api/')) {
       ensureRuleKv(env);
-      return handleApi(request, env, url, ruleStore);
+      return handleApi(request, env, url, ruleStore, testDomain);
     }
 
     // ---- health ----
@@ -158,6 +178,8 @@ export default {
 
     // ---- /dns-query ----
     if (url.pathname !== '/dns-query') {
+      // Not an API/health/DNS path -> serve static dashboard assets.
+      if (env.ASSETS) return env.ASSETS.fetch(request);
       return new Response('Not Found', { status: 404 });
     }
 
