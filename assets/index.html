@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DNS Filter — Dashboard</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
+          --green:#3fb950; --red:#f85149; --blue:#58a6ff; --yellow:#d29922; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--border); display:flex;
+           align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; font-weight:600; }
+  h1 small { color:var(--muted); font-weight:400; margin-left:8px; }
+  main { max-width:1000px; margin:0 auto; padding:24px; }
+  .row { display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
+  input, select, textarea, button {
+    font:inherit; background:var(--panel); color:var(--fg);
+    border:1px solid var(--border); border-radius:6px; padding:8px 12px;
+  }
+  input[type=text], input[type=password] { flex:1; min-width:220px; }
+  textarea { width:100%; min-height:100px; font-family:ui-monospace,monospace; }
+  button { cursor:pointer; background:var(--blue); border-color:transparent; color:#fff; font-weight:600; }
+  button.ghost { background:transparent; border-color:var(--border); color:var(--fg); font-weight:400; }
+  button.danger { background:transparent; border-color:var(--red); color:var(--red); }
+  button:hover:not(:disabled) { filter:brightness(1.1); }
+  button:disabled { opacity:.35; cursor:not-allowed; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:20px; max-width:420px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel);
+          border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); }
+  th { background:#0f141b; font-weight:600; font-size:12px; text-transform:uppercase;
+       letter-spacing:0.05em; color:var(--muted); }
+  tr:last-child td { border-bottom:none; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .pill.allow, .pill.allowed { background:rgba(63,185,80,0.15); color:var(--green); }
+  .pill.deny, .pill.blocked { background:rgba(248,81,73,0.15); color:var(--red); }
+  .pill.none { background:rgba(139,148,158,0.15); color:var(--muted); }
+  .muted { color:var(--muted); }
+  .tabs { display:flex; gap:4px; margin-bottom:16px; flex-wrap:wrap; }
+  .tab { padding:8px 16px; border-radius:6px; cursor:pointer; border:1px solid transparent;
+         background:transparent; color:var(--muted); }
+  .tab.active { background:var(--panel); border-color:var(--border); color:var(--fg); }
+  .hidden { display:none; }
+  .flex { display:flex; gap:8px; align-items:center; }
+  .flex-grow { flex:1; }
+  #status { min-height:22px; margin:8px 0; font-size:13px; }
+  #status.err { color:var(--red); }
+  #status.ok { color:var(--green); }
+  code { background:var(--panel); padding:2px 6px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DNS Filter <small class="muted">dashboard</small></h1>
+  <div class="flex">
+    <span id="auth-status" class="muted"></span>
+    <button id="logout" class="ghost hidden">Sign out</button>
+  </div>
+</header>
+
+<main>
+  <div id="unconfigured-view" class="hidden">
+    <div class="card">
+      <h2 style="margin-top:0;">Dashboard disabled</h2>
+      <p>No <code>DASHBOARD_PASSWORD</code> secret is configured. Set it to enable rule management:</p>
+      <pre style="background:var(--panel);border:1px solid var(--border);padding:10px;border-radius:6px;overflow:auto;">wrangler secret put DASHBOARD_PASSWORD</pre>
+      <p class="muted">DoH filtering still works without it — only the dashboard is disabled.</p>
+    </div>
+  </div>
+
+  <div id="login-view" class="hidden">
+    <div class="card">
+      <h2 style="margin-top:0;">Sign in</h2>
+      <p class="muted">Manage custom allow/deny rules.</p>
+      <div class="row">
+        <input type="password" id="pw" placeholder="Dashboard password" autocomplete="current-password">
+        <button id="login-btn">Sign in</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="app-view" class="hidden">
+    <div class="tabs">
+      <button class="tab active" data-tab="single">Add rule</button>
+      <button class="tab" data-tab="bulk">Bulk import</button>
+      <button class="tab" data-tab="test">Test domain</button>
+      <button class="tab" data-tab="logs">Logs</button>
+    </div>
+
+    <section id="tab-single" class="tab-panel">
+      <div class="row">
+        <input type="text" id="domain" placeholder="example.com (blocks *.example.com)">
+        <select id="kind">
+          <option value="deny">Deny</option>
+          <option value="allow">Allow</option>
+        </select>
+        <button id="add">Add</button>
+      </div>
+      <p class="muted">Allow always wins over deny and over the remote blocklist.</p>
+    </section>
+
+    <section id="tab-bulk" class="tab-panel hidden">
+      <div class="row">
+        <select id="bulk-kind">
+          <option value="deny">Deny</option>
+          <option value="allow">Allow</option>
+        </select>
+        <button id="bulk-add">Import</button>
+      </div>
+      <textarea id="bulk-domains" placeholder="One domain per line…"></textarea>
+      <p class="muted">Comma or newline separated. Wildcards (<code>*.example.com</code>) and
+         full URLs are accepted and normalized.</p>
+    </section>
+
+    <section id="tab-test" class="tab-panel hidden">
+      <div class="row">
+        <input type="text" id="test-domain" placeholder="sub.example.com">
+        <button id="test-btn">Test</button>
+      </div>
+      <p class="muted">Runs the full server-side pipeline: custom allowlist &rarr; custom
+        denylist &rarr; remote Hagezi blocklist &rarr; Quad9.</p>
+      <div id="test-result" class="muted"></div>
+    </section>
+
+    <section id="tab-logs" class="tab-panel hidden">
+      <div class="row">
+        <input type="text" id="log-search" placeholder="Search domain…" style="max-width:240px;">
+        <select id="log-status">
+          <option value="">All statuses</option>
+          <option value="allow">allow</option>
+          <option value="deny">deny</option>
+          <option value="blocklist">blocklist</option>
+          <option value="none">none</option>
+        </select>
+        <select id="log-limit" title="Rows per page">
+          <option value="25">25 / page</option>
+          <option value="50" selected>50 / page</option>
+          <option value="100">100 / page</option>
+        </select>
+        <button id="logs-refresh">Refresh</button>
+        <button id="logs-delete" class="ghost">Delete filtered</button>
+        <button id="logs-clear" class="danger">Clear all</button>
+      </div>
+      <div class="row" style="margin-bottom:8px;">
+        <span class="muted flex-grow" id="logs-count"></span>
+        <button id="logs-prev" class="ghost">&lsaquo; Prev</button>
+        <span class="muted" id="logs-page"></span>
+        <button id="logs-next" class="ghost">Next &rsaquo;</button>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Domain</th><th>Status</th><th>Time</th>
+          <th style="text-align:right;">Actions</th>
+        </tr></thead>
+        <tbody id="logs-body"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </section>
+
+    <div id="status"></div>
+
+    <div id="rules-section">
+      <div class="flex" style="margin:16px 0 8px;">
+        <h2 class="flex-grow" style="font-size:14px;margin:0;">Rules</h2>
+        <input type="text" id="filter" placeholder="Filter…" style="max-width:220px;">
+      </div>
+      <table>
+        <thead><tr><th>Domain</th><th>Kind</th><th></th></tr></thead>
+        <tbody id="rules-body"><tr><td colspan="3" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let RULES = [];
+
+function setStatus(msg, kind) {
+  const el = $('status');
+  el.textContent = msg || '';
+  el.className = kind || '';
+  if (msg) setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 4000);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  if (res.status === 503) { showUnconfigured(); throw new Error('unconfigured'); }
+  if (!res.ok) {
+    let msg;
+    try { const j = await res.json(); msg = j.error || ('HTTP ' + res.status); }
+    catch { msg = 'HTTP ' + res.status; }
+    throw new Error(msg);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+function showLogin() {
+  $('unconfigured-view').classList.add('hidden');
+  $('login-view').classList.remove('hidden');
+  $('app-view').classList.add('hidden');
+  $('logout').classList.add('hidden');
+  $('auth-status').textContent = '';
+}
+function showUnconfigured() {
+  $('login-view').classList.add('hidden');
+  $('app-view').classList.add('hidden');
+  $('unconfigured-view').classList.remove('hidden');
+  $('logout').classList.add('hidden');
+  $('auth-status').textContent = '';
+}
+function showApp() {
+  $('login-view').classList.add('hidden');
+  $('unconfigured-view').classList.add('hidden');
+  $('app-view').classList.remove('hidden');
+  $('logout').classList.remove('hidden');
+  $('auth-status').textContent = 'signed in';
+  loadRules();
+}
+
+async function loadRules() {
+  try {
+    const data = await api('/api/rules');
+    RULES = data.rules || [];
+    render();
+  } catch (e) {
+    if (e.message !== 'unauthorized' && e.message !== 'unconfigured') setStatus(e.message, 'err');
+  }
+}
+
+function render() {
+  const filter = ($('filter').value || '').toLowerCase();
+  const tbody = $('rules-body');
+  const filtered = RULES.filter((r) => r.domain.includes(filter));
+  if (!filtered.length) {
+    tbody.innerHTML = '<tr><td colspan="3" class="muted">' +
+      (RULES.length ? 'No matches.' : 'No custom rules yet.') + '</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const r of filtered) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td');
+    td1.textContent = r.domain;
+    const td2 = document.createElement('td');
+    const pill = document.createElement('span');
+    pill.className = 'pill ' + r.kind;
+    pill.textContent = r.kind;
+    td2.appendChild(pill);
+    const td3 = document.createElement('td');
+    td3.style.textAlign = 'right';
+    const del = document.createElement('button');
+    del.className = 'danger';
+    del.textContent = 'Delete';
+    del.onclick = async () => {
+      try {
+        await api('/api/rules?domain=' + encodeURIComponent(r.domain), { method: 'DELETE' });
+        setStatus('Deleted ' + r.domain, 'ok');
+        loadRules();
+      } catch (e) { setStatus(e.message, 'err'); }
+    };
+    td3.appendChild(del);
+    tr.append(td1, td2, td3);
+    frag.appendChild(tr);
+  }
+  tbody.replaceChildren(frag);
+}
+
+// --- auth: single in-page form ---
+$('login-btn').onclick = async () => {
+  const pw = $('pw').value;
+  if (!pw) return;
+  try {
+    const res = await fetch('/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }),
+    });
+    if (res.status === 503) { showUnconfigured(); return; }
+    if (!res.ok) { setStatus('Incorrect password', 'err'); return; }
+    $('pw').value = '';
+    showApp();
+  } catch { setStatus('Login failed', 'err'); }
+};
+$('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('login-btn').click(); });
+$('logout').onclick = () => {
+  document.cookie = 'dns_dash_session=; Path=/; Max-Age=0';
+  showLogin();
+};
+
+// --- tabs ---
+document.querySelectorAll('.tab').forEach((t) => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === t));
+    document.querySelectorAll('.tab-panel').forEach((p) =>
+      p.classList.toggle('hidden', p.id !== 'tab-' + t.dataset.tab));
+    const isLogs = t.dataset.tab === 'logs';
+    const rs = $('rules-section');
+    if (rs) rs.classList.toggle('hidden', isLogs);
+    if (isLogs && !LOGS_LOADED) loadLogs();
+  };
+});
+
+// --- add ---
+$('add').onclick = async () => {
+  const domain = $('domain').value.trim();
+  if (!domain) return;
+  try {
+    await api('/api/rules', { method: 'POST', body: JSON.stringify({ domain, kind: $('kind').value }) });
+    $('domain').value = '';
+    setStatus('Added ' + domain, 'ok');
+    loadRules();
+  } catch (e) { setStatus(e.message, 'err'); }
+};
+$('domain').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('add').click(); });
+
+// --- bulk ---
+$('bulk-add').onclick = async () => {
+  const domains = $('bulk-domains').value;
+  if (!domains.trim()) return;
+  try {
+    const r = await api('/api/rules/bulk', {
+      method: 'POST',
+      body: JSON.stringify({ domains, kind: $('bulk-kind').value }),
+    });
+    setStatus('Imported ' + r.added + ' rule(s)' + (r.skipped.length ? ', skipped ' + r.skipped.length : ''), 'ok');
+    $('bulk-domains').value = '';
+    loadRules();
+  } catch (e) { setStatus(e.message, 'err'); }
+};
+
+// --- test (server-side, covers blocklist too) ---
+$('test-btn').onclick = doTest;
+$('test-domain').addEventListener('keydown', (e) => { if (e.key === 'Enter') doTest(); });
+
+async function doTest() {
+  const domain = ($('test-domain').value || '').trim().toLowerCase();
+  const el = $('test-result');
+  if (!domain) { el.textContent = ''; return; }
+  el.textContent = 'Testing…';
+  try {
+    const d = await api('/api/test?domain=' + encodeURIComponent(domain));
+    const cls = (d.status === 'allow' || d.status === 'none') ? 'allowed' : 'blocked';
+    let html = '<span class="pill ' + cls + '">' + escapeHtml(d.status.toUpperCase()) +
+               '</span> via <strong>' + escapeHtml(d.filter) + '</strong>';
+    if (d.matched) html += ' &mdash; matched rule <code>' + escapeHtml(d.matched) + '</code>';
+    else if (d.status === 'none') html += ' &mdash; no rule matched, forwarded to upstream';
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = '<span class="pill blocked">ERROR</span> ' + escapeHtml(e.message);
+  }
+}
+
+$('filter').oninput = render;
+
+// --- logs (D1) with pagination ---
+let LOGS = [];
+let LOGS_LOADED = false;
+let logOffset = 0;
+let logLimit = 50;
+let logTotal = 0;
+
+function debounce(fn, ms) {
+  let t;
+  return () => { clearTimeout(t); t = setTimeout(fn, ms); };
+}
+
+function resetLogOffset() { logOffset = 0; }
+
+async function loadLogs() {
+  try {
+    const search = ($('log-search').value || '').trim();
+    const status = $('log-status').value;
+    const qs = 'search=' + encodeURIComponent(search) +
+               '&status=' + encodeURIComponent(status) +
+               '&limit=' + logLimit +
+               '&offset=' + logOffset;
+    const data = await api('/api/logs?' + qs);
+    LOGS = data.logs || [];
+    logTotal = typeof data.total === 'number' ? data.total : LOGS.length;
+    LOGS_LOADED = true;
+    renderLogs();
+    renderPagination();
+  } catch (e) {
+    if (e.message !== 'unauthorized' && e.message !== 'unconfigured') setStatus(e.message, 'err');
+  }
+}
+
+function fmtTime(ts) {
+  try { return new Date(ts).toLocaleString(); } catch { return String(ts); }
+}
+
+function statusPillClass(status) {
+  if (status === 'allow') return 'allowed';
+  if (status === 'none') return 'none';
+  return 'blocked';
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderLogs() {
+  const tbody = $('logs-body');
+  $('logs-count').textContent = logTotal + ' log(s)';
+
+  if (!LOGS.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="muted">No logs' +
+      (logTotal ? ' on this page.' : ' yet.') + '</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const l of LOGS) {
+    const tr = document.createElement('tr');
+
+    const tdD = document.createElement('td');
+    tdD.textContent = l.domain;
+
+    const tdS = document.createElement('td');
+    const pill = document.createElement('span');
+    pill.className = 'pill ' + statusPillClass(l.status);
+    pill.textContent = l.status;
+    tdS.appendChild(pill);
+
+    const tdT = document.createElement('td');
+    tdT.className = 'muted';
+    tdT.textContent = fmtTime(l.ts);
+
+    const tdA = document.createElement('td');
+    tdA.style.textAlign = 'right';
+
+    const btnAllow = document.createElement('button');
+    btnAllow.className = 'ghost';
+    btnAllow.textContent = 'Allow';
+    btnAllow.title = 'Add to allowlist';
+    btnAllow.onclick = () => quickRule(l.domain, 'allow');
+
+    const btnDeny = document.createElement('button');
+    btnDeny.className = 'ghost';
+    btnDeny.textContent = 'Deny';
+    btnDeny.title = 'Add to denylist';
+    btnDeny.onclick = () => quickRule(l.domain, 'deny');
+
+    const btnDel = document.createElement('button');
+    btnDel.className = 'danger';
+    btnDel.textContent = '×';
+    btnDel.title = 'Delete this log row';
+    btnDel.onclick = async () => {
+      try {
+        await api('/api/logs/' + l.id, { method: 'DELETE' });
+        loadLogs();
+      } catch (e) { setStatus(e.message, 'err'); }
+    };
+
+    tdA.append(btnAllow, btnDeny, btnDel);
+    tr.append(tdD, tdS, tdT, tdA);
+    frag.appendChild(tr);
+  }
+  tbody.replaceChildren(frag);
+}
+
+function renderPagination() {
+  const page = Math.floor(logOffset / logLimit) + 1;
+  const pages = Math.max(1, Math.ceil(logTotal / logLimit));
+  $('logs-page').textContent = 'Page ' + page + ' of ' + pages;
+  $('logs-prev').disabled = logOffset === 0;
+  $('logs-next').disabled = logOffset + logLimit >= logTotal;
+}
+
+async function quickRule(domain, kind) {
+  try {
+    await api('/api/rules', { method: 'POST', body: JSON.stringify({ domain, kind }) });
+    setStatus('Added ' + domain + ' to ' + kind + 'list', 'ok');
+    loadRules();
+  } catch (e) { setStatus(e.message, 'err'); }
+}
+
+$('logs-refresh').onclick = loadLogs;
+$('log-search').oninput = debounce(() => { resetLogOffset(); loadLogs(); }, 300);
+$('log-status').onchange = () => { resetLogOffset(); loadLogs(); };
+$('log-limit').onchange = (e) => { logLimit = parseInt(e.target.value, 10) || 50; resetLogOffset(); loadLogs(); };
+$('logs-prev').onclick = () => { logOffset = Math.max(0, logOffset - logLimit); loadLogs(); };
+$('logs-next').onclick = () => { if (logOffset + logLimit < logTotal) { logOffset += logLimit; loadLogs(); } };
+
+$('logs-delete').onclick = async () => {
+  const search = ($('log-search').value || '').trim();
+  const status = $('log-status').value;
+  if (!search && !status) {
+    setStatus('Enter a search or status to delete filtered, or use Clear all', 'err');
+    return;
+  }
+  if (!confirm('Delete matching log rows?')) return;
+  try {
+    await api('/api/logs?search=' + encodeURIComponent(search) +
+              '&status=' + encodeURIComponent(status), { method: 'DELETE' });
+    setStatus('Deleted matching logs', 'ok');
+    resetLogOffset();
+    loadLogs();
+  } catch (e) { setStatus(e.message, 'err'); }
+};
+
+$('logs-clear').onclick = async () => {
+  if (!confirm('Clear ALL logs? This cannot be undone.')) return;
+  try {
+    await api('/api/logs?clear=1', { method: 'DELETE' });
+    setStatus('Cleared all logs', 'ok');
+    resetLogOffset();
+    loadLogs();
+  } catch (e) { setStatus(e.message, 'err'); }
+};
+
+// --- bootstrap: probe auth state without triggering a browser dialog ---
+(async () => {
+  try {
+    const res = await fetch('/api/rules', { credentials: 'same-origin' });
+    if (res.ok) showApp();
+    else if (res.status === 503) showUnconfigured();
+    else showLogin();
+  } catch { showLogin(); }
+})();
+</script>
+</body>
+</html>
