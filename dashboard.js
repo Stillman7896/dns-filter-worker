@@ -123,6 +123,10 @@ export async function handleApi(request, env, url, rules) {
 
   // ---- logs (D1) ----
   const logs = env.LOGS;
+  if (!logs) {
+    // 501 (not 503) so the frontend doesn't mistake this for "password not configured".
+    return json({ error: 'D1 logging not configured', code: 'no_d1' }, { status: 501 });
+  }
 
   // DELETE /api/logs/:id  -> delete one row
   if (path.startsWith('/api/logs/') && request.method === 'DELETE') {
@@ -312,16 +316,44 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div id="test-result" class="muted"></div>
     </section>
 
+    <section id="tab-logs" class="tab-panel hidden">
+      <div class="row">
+        <input type="text" id="log-search" placeholder="Search domain…" style="max-width:260px;">
+        <select id="log-status">
+          <option value="">All statuses</option>
+          <option value="allow">allow</option>
+          <option value="deny">deny</option>
+          <option value="blocklist">blocklist</option>
+          <option value="none">none</option>
+        </select>
+        <button id="logs-refresh">Refresh</button>
+        <button id="logs-delete" class="ghost">Delete filtered</button>
+        <button id="logs-clear" class="danger">Clear all</button>
+      </div>
+      <div class="flex" style="margin-bottom:8px;">
+        <span class="muted flex-grow" id="logs-count"></span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>Domain</th><th>Status</th><th>Filter</th><th>Time</th>
+          <th style="text-align:right;">Actions</th>
+        </tr></thead>
+        <tbody id="logs-body"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </section>
+
     <div id="status"></div>
 
-    <div class="flex" style="margin:16px 0 8px;">
-      <h2 class="flex-grow" style="font-size:14px;margin:0;">Rules</h2>
-      <input type="text" id="filter" placeholder="Filter…" style="max-width:220px;">
+    <div id="rules-section">
+      <div class="flex" style="margin:16px 0 8px;">
+        <h2 class="flex-grow" style="font-size:14px;margin:0;">Rules</h2>
+        <input type="text" id="filter" placeholder="Filter…" style="max-width:220px;">
+      </div>
+      <table>
+        <thead><tr><th>Domain</th><th>Kind</th><th></th></tr></thead>
+        <tbody id="rules-body"><tr><td colspan="3" class="muted">Loading…</td></tr></tbody>
+      </table>
     </div>
-    <table>
-      <thead><tr><th>Domain</th><th>Kind</th><th></th></tr></thead>
-      <tbody id="rules-body"><tr><td colspan="3" class="muted">Loading…</td></tr></tbody>
-    </table>
   </div>
 </main>
 
@@ -345,8 +377,12 @@ async function api(path, opts = {}) {
   if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
   if (res.status === 503) { showUnconfigured(); throw new Error('unconfigured'); }
   if (!res.ok) {
-    const t = await res.text();
-    throw new Error(t || 'HTTP ' + res.status);
+    let msg;
+    try {
+      const j = await res.json();
+      msg = j.error || ('HTTP ' + res.status);
+    } catch { msg = 'HTTP ' + res.status; }
+    throw new Error(msg);
   }
   return res.status === 204 ? null : res.json();
 }
@@ -450,6 +486,10 @@ document.querySelectorAll('.tab').forEach((t) => {
     document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === t));
     document.querySelectorAll('.tab-panel').forEach((p) =>
       p.classList.toggle('hidden', p.id !== 'tab-' + t.dataset.tab));
+    const isLogs = t.dataset.tab === 'logs';
+    const rs = $('rules-section');
+    if (rs) rs.classList.toggle('hidden', isLogs);
+    if (isLogs) loadLogs();
   };
 });
 
@@ -518,6 +558,139 @@ $('test-btn').onclick = () => {
 };
 
 $('filter').oninput = render;
+
+// --- logs (D1) ---
+let LOGS = [];
+
+function debounce(fn, ms) {
+  let t;
+  return () => { clearTimeout(t); t = setTimeout(fn, ms); };
+}
+
+async function loadLogs() {
+  try {
+    const search = ($('log-search').value || '').trim();
+    const status = $('log-status').value;
+    const qs = 'search=' + encodeURIComponent(search) +
+               '&status=' + encodeURIComponent(status) +
+               '&limit=200';
+    const data = await api('/api/logs?' + qs);
+    LOGS = data.logs || [];
+    renderLogs(data.total);
+  } catch (e) {
+    if (e.message !== 'unauthorized' && e.message !== 'unconfigured') setStatus(e.message, 'err');
+  }
+}
+
+function fmtTime(ts) {
+  try { return new Date(ts).toLocaleString(); } catch { return String(ts); }
+}
+
+function statusPillClass(status) {
+  return status === 'allow' || status === 'none' ? 'allowed' : 'blocked';
+}
+
+function renderLogs(total) {
+  const tbody = $('logs-body');
+  const shown = LOGS.length;
+  const t = (typeof total === 'number') ? total : shown;
+  $('logs-count').textContent = (t + ' log(s)') + (shown && t > shown ? ' — showing ' + shown : '');
+
+  if (!shown) {
+    tbody.innerHTML = '<tr><td colspan="5" class="muted">No logs yet.</td></tr>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const l of LOGS) {
+    const tr = document.createElement('tr');
+
+    const tdD = document.createElement('td');
+    tdD.textContent = l.domain;
+
+    const tdS = document.createElement('td');
+    const pill = document.createElement('span');
+    pill.className = 'pill ' + statusPillClass(l.status);
+    pill.textContent = l.status;
+    tdS.appendChild(pill);
+
+    const tdF = document.createElement('td');
+    tdF.className = 'muted';
+    tdF.textContent = l.filter;
+
+    const tdT = document.createElement('td');
+    tdT.className = 'muted';
+    tdT.textContent = fmtTime(l.ts);
+
+    const tdA = document.createElement('td');
+    tdA.style.textAlign = 'right';
+
+    // Quick actions: add this domain to allow/deny rules
+    const btnAllow = document.createElement('button');
+    btnAllow.className = 'ghost';
+    btnAllow.textContent = 'Allow';
+    btnAllow.title = 'Add to allowlist';
+    btnAllow.onclick = () => quickRule(l.domain, 'allow');
+
+    const btnDeny = document.createElement('button');
+    btnDeny.className = 'ghost';
+    btnDeny.textContent = 'Deny';
+    btnDeny.title = 'Add to denylist';
+    btnDeny.onclick = () => quickRule(l.domain, 'deny');
+
+    const btnDel = document.createElement('button');
+    btnDel.className = 'danger';
+    btnDel.textContent = '×';
+    btnDel.title = 'Delete this log row';
+    btnDel.onclick = async () => {
+      try {
+        await api('/api/logs/' + l.id, { method: 'DELETE' });
+        loadLogs();
+      } catch (e) { setStatus(e.message, 'err'); }
+    };
+
+    tdA.append(btnAllow, btnDeny, btnDel);
+    tr.append(tdD, tdS, tdF, tdT, tdA);
+    frag.appendChild(tr);
+  }
+  tbody.replaceChildren(frag);
+}
+
+async function quickRule(domain, kind) {
+  try {
+    await api('/api/rules', { method: 'POST', body: JSON.stringify({ domain, kind }) });
+    setStatus('Added ' + domain + ' to ' + kind + 'list', 'ok');
+    loadRules();
+  } catch (e) { setStatus(e.message, 'err'); }
+}
+
+$('logs-refresh').onclick = loadLogs;
+$('log-search').oninput = debounce(loadLogs, 300);
+$('log-status').onchange = loadLogs;
+
+$('logs-delete').onclick = async () => {
+  const search = ($('log-search').value || '').trim();
+  const status = $('log-status').value;
+  if (!search && !status) {
+    setStatus('Enter a search or status to delete filtered, or use Clear all', 'err');
+    return;
+  }
+  if (!confirm('Delete matching log rows?')) return;
+  try {
+    await api('/api/logs?search=' + encodeURIComponent(search) +
+              '&status=' + encodeURIComponent(status), { method: 'DELETE' });
+    setStatus('Deleted matching logs', 'ok');
+    loadLogs();
+  } catch (e) { setStatus(e.message, 'err'); }
+};
+
+$('logs-clear').onclick = async () => {
+  if (!confirm('Clear ALL logs? This cannot be undone.')) return;
+  try {
+    await api('/api/logs?clear=1', { method: 'DELETE' });
+    setStatus('Cleared all logs', 'ok');
+    loadLogs();
+  } catch (e) { setStatus(e.message, 'err'); }
+};
 
 // --- bootstrap: probe auth state without triggering a browser dialog ---
 (async () => {
