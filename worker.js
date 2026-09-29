@@ -1,5 +1,4 @@
-// worker.js — DoH filter: remote blocklist + custom allow/deny + dashboard
-import { Blocklist } from './blocklist.js';
+import { Blocklist, BLOCKLIST_URL } from './blocklist.js';
 import { RuleStore } from './rules.js';
 import { handleApi, serveDashboard } from './dashboard.js';
 import {
@@ -11,25 +10,22 @@ import {
   base64urlDecode,
 } from './dns.js';
 
-const BLOCKLIST_URL =
-  'https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/pro-plus/domains';
 const UPSTREAM = 'https://dns.quad9.net/dns-query';
 const DNS_MEDIA_TYPE = 'application/dns-message';
 const BLOCKLIST_CACHE_KEY = 'https://blocklist.internal/v1';
-const BLOCKLIST_TTL = 6 * 60 * 60; // seconds
+const BLOCKLIST_TTL = 24 * 60 * 60; // seconds
 
-// Per-isolate singletons. The RuleStore is backed by env.RULES, which we
-// only get per-request, so it's created lazily and memoized per isolate.
+// Per-isolate singletons.
 const blocklist = new Blocklist();
-let ruleStore = null;
-let ruleStoreKv = null;
+const ruleStore = new RuleStore(null);
+let ruleKv = null;
 
-function getRules(env) {
-  if (!ruleStore || ruleStoreKv !== env.RULES) {
-    ruleStore = new RuleStore(env.RULES);
-    ruleStoreKv = env.RULES;
+function ensureRuleKv(env) {
+  if (env.RULES !== ruleKv) {
+    ruleKv = env.RULES;
+    ruleStore.kv = env.RULES;
+    ruleStore.cachedVersion = null; // reset cache across binding changes
   }
-  return ruleStore;
 }
 
 async function ensureBlocklist() {
@@ -63,28 +59,54 @@ async function forwardToQuad9(queryBuf) {
 }
 
 /**
- * Decision pipeline for a QNAME:
- *   1. Custom allowlist (KV)     → pass through
- *   2. Custom denylist  (KV)     → NXDOMAIN
- *   3. Remote blocklist          → NXDOMAIN
- *   4. Otherwise                 → forward to Quad9
+ * Decision pipeline for a QNAME.
+ * Returns { status, filter }:
+ *   status: 'allow' | 'deny' | 'blocklist' | 'none'
+ *   filter: 'allowlist' | 'denylist' | 'blocklist' | 'upstream'
  */
 async function decide(name, env) {
-  await getRules(env).refresh();
-  const custom = getRules(env).lookup(name);
-  if (custom === 'allow') return 'allow';
-  if (custom === 'deny') return 'deny';
-  if (blocklist.isBlocked(name)) return 'deny';
-  return 'pass';
+  await ruleStore.refresh();
+  const custom = ruleStore.lookup(name);
+  if (custom === 'allow') return { status: 'allow', filter: 'allowlist' };
+  if (custom === 'deny') return { status: 'deny', filter: 'denylist' };
+  if (blocklist.isBlocked(name)) return { status: 'blocklist', filter: 'blocklist' };
+  return { status: 'none', filter: 'upstream' };
+}
+
+// ---- D1 audit logging ----
+let logsReady = false;
+const LOGS_CREATE =
+  'CREATE TABLE IF NOT EXISTS dns_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, status TEXT NOT NULL, filter TEXT NOT NULL, ts INTEGER NOT NULL)';
+
+/**
+ * Insert one audit row. Never throws — logging must not break DNS responses.
+ */
+async function logQuery(env, domain, status, filter) {
+  if (!env.LOGS) return;
+  try {
+    if (!logsReady) {
+      await env.LOGS.prepare(LOGS_CREATE).run();
+      logsReady = true;
+    }
+    await env.LOGS
+      .prepare('INSERT INTO dns_logs (domain, status, filter, ts) VALUES (?, ?, ?, ?)')
+      .bind(domain, status, filter, Date.now())
+      .run();
+  } catch (e) {
+    console.error('[logs] insert failed:', e.message);
+  }
 }
 
 async function handleQuery(queryBuf, env) {
   const q = parseQuestion(queryBuf);
   if (!q) return new Response('malformed DNS message', { status: 400 });
 
-  const decision = await decide(q.name, env);
+  const { status, filter } = await decide(q.name, env);
 
-  if (decision === 'deny') {
+  // Audit logging (fire and forget the DB write).
+  await logQuery(env, q.name, status, filter);
+
+  if (status === 'deny' || status === 'blocklist') {
     return new Response(buildNxdomainResponse(queryBuf), {
       headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': 'max-age=30' },
     });
@@ -110,22 +132,27 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // ---- dashboard ----
+    // ---- dashboard UI ----
     if (url.pathname === '/dashboard' || url.pathname === '/dashboard/') {
       return serveDashboard();
     }
+
+    // ---- dashboard API ----
     if (url.pathname.startsWith('/api/')) {
-      return handleApi(request, env, url, getRules(env));
+      ensureRuleKv(env);
+      return handleApi(request, env, url, ruleStore);
     }
 
     // ---- health ----
     if (url.pathname === '/healthz') {
       await ensureBlocklist();
+      ensureRuleKv(env);
       return Response.json({
         ok: true,
         blocklistSize: blocklist.size,
         blocklistLoadedAt: blocklist.loadedAt,
-        customRulesCached: getRules(env).cache.size,
+        customRulesCached: ruleStore.cache.size,
+        dashboardConfigured: typeof env.DASHBOARD_PASSWORD === 'string' && env.DASHBOARD_PASSWORD.length > 0,
       });
     }
 
@@ -135,6 +162,7 @@ export default {
     }
 
     await ensureBlocklist();
+    ensureRuleKv(env);
 
     if (request.method === 'GET') {
       const accept = request.headers.get('accept') || '';
