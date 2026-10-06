@@ -34,7 +34,7 @@ function json(body, init = {}) {
   });
 }
 
-export async function handleApi(request, env, url, rules, testFn) {
+export async function handleApi(request, env, url, rules, testFn, settings) {
   // ---- Login: POST /api/session { password } or Authorization: Bearer <pw> ----
   if (url.pathname === '/api/session' && request.method === 'POST') {
     if (!isConfigured(env)) {
@@ -126,7 +126,32 @@ export async function handleApi(request, env, url, rules, testFn) {
     const domain = normalizeDomain(url.searchParams.get('domain') || '');
     if (!domain) return json({ error: 'invalid domain' }, { status: 400 });
     if (typeof testFn !== 'function') return json({ error: 'test not available' }, { status: 501 });
-    return json(await testFn(domain));
+    return json(await testFn(domain, env));
+  }
+
+  // ---- settings (KV, persistent) ----
+  if (path === '/api/settings') {
+    if (!settings) return json({ error: 'settings not available' }, { status: 501 });
+
+    if (request.method === 'GET') {
+      await settings.refresh(true);
+      return json({ settings: settings.get() });
+    }
+
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
+
+      const patch = {};
+      if (typeof body.rebindProtection === 'boolean') patch.rebindProtection = body.rebindProtection;
+      if (typeof body.idnBlock === 'boolean') patch.idnBlock = body.idnBlock;
+      if (Object.keys(patch).length === 0) {
+        return json({ error: 'no valid settings provided' }, { status: 400 });
+      }
+
+      await settings.update(patch);
+      return json({ ok: true, settings: settings.get() });
+    }
   }
 
   // ---- logs (D1) ----
