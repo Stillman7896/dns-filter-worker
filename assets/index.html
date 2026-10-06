@@ -28,6 +28,12 @@
   button:hover:not(:disabled) { filter:brightness(1.1); }
   button:disabled { opacity:.35; cursor:not-allowed; }
   .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:20px; max-width:420px; }
+  .toggle-row { display:flex; gap:14px; align-items:flex-start; padding:14px 0;
+                border-bottom:1px solid var(--border); cursor:pointer; }
+  .toggle-row input[type=checkbox] { width:18px; height:18px; margin-top:3px;
+                flex:0 0 auto; accent-color:var(--blue); cursor:pointer; }
+  .toggle-text { display:flex; flex-direction:column; gap:4px; font-size:13px; }
+  .toggle-text strong { font-size:14px; }
   table { width:100%; border-collapse:collapse; background:var(--panel);
           border:1px solid var(--border); border-radius:8px; overflow:hidden; }
   th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); }
@@ -38,6 +44,7 @@
   .pill.allow, .pill.allowed { background:rgba(63,185,80,0.15); color:var(--green); }
   .pill.deny, .pill.blocked { background:rgba(248,81,73,0.15); color:var(--red); }
   .pill.none { background:rgba(139,148,158,0.15); color:var(--muted); }
+  .pill.warn { background:rgba(210,153,34,0.15); color:var(--yellow); }
   .muted { color:var(--muted); }
   .tabs { display:flex; gap:4px; margin-bottom:16px; flex-wrap:wrap; }
   .tab { padding:8px 16px; border-radius:6px; cursor:pointer; border:1px solid transparent;
@@ -88,6 +95,7 @@
       <button class="tab" data-tab="bulk">Bulk import</button>
       <button class="tab" data-tab="test">Test domain</button>
       <button class="tab" data-tab="logs">Logs</button>
+      <button class="tab" data-tab="settings">Settings</button>
     </div>
 
     <section id="tab-single" class="tab-panel">
@@ -121,7 +129,8 @@
         <button id="test-btn">Test</button>
       </div>
       <p class="muted">Runs the full server-side pipeline: custom allowlist &rarr; custom
-        denylist &rarr; remote Hagezi blocklist &rarr; Quad9.</p>
+        denylist &rarr; remote Hagezi blocklist &rarr; rebinding (internal names) &rarr;
+        IDN block &rarr; Quad9. Answer-level rebinding is checked after upstream resolves.</p>
       <div id="test-result" class="muted"></div>
     </section>
 
@@ -133,6 +142,8 @@
           <option value="allow">allow</option>
           <option value="deny">deny</option>
           <option value="blocklist">blocklist</option>
+          <option value="rebind">rebind</option>
+          <option value="idn">idn</option>
           <option value="none">none</option>
         </select>
         <select id="log-limit" title="Rows per page">
@@ -157,6 +168,41 @@
         </tr></thead>
         <tbody id="logs-body"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
       </table>
+    </section>
+
+    <section id="tab-settings" class="tab-panel hidden">
+      <div class="card" style="max-width:560px;">
+        <h2 style="margin-top:0;font-size:15px;">Filter settings</h2>
+        <p class="muted" style="margin-top:0;">Changes are saved to KV and apply to every request within ~30 seconds.</p>
+
+        <label class="toggle-row">
+          <input type="checkbox" id="set-rebind">
+          <span class="toggle-text">
+            <strong>DNS rebinding protection</strong>
+            <span class="muted">Blocks special-use/internal hostnames
+              (<code>localhost</code>, <code>*.local</code>, <code>*.lan</code>,
+              <code>*.home.arpa</code>, <code>*.internal</code>, <code>.test</code>, …)
+              and blocks any answer that resolves to a private or link-local IP
+              (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, 100.64/10, ::1, fc00::/7, fe80::/10).
+              Allowlisted domains bypass this check.</span>
+          </span>
+        </label>
+
+        <label class="toggle-row">
+          <input type="checkbox" id="set-idn">
+          <span class="toggle-text">
+            <strong>IDN homograph block</strong>
+            <span class="muted">Blocks all punycode (<code>xn--</code>) and non-ASCII domain
+              labels — the blunt "block everything" defense against lookalike domains
+              (Cyrillic <em>аpple</em>, etc.). Enable only if you don't resolve internationalized domains.</span>
+          </span>
+        </label>
+
+        <div class="row" style="margin-bottom:0;">
+          <button id="settings-save">Save settings</button>
+          <span id="settings-status" class="muted"></span>
+        </div>
+      </div>
     </section>
 
     <div id="status"></div>
@@ -301,10 +347,11 @@ document.querySelectorAll('.tab').forEach((t) => {
     document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === t));
     document.querySelectorAll('.tab-panel').forEach((p) =>
       p.classList.toggle('hidden', p.id !== 'tab-' + t.dataset.tab));
-    const isLogs = t.dataset.tab === 'logs';
+    const tab = t.dataset.tab;
     const rs = $('rules-section');
-    if (rs) rs.classList.toggle('hidden', isLogs);
-    if (isLogs && !LOGS_LOADED) loadLogs();
+    if (rs) rs.classList.toggle('hidden', tab === 'logs' || tab === 'settings');
+    if (tab === 'logs' && !LOGS_LOADED) loadLogs();
+    if (tab === 'settings') loadSettings();
   };
 });
 
@@ -347,11 +394,13 @@ async function doTest() {
   el.textContent = 'Testing…';
   try {
     const d = await api('/api/test?domain=' + encodeURIComponent(domain));
-    const cls = (d.status === 'allow' || d.status === 'none') ? 'allowed' : 'blocked';
+    const cls = (d.status === 'allow' || d.status === 'none') ? 'allowed'
+              : (d.status === 'rebind' || d.status === 'idn') ? 'warn' : 'blocked';
     let html = '<span class="pill ' + cls + '">' + escapeHtml(d.status.toUpperCase()) +
                '</span> via <strong>' + escapeHtml(d.filter) + '</strong>';
     if (d.matched) html += ' &mdash; matched rule <code>' + escapeHtml(d.matched) + '</code>';
     else if (d.status === 'none') html += ' &mdash; no rule matched, forwarded to upstream';
+    if (d.note) html += '<div class="muted" style="margin-top:6px;font-size:12px;">' + escapeHtml(d.note) + '</div>';
     el.innerHTML = html;
   } catch (e) {
     el.innerHTML = '<span class="pill blocked">ERROR</span> ' + escapeHtml(e.message);
@@ -400,6 +449,7 @@ function fmtTime(ts) {
 function statusPillClass(status) {
   if (status === 'allow') return 'allowed';
   if (status === 'none') return 'none';
+  if (status === 'rebind' || status === 'idn') return 'warn';
   return 'blocked';
 }
 
@@ -514,6 +564,34 @@ $('logs-clear').onclick = async () => {
     setStatus('Cleared all logs', 'ok');
     resetLogOffset();
     loadLogs();
+  } catch (e) { setStatus(e.message, 'err'); }
+};
+
+// --- settings (persistent, KV) ---
+async function loadSettings() {
+  try {
+    const d = await api('/api/settings');
+    $('set-rebind').checked = !!d.settings.rebindProtection;
+    $('set-idn').checked = !!d.settings.idnBlock;
+    $('settings-status').textContent = '';
+  } catch (e) {
+    if (e.message !== 'unauthorized' && e.message !== 'unconfigured') setStatus(e.message, 'err');
+  }
+}
+
+$('settings-save').onclick = async () => {
+  try {
+    const d = await api('/api/settings', {
+      method: 'POST',
+      body: JSON.stringify({
+        rebindProtection: $('set-rebind').checked,
+        idnBlock: $('set-idn').checked,
+      }),
+    });
+    $('set-rebind').checked = !!d.settings.rebindProtection;
+    $('set-idn').checked = !!d.settings.idnBlock;
+    $('settings-status').textContent = 'Saved ✓ (propagates within ~30s)';
+    setStatus('Settings saved', 'ok');
   } catch (e) { setStatus(e.message, 'err'); }
 };
 
