@@ -1,0 +1,130 @@
+// lists.js — Newline-delimited string sets persisted as a single KV blob.
+//
+// WHY A BLOB INSTEAD OF ONE KEY PER ENTRY
+// ----------------------------------------
+// Cloudflare KV has *unlimited* keys per namespace, so key count is never the
+// issue. The binding limits are:
+//   • 1,000 KV operations per Worker invocation  — a `list()` + N `get()` for
+//     N rules blows past this once N is in the thousands.
+//   • 1,000 writes to *different* keys per day on the free plan.
+// Storing each list as ONE value means a refresh costs 1 version read (+ 1 blob
+// read only when something changed), and a write costs 2 writes total.
+//
+// SHARED VERSION KEY
+// ------------------
+// Every KV-backed store bumps the same `data:version` key on write, so a single
+// tiny read per cache TTL tells *all* stores whether to re-read their blob.
+
+const CACHE_TTL_MS = 30_000;
+
+export const DATA_VERSION_KEY = 'data:version';
+
+/** Trim + lowercase; returns '' for anything unusable. */
+export function normalizeEntry(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw.trim().toLowerCase().replace(/^[-.*]+/, '').replace(/\.+$/, '');
+}
+
+/** TLD normalization: strip leading dot, require a single label. */
+export function normalizeTld(raw) {
+  const s = normalizeEntry(raw);
+  if (!s || s.length < 2 || s.length > 63) return '';
+  if (s.includes('.') || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(s)) return '';
+  return s;
+}
+
+/** Keyword normalization: substring match target, so keep it simple. */
+export function normalizeKeyword(raw) {
+  const s = normalizeEntry(raw);
+  if (!s || s.length > 64) return '';
+  if (!/^[a-z0-9][a-z0-9.-]*$/.test(s)) return '';
+  return s;
+}
+
+export class TextSetStore {
+  constructor(kv, key) {
+    this.kv = kv;
+    this.key = key;
+    this.set = new Set();
+    this.version = null;
+    this.loaded = false;
+    this.cachedAt = 0;
+  }
+
+  /**
+   * Cheap while cached (no I/O). force skips the version equality check.
+   *
+   * Failure handling mirrors rules.js: any KV read error keeps the current
+   * set and just re-throttles the TTL. Never substitute an empty set for a
+   * failed read — `add()`/`remove()` do read-modify-write, so a silent wipe
+   * would get persisted on the next save.
+   */
+  async refresh(force = false) {
+    const now = Date.now();
+    if (!force && this.cachedAt && now - this.cachedAt < CACHE_TTL_MS) return;
+
+    let version;
+    try {
+      version = (await this.kv.get(DATA_VERSION_KEY)) || '0';
+    } catch {
+      this.cachedAt = now; // keep stale; retry after TTL
+      return;
+    }
+    if (!force && this.version !== null && version === this.version) {
+      this.cachedAt = now;
+      return;
+    }
+
+    let raw;
+    let readOk = false;
+    try { raw = await this.kv.get(this.key, 'text'); readOk = true; } catch {}
+    if (!readOk) {
+      this.cachedAt = now; // keep stale; retry after TTL
+      return;
+    }
+
+    const set = new Set();
+    if (raw) {
+      for (const line of raw.split('\n')) {
+        const v = normalizeEntry(line);
+        if (v) set.add(v);
+      }
+    }
+    this.set = set;
+    this.version = version; // only after a successful load
+    this.loaded = true;
+    this.cachedAt = Date.now();
+  }
+
+  get() { return this.set; }
+  list() { return [...this.set].sort(); }
+
+  /** @returns {Promise<boolean>} true if newly added */
+  async add(value) {
+    const v = normalizeEntry(value);
+    if (!v) throw new Error('invalid entry');
+    await this.refresh(true); // read-modify-write from fresh state
+    if (this.set.has(v)) return false;
+    this.set.add(v);
+    await this.save();
+    return true;
+  }
+
+  /** @returns {Promise<boolean>} true if it existed and was removed */
+  async remove(value) {
+    const v = normalizeEntry(value);
+    if (!v) return false;
+    await this.refresh(true);
+    if (!this.set.delete(v)) return false;
+    await this.save();
+    return true;
+  }
+
+  async save() {
+    await this.kv.put(this.key, this.list().join('\n'));
+    const v = String(Date.now());
+    await this.kv.put(DATA_VERSION_KEY, v);
+    this.version = v;
+    this.cachedAt = Date.now();
+  }
+}

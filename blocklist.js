@@ -1,4 +1,8 @@
-export const BLOCKLIST_URL =
+// blocklist.js — Workers + Node compatible remote blocklist matcher
+//
+// The URL is a *default*; the worker overrides it at runtime from
+// `env.BLOCKLIST_URL` (see wrangler.toml [vars]).
+export const DEFAULT_BLOCKLIST_URL =
   'https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/pro-plus/domains';
 
 export class Blocklist {
