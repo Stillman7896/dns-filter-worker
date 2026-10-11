@@ -1,4 +1,13 @@
+// dashboard.js — JSON API for the dashboard.
+//
+// The UI itself is a static asset (see assets/index.html), served by the
+// [assets] binding in wrangler.toml. This file only handles /api/* routes.
+//
+// `ctx` (built by worker.js) carries the KV-backed stores and the test fn:
+//   { rules, settings, keywords, tlds, testFn }
+
 import { normalizeDomain } from './rules.js';
+import { normalizeTld, normalizeKeyword } from './lists.js';
 
 const SESSION_COOKIE = 'dns_dash_session';
 
@@ -34,7 +43,21 @@ function json(body, init = {}) {
   });
 }
 
-export async function handleApi(request, env, url, rules, testFn) {
+/** Build ` WHERE a=? AND b=? ` + args from the given filters. */
+function buildWhere(entries) {
+  let where = '';
+  const args = [];
+  for (const [clause, value] of entries) {
+    if (value === '' || value == null) continue;
+    where += (where ? ' AND' : ' WHERE') + ' ' + clause;
+    args.push(value);
+  }
+  return { where, args };
+}
+
+export async function handleApi(request, env, url, ctx) {
+  const { rules, settings, keywords, tlds, testFn } = ctx;
+
   // ---- Login: POST /api/session { password } or Authorization: Bearer <pw> ----
   if (url.pathname === '/api/session' && request.method === 'POST') {
     if (!isConfigured(env)) {
@@ -74,6 +97,7 @@ export async function handleApi(request, env, url, rules, testFn) {
 
   const path = url.pathname;
 
+  // ---- custom rules ----
   if (path === '/api/rules' && request.method === 'GET') {
     await rules.refresh(true);
     return json({ rules: await rules.list() });
@@ -110,23 +134,84 @@ export async function handleApi(request, env, url, rules, testFn) {
       return json({ error: 'domains must be a string' }, { status: 400 });
     }
 
-    const added = [], skipped = [];
-    const lines = body.domains.split(/[\r\n,]+/);
-    for (const line of lines) {
-      const d = normalizeDomain(line);
-      if (d) added.push(d); else if (line.trim()) skipped.push(line.trim());
+    const entries = [];
+    const skipped = [];
+    for (const line of body.domains.split(/[\r\n,]+/)) {
+      if (!line.trim()) continue;
+      entries.push({ domain: line.trim(), kind: body.kind });
     }
-    const unique = [...new Set(added)];
-    await Promise.all(unique.map((d) => rules.put(d, body.kind)));
-    return json({ ok: true, added: unique.length, skipped });
+    // ONE read + ONE write for the whole batch (not one per rule).
+    const added = await rules.putBulk(entries);
+
+    // Report which input lines were unparseable.
+    for (const e of entries) {
+      if (!normalizeDomain(e.domain)) skipped.push(e.domain);
+    }
+
+    return json({ ok: true, added, skipped });
   }
 
-  // ---- test domain: full server-side pipeline (custom rules + blocklist) ----
+  // ---- test domain: full server-side pipeline (custom rules + blocklist + policies) ----
   if (path === '/api/test' && request.method === 'GET') {
     const domain = normalizeDomain(url.searchParams.get('domain') || '');
     if (!domain) return json({ error: 'invalid domain' }, { status: 400 });
     if (typeof testFn !== 'function') return json({ error: 'test not available' }, { status: 501 });
-    return json(await testFn(domain));
+    return json(await testFn(domain, env));
+  }
+
+  // ---- settings (KV, persistent) ----
+  if (path === '/api/settings') {
+    if (!settings) return json({ error: 'settings not available' }, { status: 501 });
+
+    if (request.method === 'GET') {
+      await settings.refresh(true);
+      return json({ settings: settings.get() });
+    }
+
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
+
+      const patch = {};
+      for (const k of ['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock']) {
+        if (typeof body[k] === 'boolean') patch[k] = body[k];
+      }
+      if (Object.keys(patch).length === 0) {
+        return json({ error: 'no valid settings provided' }, { status: 400 });
+      }
+
+      await settings.update(patch);
+      return json({ ok: true, settings: settings.get() });
+    }
+  }
+
+  // ---- filter lists: blocked TLDs + blocked keywords ----
+  const listMatch = path.match(/^\/api\/filters\/(keywords|tlds)$/);
+  if (listMatch) {
+    const isKeywords = listMatch[1] === 'keywords';
+    const store = isKeywords ? keywords : tlds;
+    const normalize = isKeywords ? normalizeKeyword : normalizeTld;
+    if (!store) return json({ error: 'list not available' }, { status: 501 });
+
+    if (request.method === 'GET') {
+      return json({ items: store.list() });
+    }
+
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
+      const value = normalize(body.value != null ? body.value : body.add);
+      if (!value) return json({ error: 'invalid value' }, { status: 400 });
+      const added = await store.add(value);
+      return json({ ok: true, added, items: store.list() });
+    }
+
+    if (request.method === 'DELETE') {
+      const value = normalize(url.searchParams.get('value') || '');
+      if (!value) return json({ error: 'invalid value' }, { status: 400 });
+      const removed = await store.remove(value);
+      return json({ ok: true, removed, items: store.list() });
+    }
   }
 
   // ---- logs (D1) ----
@@ -150,19 +235,24 @@ export async function handleApi(request, env, url, rules, testFn) {
       const search = (url.searchParams.get('search') || '').trim();
       const status = url.searchParams.get('status') || '';
 
+      const { where, args } = buildWhere([
+        [search ? 'domain LIKE ?' : '', search ? `%${search}%` : ''],
+        [status ? 'status = ?' : '', status],
+      ]);
+
       // GET /api/logs?search=&status=&limit=&offset=
       if (request.method === 'GET') {
         const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 500);
         const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0);
 
-        let where = '';
-        const args = [];
-        if (search) { where += ' WHERE domain LIKE ?'; args.push('%' + search + '%'); }
-        if (status) { where += (where ? ' AND' : ' WHERE') + ' status = ?'; args.push(status); }
+        const total = (await logs
+          .prepare('SELECT COUNT(*) AS n FROM dns_logs' + where)
+          .bind(...args)
+          .first()).n;
 
-        const total = (await logs.prepare('SELECT COUNT(*) AS n FROM dns_logs' + where).bind(...args).first()).n;
         const { results } = await logs
-          .prepare('SELECT id, domain, status, filter, ts FROM dns_logs' + where + ' ORDER BY ts DESC LIMIT ? OFFSET ?')
+          .prepare('SELECT id, domain, status, filter, qtype, ts FROM dns_logs' + where +
+                   ' ORDER BY ts DESC LIMIT ? OFFSET ?')
           .bind(...args, limit, offset)
           .all();
 
@@ -171,15 +261,9 @@ export async function handleApi(request, env, url, rules, testFn) {
 
       // DELETE /api/logs?search=&status=&clear=1  -> delete matching (or all with clear=1)
       if (request.method === 'DELETE') {
-        let where = '';
-        const args = [];
-        if (search) { where += ' WHERE domain LIKE ?'; args.push('%' + search + '%'); }
-        if (status) { where += (where ? ' AND' : ' WHERE') + ' status = ?'; args.push(status); }
-
         if (!where && url.searchParams.get('clear') !== '1') {
           return json({ error: 'use ?clear=1 to delete all logs' }, { status: 400 });
         }
-
         await logs.prepare('DELETE FROM dns_logs' + where).bind(...args).run();
         return json({ ok: true });
       }
@@ -188,4 +272,3 @@ export async function handleApi(request, env, url, rules, testFn) {
 
   return json({ error: 'not found' }, { status: 404 });
 }
-
