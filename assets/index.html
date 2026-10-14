@@ -103,6 +103,7 @@
       <button class="tab" data-tab="bulk">Bulk import</button>
       <button class="tab" data-tab="test">Test domain</button>
       <button class="tab" data-tab="logs">Logs</button>
+      <button class="tab" data-tab="stats">Stats</button>
       <button class="tab" data-tab="settings">Settings</button>
     </div>
 
@@ -178,6 +179,32 @@
         </tr></thead>
         <tbody id="logs-body"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
       </table>
+    </section>
+
+    <section id="tab-stats" class="tab-panel hidden">
+      <div class="card" style="max-width:640px;">
+        <div class="flex" style="margin-top:0;">
+          <h2 class="flex-grow" style="font-size:15px;margin:0;">Overview</h2>
+          <button id="stats-refresh" class="ghost">Refresh</button>
+        </div>
+        <p class="muted" id="stats-empty" style="margin-top:4px;">Aggregate counts from the D1 audit log. Requires D1 logging.</p>
+        <div class="flex" style="gap:24px;flex-wrap:wrap;margin-top:12px;" id="stats-totals"></div>
+      </div>
+
+      <div class="card" style="max-width:640px;margin-top:16px;">
+        <h3 class="sub" style="margin-top:0;">Status mix</h3>
+        <div id="stats-status" style="display:flex;flex-direction:column;gap:6px;"></div>
+      </div>
+
+      <div class="card" style="max-width:640px;margin-top:16px;">
+        <h3 class="sub" style="margin-top:0;">Top blocked domains</h3>
+        <div id="stats-top"></div>
+      </div>
+
+      <div class="card" style="max-width:640px;margin-top:16px;">
+        <h3 class="sub" style="margin-top:0;">Query volume — last 24h</h3>
+        <div id="stats-volume"></div>
+      </div>
     </section>
 
     <section id="tab-settings" class="tab-panel hidden">
@@ -407,8 +434,9 @@ document.querySelectorAll('.tab').forEach((t) => {
       p.classList.toggle('hidden', p.id !== 'tab-' + t.dataset.tab));
     const tab = t.dataset.tab;
     const rs = $('rules-section');
-    if (rs) rs.classList.toggle('hidden', tab === 'logs' || tab === 'settings');
+    if (rs) rs.classList.toggle('hidden', tab === 'logs' || tab === 'stats' || tab === 'settings');
     if (tab === 'logs' && !LOGS_LOADED) loadLogs();
+    if (tab === 'stats') loadStats();
     if (tab === 'settings') { loadSettings(); loadFilterLists(); }
   };
 });
@@ -746,6 +774,123 @@ $('settings-save').onclick = async () => {
     setStatus('Settings saved', 'ok');
   } catch (e) { setStatus(e.message, 'err'); }
 };
+
+// --- stats tab ---
+async function loadStats() {
+  try {
+    const d = await api('/api/logs/stats');
+    $('stats-empty').classList.add('hidden');
+    renderStatTotals(d);
+    renderStatusMix(d.byStatus);
+    renderTopBlocked(d.topBlocked);
+    renderVolume(d.last24h);
+  } catch (e) {
+    if (e.message === 'unauthorized' || e.message === 'unconfigured') return;
+    $('stats-empty').textContent = e.code === 'no_d1' ? 'D1 logging not configured.' : e.message;
+    $('stats-empty').classList.remove('hidden');
+  }
+}
+
+function statBox(label, value) {
+  const div = document.createElement('div');
+  div.style.textAlign = 'center';
+  const v = document.createElement('div');
+  v.style.cssText = 'font-size:22px;font-weight:600;color:var(--fg);';
+  v.textContent = String(value);
+  const l = document.createElement('span');
+  l.className = 'muted';
+  l.style.fontSize = '12px';
+  l.textContent = label;
+  div.append(v, l);
+  return div;
+}
+
+function renderStatTotals(d) {
+  const el = $('stats-totals');
+  const blocked = d.total - (d.byStatus.rows.find(r => r.status === 'none')?.n || 0)
+                          - (d.byStatus.rows.find(r => r.status === 'allow')?.n || 0);
+  el.replaceChildren(
+    statBox('Total queries', d.total),
+    statBox('Blocked', blocked),
+    statBox('Allowed / passed', Number(d.byStatus.rows.find(r => r.status === 'none')?.n || 0)),
+    statBox('Allowlisted', Number(d.byStatus.rows.find(r => r.status === 'allow')?.n || 0)),
+  );
+}
+
+function renderStatusMix(data) {
+  const el = $('stats-status');
+  el.replaceChildren();
+  if (!data.rows.length) { el.innerHTML = '<span class="muted">No data.</span>'; return; }
+  const total = data.total || 1;
+  const frag = document.createDocumentFragment();
+  for (const r of data.rows) {
+    const pct = Math.round((r.n / total) * 100);
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;';
+    const pill = document.createElement('span');
+    pill.className = 'pill ' + statusPillClass(r.status);
+    pill.textContent = r.status;
+    pill.style.flex = '0 0 90px';
+    const bar = document.createElement('div');
+    bar.style.cssText = 'flex:1;height:14px;background:var(--border);border-radius:3px;overflow:hidden;';
+    const fill = document.createElement('div');
+    fill.style.cssText = 'height:100%;background:' +
+      (r.status === 'none' || r.status === 'allow' ? 'var(--accent)' : '#f85149') + ';width:' + pct + '%;';
+    bar.appendChild(fill);
+    const cnt = document.createElement('span');
+    cnt.className = 'muted';
+    cnt.style.cssText = 'flex:0 0 80px;text-align:right;font-size:12px;';
+    cnt.textContent = r.n + ' (' + pct + '%)';
+    row.append(pill, bar, cnt);
+    frag.appendChild(row);
+  }
+  el.appendChild(frag);
+}
+
+function renderTopBlocked(rows) {
+  const el = $('stats-top');
+  el.replaceChildren();
+  if (!rows.length) { el.innerHTML = '<span class="muted">Nothing blocked yet.</span>'; return; }
+  const tbl = document.createElement('table');
+  tbl.style.margin = '0';
+  tbl.innerHTML = '<thead><tr><th>Domain</th><th style="text-align:right;">Hits</th></tr></thead>';
+  const tbody = document.createElement('tbody');
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td');
+    td1.textContent = r.domain;
+    const td2 = document.createElement('td');
+    td2.style.textAlign = 'right';
+    td2.textContent = r.n;
+    tr.append(td1, td2);
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  el.appendChild(tbl);
+}
+
+function renderVolume(buckets) {
+  const el = $('stats-volume');
+  el.replaceChildren();
+  const max = Math.max(...buckets, 1);
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;align-items:flex-end;gap:2px;height:80px;padding:4px 0;';
+  for (let i = 0; i < 24; i++) {
+    const col = document.createElement('div');
+    const h = Math.max(2, Math.round((buckets[i] / max) * 72));
+    col.style.cssText = 'flex:1;background:var(--accent);border-radius:2px 2px 0 0;height:' + h + 'px;opacity:0.8;';
+    col.title = buckets[i] + ' queries';
+    wrap.appendChild(col);
+  }
+  el.appendChild(wrap);
+  const lbl = document.createElement('div');
+  lbl.className = 'muted';
+  lbl.style.cssText = 'display:flex;justify-content:space-between;font-size:11px;';
+  lbl.innerHTML = '<span>-24h</span><span>-12h</span><span>now</span>';
+  el.appendChild(lbl);
+}
+
+$('stats-refresh').onclick = loadStats;
 
 // --- bootstrap: probe auth state without triggering a browser dialog ---
 (async () => {
