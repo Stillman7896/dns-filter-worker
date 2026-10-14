@@ -231,6 +231,30 @@ export async function handleApi(request, env, url, ctx) {
       return json({ error: 'D1 logging not configured', code: 'no_d1' }, { status: 501 });
     }
 
+    // GET /api/logs/stats -> aggregate overview (status mix, top blocked, volume)
+    if (path === '/api/logs/stats' && request.method === 'GET') {
+      const [byStatus, topBlocked, last24h, total] = await Promise.all([
+        logs.prepare('SELECT status, COUNT(*) AS n FROM dns_logs GROUP BY status').all(),
+        logs.prepare(
+          "SELECT domain, COUNT(*) AS n FROM dns_logs " +
+          "WHERE status IN ('deny','blocklist','tld','keyword','rebind','idn') " +
+          'GROUP BY domain ORDER BY n DESC LIMIT ?').bind(10).all(),
+        logs.prepare(
+          'SELECT (ts / 3600000) % 24 AS hour, COUNT(*) AS n FROM dns_logs ' +
+          'WHERE ts >= ? GROUP BY hour ORDER BY hour')
+          .bind(Date.now() - 24 * 86400000).all(),
+        logs.prepare('SELECT COUNT(*) AS n FROM dns_logs').first(),
+      ]);
+      const buckets = new Array(24).fill(0);
+      for (const r of last24h.results) buckets[Number(r.hour)] = Number(r.n);
+      return json({
+        total: total.n,
+        byStatus: { rows: byStatus.results, total: total.n },
+        topBlocked: topBlocked.results,
+        last24h: buckets,
+      });
+    }
+
     // DELETE /api/logs/:id  -> delete one row
     if (path.startsWith('/api/logs/') && request.method === 'DELETE') {
       const id = path.slice('/api/logs/'.length);

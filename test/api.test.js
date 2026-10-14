@@ -258,3 +258,72 @@ test('logs: missing D1 binding -> 501 (not 503, not 404)', async () => {
   assert.equal(res.status, 501);
   assert.equal((await res.json()).code, 'no_d1');
 });
+
+// ---- logs stats (D1) -----------------------------------------------------------
+
+// Minimal D1 for the stats endpoint: each prepare() sniffed and bound to a
+// canned handler that matches the real GROUP BY queries in dashboard.js.
+function statsD1() {
+  const statusRows = [
+    { status: 'blocklist', n: 5 }, { status: 'none', n: 3 },
+    { status: 'allow', n: 1 }, { status: 'rebind', n: 2 },
+  ];
+  const topBlocked = [
+    { domain: 'ads.example', n: 3 }, { domain: 'tracker.io', n: 2 },
+  ];
+  const hourRows = [{ hour: 10, n: 4 }, { hour: 11, n: 6 }];
+  const totalRow = { n: 11 };
+  const handlerFor = (sql) => {
+    if (/GROUP BY status/i.test(sql)) return statusRows;
+    if (/WHERE status IN/i.test(sql)) return topBlocked;
+    if (/GROUP BY hour/i.test(sql)) return hourRows;
+    if (/^SELECT COUNT\(\*\) AS n FROM dns_logs$/i.test(sql.trim())) return totalRow;
+    throw new Error('unexpected STATS sql: ' + sql);
+  };
+  const binding = (rows) => ({
+    all: async () => ({ results: rows }),
+    first: async () => (Array.isArray(rows) ? rows[0] : rows),
+    run: async () => ({ success: true }),
+  });
+  return {
+    prepare(sql) {
+      return {
+        bind: () => binding(handlerFor(sql)),
+        all: async () => ({ results: handlerFor(sql) }),
+        first: async () => handlerFor(sql),
+        run: async () => ({ success: true }),
+      };
+    },
+  };
+}
+
+test('logs/stats: aggregates status mix, top blocked, hourly buckets', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD, LOGS: statsD1() };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+  const res = await call(ctx, env, '/api/logs/stats', { cookie });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.total, 11);
+  assert.equal(j.byStatus.total, 11);
+  assert.equal(j.byStatus.rows.length, 4);
+  assert.equal(j.topBlocked[0].domain, 'ads.example');
+  assert.ok(Array.isArray(j.last24h) && j.last24h.length === 24);
+  assert.equal(j.last24h[10], 4);
+  assert.equal(j.last24h[11], 6);
+  assert.equal(j.last24h[0], 0);
+});
+
+test('logs/stats: requires D1 (501 when missing)', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+  const res = await call(ctx, env, '/api/logs/stats', { cookie });
+  assert.equal(res.status, 501);
+});
