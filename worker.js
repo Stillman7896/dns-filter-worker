@@ -252,7 +252,10 @@ export default {
     // ---- dashboard API ----
     if (url.pathname.startsWith('/api/')) {
       return handleApi(request, env, url, {
-        ...stores,
+        rules: ruleStore,
+        keywords: keywordStore,
+        tlds: tldStore,
+        blocklist,
         settings: settingsStore,
         testFn: testDomain,
       });
