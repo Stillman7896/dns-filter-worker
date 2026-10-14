@@ -150,7 +150,10 @@ export function minTtl(respBuf) {
     off = skipName(respBuf, off);
     if (off < 0) return 60;
     if (off + 10 > respBuf.length) return 60;
-    const ttl = respBuf.readUInt32BE(off + 4);
+    // Open-coded u32 read: works on Buf and plain Uint8Array alike.
+    const ttl =
+      respBuf[off + 4] * 0x1000000 +
+      ((respBuf[off + 5] << 16) | (respBuf[off + 6] << 8) | respBuf[off + 7]);
     if (ttl < min) min = ttl;
     const rdlen = (respBuf[off + 8] << 8) | respBuf[off + 9];
     off += 10 + rdlen;

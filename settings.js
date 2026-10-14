@@ -17,7 +17,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
   idnBlock: false,        // block all punycode / non-ASCII labels (homograph defense)
   tldBlock: false,        // block queries whose TLD is in the Blocked-TLD list
   keywordBlock: false,    // block queries containing any Blocked-keyword
+  logRetentionDays: 30,   // delete dns_logs rows older than this; 0 = keep forever
 });
+
+/** Clamp a candidate retention value; returns 0..3650 or NaN if not a number. */
+export function clampRetention(v) {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return NaN;
+  return Math.min(3650, Math.max(0, Math.floor(v)));
+}
 
 export class SettingsStore {
   constructor(kv) {
@@ -26,6 +33,17 @@ export class SettingsStore {
     this.loaded = false;
     this.cachedAt = 0;
     this.loading = null;
+  }
+
+  /**
+   * Point at a different KV binding and reset to defaults until the next
+   * successful load (see rules.js for the rationale).
+   */
+  bind(kv) {
+    this.kv = kv;
+    this.cache = { ...DEFAULT_SETTINGS };
+    this.loaded = false;
+    this.cachedAt = 0;
   }
 
   /**

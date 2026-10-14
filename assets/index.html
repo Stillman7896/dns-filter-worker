@@ -227,6 +227,13 @@
           </span>
         </label>
 
+        <div class="row">
+          <label class="muted" for="set-retention" style="flex:0 0 auto;">Log retention</label>
+          <input type="number" id="set-retention" min="0" max="3650" step="1"
+                 style="max-width:110px;flex:0 0 auto;" title="0 = keep forever">
+          <span class="muted" style="font-size:13px;">days (0 = keep forever; pruning runs in the background)</span>
+        </div>
+
         <div class="row" style="margin-bottom:0;">
           <button id="settings-save">Save settings</button>
           <span id="settings-status" class="muted"></span>
@@ -646,6 +653,7 @@ async function loadSettings() {
   try {
     const d = await api('/api/settings');
     for (const k of SETTINGS_KEYS) $(SETTINGS_INPUT[k]).checked = !!d.settings[k];
+    $('set-retention').value = d.settings.logRetentionDays ?? 30;
     $('settings-status').textContent = '';
   } catch (e) {
     if (e.message !== 'unauthorized' && e.message !== 'unconfigured') setStatus(e.message, 'err');
@@ -730,8 +738,10 @@ $('settings-save').onclick = async () => {
   try {
     const body = {};
     for (const k of SETTINGS_KEYS) body[k] = $(SETTINGS_INPUT[k]).checked;
+    body.logRetentionDays = parseInt($('set-retention').value, 10) || 0;
     const d = await api('/api/settings', { method: 'POST', body: JSON.stringify(body) });
     for (const k of SETTINGS_KEYS) $(SETTINGS_INPUT[k]).checked = !!d.settings[k];
+    $('set-retention').value = d.settings.logRetentionDays ?? 30;
     $('settings-status').textContent = 'Saved ✓ (propagates within ~30s)';
     setStatus('Settings saved', 'ok');
   } catch (e) { setStatus(e.message, 'err'); }

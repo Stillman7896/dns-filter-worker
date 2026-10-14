@@ -1,0 +1,15 @@
+{
+  "name": "dns-filter-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "worker.js",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "test:watch": "node --test --watch \"test/*.test.js\"",
+    "deploy": "wrangler deploy"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

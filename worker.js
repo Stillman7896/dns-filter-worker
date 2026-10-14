@@ -1,17 +1,16 @@
 // worker.js — DoH filter
-// Pipeline: custom allowlist -> custom denylist -> remote blocklist
-//           -> blocked TLD -> blocked keyword -> DNS rebinding (name-level)
-//           -> IDN homograph block -> upstream
-//           -> DNS rebinding (answer-level private IP check)
+// Query path: qclass guard -> custom allowlist -> denylist -> blocklist
+//           -> blocked TLD -> blocked keyword -> rebinding -> IDN -> upstream
+// Response path: answer-level rebinding check (private IPs)
 //
-// Runtime-configurable: blocklist URL and upstream URL are read from
-// env.BLOCKLIST_URL / env.UPSTREAM_URL (see wrangler.toml [vars]) with
-// defaults from blocklist.js / DEFAULT_UPSTREAM_URL below.
+// Runtime-configurable: env.BLOCKLIST_URL / env.UPSTREAM_URL (wrangler [vars])
+// with defaults from blocklist.js / DEFAULT_UPSTREAM_URL below.
 
 import { Blocklist, DEFAULT_BLOCKLIST_URL } from './blocklist.js';
 import { RuleStore } from './rules.js';
 import { SettingsStore } from './settings.js';
 import { TextSetStore } from './lists.js';
+import { runQueryFilters, privateAnswerIP, BLOCKED_QUERY_STATUSES } from './filters.js';
 import { handleApi } from './dashboard.js';
 import {
   Buf,
@@ -25,38 +24,28 @@ import {
 const DEFAULT_UPSTREAM_URL = 'https://dns.quad9.net/dns-query';
 const DNS_MEDIA_TYPE = 'application/dns-message';
 const BLOCKLIST_STALE_MS = 6 * 60 * 60 * 1000; // 6h
+const PRUNE_EVERY = 500; // opportunistic D1 retention batch size
 
-// ---- DNS rebinding: internal / special-use names (RFC 6761/6762) ----
-const REBIND_LOCAL_NAMES = new Set([
-  'localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback',
-]);
-const INTERNAL_TLDS = new Set([
-  'local', 'localdomain', 'lan', 'home', 'internal', 'intranet', 'corp',
-  'private', 'home.arpa', 'test', 'invalid', 'example', 'localhost',
-]);
-
-// ---- Per-isolate singletons (all backed by the same KV namespace) ----
+// ---- Per-isolate singletons (one shared KV namespace) ----
 const blocklist = new Blocklist();
 const ruleStore = new RuleStore(null);
 const settingsStore = new SettingsStore(null);
 const keywordStore = new TextSetStore(null, 'keywords:data');
 const tldStore = new TextSetStore(null, 'tlds:data');
+const stores = { ruleStore, blocklist, keywordStore, tldStore };
 
 let boundKv = null;
 let loadedBlocklistUrl = null;
 
 function ensureKv(env) {
-  if (env.RULES !== boundKv) {
-    boundKv = env.RULES;
-    ruleStore.kv = env.RULES;
-    ruleStore.loaded = false;       // reload for the new binding
-    settingsStore.kv = env.RULES;
-    settingsStore.loaded = false;
-    keywordStore.kv = env.RULES;
-    keywordStore.loaded = false;
-    tldStore.kv = env.RULES;
-    tldStore.loaded = false;
-  }
+  if (env.RULES === boundKv) return;
+  boundKv = env.RULES;
+  // Binding changed -> different namespace: drop ALL in-memory state so a
+  // warm TTL cache can never serve the previous binding's rules/settings.
+  ruleStore.bind(env.RULES);
+  settingsStore.bind(env.RULES);
+  keywordStore.bind(env.RULES);
+  tldStore.bind(env.RULES);
 }
 
 async function ensureBlocklist(env) {
@@ -98,7 +87,7 @@ async function forwardToUpstream(queryBuf, env) {
   return Buf.from(await res.arrayBuffer());
 }
 
-/** Refresh every KV-backed store. All are TTL-cached, so this is usually free. */
+/** Refresh every KV-backed store. All TTL-cached, so this is usually free. */
 async function refreshStores() {
   await Promise.all([
     settingsStore.refresh(),
@@ -108,179 +97,11 @@ async function refreshStores() {
   ]);
 }
 
-// ---- Filter helpers (query-level) ----
-
-/** Returns the internal TLD / name that matched, or null. */
-function rebindNameHit(name) {
-  if (REBIND_LOCAL_NAMES.has(name)) return name;
-  const dot = name.lastIndexOf('.');
-  const tld = dot === -1 ? name : name.slice(dot + 1);
-  return INTERNAL_TLDS.has(tld) ? tld : null;
-}
-
-/**
- * IDN homograph detection — "block all or off" strategy:
- * any punycode (xn--) label, or any label with non-ASCII bytes
- * (raw UTF-8 sent by non-compliant clients). Returns the offending
- * label, or null if clean.
- */
-function idnHit(name) {
-  let start = 0;
-  for (;;) {
-    const dot = name.indexOf('.', start);
-    const label = dot === -1 ? name.slice(start) : name.slice(start, dot);
-    if (label.startsWith('xn--')) return label;
-    if (dot === -1) break;
-    start = dot + 1;
-  }
-  if (/[\x80-\uffff]/.test(name)) return '<non-ascii>';
-  return null;
-}
-
-/** Last label of a lowercased FQDN, or '' if none. */
-function tldOf(name) {
-  const dot = name.lastIndexOf('.');
-  return dot === -1 ? '' : name.slice(dot + 1);
-}
-
-/**
- * Ordered query-side decision chain (sync — stores must be refreshed first).
- * Returns { status, filter, matched }.
- *
- * Precedence is deliberate: curated rules first (most specific intent), then
- * coarse policy lists (TLD/keyword), then the security checks.
- */
-function runQueryFilters(settings, name) {
-  // 1-2. custom allow / deny — allow always wins
-  const custom = ruleStore.match(name);
-  if (custom) {
-    return custom.kind === 'allow'
-      ? { status: 'allow', filter: 'allowlist', matched: custom.at }
-      : { status: 'deny',  filter: 'denylist',  matched: custom.at };
-  }
-
-  // 3. remote blocklist (Hagezi pro-plus)
-  const blockHit = blocklist.match(name);
-  if (blockHit) return { status: 'blocklist', filter: 'blocklist', matched: blockHit };
-
-  // 4. TLD policy — one Set lookup on the last label
-  if (settings.tldBlock) {
-    const tlds = tldStore.get();
-    if (tlds.size) {
-      const tld = tldOf(name);
-      if (tld && tlds.has(tld)) return { status: 'tld', filter: 'tld', matched: tld };
-    }
-  }
-
-  // 5. keyword substring match — K passes over an ~L-char string
-  if (settings.keywordBlock) {
-    const kws = keywordStore.get();
-    if (kws.size) {
-      for (const kw of kws) {
-        if (name.includes(kw)) return { status: 'keyword', filter: 'keyword', matched: kw };
-      }
-    }
-  }
-
-  // 6. DNS rebinding — internal / special-use names
-  if (settings.rebindProtection) {
-    const hit = rebindNameHit(name);
-    if (hit) return { status: 'rebind', filter: 'rebind', matched: hit };
-  }
-
-  // 7. IDN homograph
-  if (settings.idnBlock) {
-    const hit = idnHit(name);
-    if (hit) return { status: 'idn', filter: 'idn', matched: hit };
-  }
-
-  return { status: 'none', filter: 'upstream', matched: null };
-}
-
-// ---- DNS rebinding: answer-level private IP inspection ----
-
-const BLOCKED_QUERY_STATUSES = new Set([
-  'deny', 'blocklist', 'tld', 'keyword', 'rebind', 'idn',
-]);
-
-function rd16(b, o) { return ((b[o] & 0xff) << 8) | (b[o + 1] & 0xff); }
-
-function isPrivateV4(b, o) {
-  const ip = ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
-  if ((ip >>> 24) === 10) return true;                              // 10/8
-  if ((ip >>> 20) === (0xac100000 >>> 20)) return true;             // 172.16/12
-  if ((ip >>> 16) === 0xc0a8) return true;                          // 192.168/16
-  if ((ip >>> 24) === 127) return true;                             // 127/8
-  if ((ip >>> 16) === 0xa9fe) return true;                          // 169.254/16 (metadata)
-  if ((ip >>> 22) === (0x64400000 >>> 22)) return true;             // 100.64/10 (CGNAT)
-  return ip === 0;
-}
-
-function isPrivateV6(b, o) {
-  let allZero = true;
-  for (let i = o; i < o + 16; i++) if (b[i]) { allZero = false; break; }
-  if (allZero) return true;
-
-  let z = true;
-  for (let i = o; i < o + 15; i++) if (b[i]) { z = false; break; }
-  if (z && b[o + 15] === 1) return true;                            // ::1
-
-  if ((b[o] & 0xfe) === 0xfc) return true;                          // fc00::/7
-  if (b[o] === 0xfe && (b[o + 1] & 0xc0) === 0x80) return true;     // fe80::/10
-
-  let mapped = true;
-  for (let i = o; i < o + 10; i++) if (b[i]) { mapped = false; break; }
-  if (mapped && b[o + 10] === 0xff && b[o + 11] === 0xff) return isPrivateV4(b, o + 12);
-  return false;
-}
-
-function skipNameAt(buf, off) {
-  let jumps = 0;
-  while (off < buf.length) {
-    const len = buf[off];
-    if (len === 0) return off + 1;
-    if ((len & 0xc0) === 0xc0) return off + 2; // compression pointer
-    off += 1 + len;
-    if (++jumps > 255) return -1;
-  }
-  return -1;
-}
-
-function fmtV4(b, o) { return `${b[o]}.${b[o + 1]}.${b[o + 2]}.${b[o + 3]}`; }
-
-/** Walk the ANSWER section; return the first private IP string or null. */
-function privateAnswerIP(buf) {
-  if (!buf || buf.length < 12) return null;
-  const qd = rd16(buf, 4);
-  const an = rd16(buf, 6);
-  let off = 12;
-
-  for (let i = 0; i < qd; i++) {
-    const r = skipNameAt(buf, off);
-    if (r < 0) return null;
-    off = r + 4;
-    if (off > buf.length) return null;
-  }
-
-  for (let i = 0; i < an; i++) {
-    const r = skipNameAt(buf, off);
-    if (r < 0) return null;
-    if (r + 10 > buf.length) return null;
-    const type = rd16(buf, r);
-    const rdlen = rd16(buf, r + 8);
-    const rd = r + 10;
-    if (type === 1 && rdlen === 4 && isPrivateV4(buf, rd)) return fmtV4(buf, rd);
-    if (type === 28 && rdlen === 16 && isPrivateV6(buf, rd)) return '<private-v6>';
-    off = rd + rdlen;
-    if (off > buf.length) return null;
-  }
-  return null;
-}
-
 // ---- D1 audit logging ----
 
 let logsReady = false;
 let logsMigrated = false;
+let logCount = 0;
 
 const LOGS_CREATE =
   'CREATE TABLE IF NOT EXISTS dns_logs (' +
@@ -291,10 +112,8 @@ const LOGS_CREATE =
   'ts INTEGER NOT NULL, ' +
   'qtype INTEGER)';
 
-/**
- * Insert one audit row. Never throws — logging must not break DNS responses.
- */
-async function logQuery(env, domain, status, filter, qtype) {
+/** Never throws — logging must not break DNS responses. */
+async function logQuery(env, domain, status, filter, qtype, retentionDays) {
   if (!env.LOGS) return;
   try {
     if (!logsReady) {
@@ -302,9 +121,9 @@ async function logQuery(env, domain, status, filter, qtype) {
       logsReady = true;
     }
     if (!logsMigrated) {
-      // Databases created before qtype existed lack the column. CREATE TABLE
-      // IF NOT EXISTS no-ops on them, so add it explicitly; on a fresh table
-      // this fails with "duplicate column" which we swallow.
+      // Tables created before qtype existed lack the column. CREATE TABLE
+      // IF NOT EXISTS no-ops on them; a fresh table then errors with
+      // "duplicate column" here, which we swallow.
       try { await env.LOGS.prepare('ALTER TABLE dns_logs ADD COLUMN qtype INTEGER').run(); }
       catch { /* already present */ }
       logsMigrated = true;
@@ -313,6 +132,17 @@ async function logQuery(env, domain, status, filter, qtype) {
       .prepare('INSERT INTO dns_logs (domain, status, filter, ts, qtype) VALUES (?, ?, ?, ?, ?)')
       .bind(domain, status, filter, Date.now(), qtype == null ? null : qtype)
       .run();
+
+    logCount++;
+    // Configured retention: opportunistically prune rows past the cutoff.
+    // Throttled to every PRUNE_EVERY inserts so the extra write only fires
+    // on a busy isolate, never on a cold query.
+    if (retentionDays > 0 && logCount % PRUNE_EVERY === 0) {
+      await env.LOGS
+        .prepare('DELETE FROM dns_logs WHERE ts < ?')
+        .bind(Date.now() - retentionDays * 86400000)
+        .run();
+    }
   } catch (e) {
     console.error('[logs] insert failed:', e.message);
   }
@@ -323,6 +153,20 @@ async function logQuery(env, domain, status, filter, qtype) {
 function nxdomain(queryBuf) {
   return new Response(buildNxdomainResponse(queryBuf), {
     headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': 'max-age=30' },
+  });
+}
+
+function refused(queryBuf, maxAge = 30) {
+  return new Response(buildRefusedResponse(queryBuf), {
+    headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': `max-age=${maxAge}` },
+  });
+}
+
+/** Upstream unreachable: SERVFAIL-ish (502) carrying a REFUSED answer. */
+function upstreamFailure(queryBuf) {
+  return new Response(buildRefusedResponse(queryBuf), {
+    status: 502,
+    headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': 'max-age=15' },
   });
 }
 
@@ -341,12 +185,18 @@ async function handleQuery(queryBuf, env) {
   const q = parseQuestion(queryBuf);
   if (!q) return new Response('malformed DNS message', { status: 400 });
 
+  // Only the IN class belongs on this resolver (blocks CH/version.bind
+  // probing and other non-IN queries before any store I/O). No log row: this
+  // is a wire-level reject, not a domain filtering decision.
+  if (q.qclass !== 1) return refused(queryBuf, 60);
+
   await refreshStores();
   const settings = settingsStore.get();
-  const verdict = runQueryFilters(settings, q.name);
+  const verdict = runQueryFilters(stores, settings, q.name);
+  const retention = settings.logRetentionDays;
 
   if (BLOCKED_QUERY_STATUSES.has(verdict.status)) {
-    await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype);
+    await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
     return nxdomain(queryBuf);
   }
 
@@ -357,21 +207,18 @@ async function handleQuery(queryBuf, env) {
     if (verdict.status === 'none' && settings.rebindProtection) {
       const priv = privateAnswerIP(upstream);
       if (priv) {
-        await logQuery(env, q.name, 'rebind', 'rebind', q.qtype);
+        await logQuery(env, q.name, 'rebind', 'rebind', q.qtype, retention);
         return nxdomain(queryBuf);
       }
     }
-    await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype);
+    await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
     return passThrough(upstream);
   } catch {
     // Upstream unavailable — never break DNS.
   }
 
-  await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype);
-  return new Response(buildRefusedResponse(queryBuf), {
-    status: 502,
-    headers: { 'Content-Type': DNS_MEDIA_TYPE },
-  });
+  await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
+  return upstreamFailure(queryBuf);
 }
 
 // ---- Test endpoint (mirrors the live pipeline) ----
@@ -380,7 +227,8 @@ async function testDomain(domain, env) {
   await ensureBlocklist(env);
   await refreshStores();
 
-  const verdict = runQueryFilters(settingsStore.get(), domain);
+  const settings = settingsStore.get();
+  const verdict = runQueryFilters(stores, settings, domain);
   return {
     domain,
     status: verdict.status,
@@ -388,7 +236,7 @@ async function testDomain(domain, env) {
     matched: verdict.matched,
     blocklistSize: blocklist.size,
     note:
-      verdict.status === 'none' && settingsStore.get().rebindProtection
+      verdict.status === 'none' && settings.rebindProtection
         ? 'answer-level rebinding check applies after upstream resolves'
         : null,
   };
@@ -404,10 +252,8 @@ export default {
     // ---- dashboard API ----
     if (url.pathname.startsWith('/api/')) {
       return handleApi(request, env, url, {
-        rules: ruleStore,
+        ...stores,
         settings: settingsStore,
-        keywords: keywordStore,
-        tlds: tldStore,
         testFn: testDomain,
       });
     }
@@ -430,7 +276,7 @@ export default {
       });
     }
 
-    // ---- root redirect for browsers (curl without Accept: text/html passes through) ----
+    // ---- root redirect for browsers ----
     if (url.pathname === '/') {
       const accept = request.headers.get('accept') || '';
       if (accept.includes('text/html')) {
@@ -440,7 +286,6 @@ export default {
 
     // ---- /dns-query ----
     if (url.pathname !== '/dns-query') {
-      // Not an API/health/DNS path -> serve static dashboard assets.
       if (env.ASSETS) return env.ASSETS.fetch(request);
       return new Response('Not Found', { status: 404 });
     }

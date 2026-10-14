@@ -51,6 +51,15 @@ export class TextSetStore {
     this.cachedAt = 0;
   }
 
+  /** Point at a different KV binding and drop cached data (see rules.js). */
+  bind(kv) {
+    this.kv = kv;
+    this.set = new Set();
+    this.version = null;
+    this.loaded = false;
+    this.cachedAt = 0;
+  }
+
   /**
    * Cheap while cached (no I/O). force skips the version equality check.
    *

@@ -39,6 +39,19 @@ export class RuleStore {
   }
 
   /**
+   * Point the store at a different KV binding and drop all in-memory state.
+   * A binding change means a *different namespace* — keeping the TTL cache
+   * would serve another namespace's rules for up to CACHE_TTL.
+   */
+  bind(kv) {
+    this.kv = kv;
+    this.rules = new Map();
+    this.version = null;
+    this.loaded = false;
+    this.cachedAt = 0;
+  }
+
+  /**
    * Cheap while cached (no I/O). force skips the version check.
    *
    * Failure handling: any KV read error keeps the current in-memory rules and

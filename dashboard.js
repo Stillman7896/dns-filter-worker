@@ -8,6 +8,7 @@
 
 import { normalizeDomain } from './rules.js';
 import { normalizeTld, normalizeKeyword } from './lists.js';
+import { clampRetention } from './settings.js';
 
 const SESSION_COOKIE = 'dns_dash_session';
 
@@ -175,6 +176,13 @@ export async function handleApi(request, env, url, ctx) {
       const patch = {};
       for (const k of ['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock']) {
         if (typeof body[k] === 'boolean') patch[k] = body[k];
+      }
+      if ('logRetentionDays' in body) {
+        const days = clampRetention(body.logRetentionDays);
+        if (Number.isNaN(days)) {
+          return json({ error: 'logRetentionDays must be a number (0-3650)' }, { status: 400 });
+        }
+        patch.logRetentionDays = days;
       }
       if (Object.keys(patch).length === 0) {
         return json({ error: 'no valid settings provided' }, { status: 400 });
