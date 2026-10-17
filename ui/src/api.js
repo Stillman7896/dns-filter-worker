@@ -38,6 +38,11 @@ export async function request(path, { method = 'GET', body, query } = {}) {
       (data && data.code) || null
     );
   }
+  // A 200 with an unparsable body (deploy misroute serving index.html) must
+  // not surface as null downcall — callers would read properties off it.
+  if (data === null) {
+    throw new ApiError('worker sent a non-JSON response for ' + path, 0, 'not-json');
+  }
   return data;
 }
 

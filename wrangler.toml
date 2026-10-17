@@ -13,13 +13,16 @@ UPSTREAM_URL = "https://dns.quad9.net/dns-query"
 # The Worker only runs for these paths; everything else (static files,
 # /dashboard SPA fallback) is served directly from assets:
 #   "/"        -> worker redirect for browsers (HTML -> /dashboard)
-#   "/api/"    -> dashboard JSON API
+#   "/api/*"   -> dashboard JSON API
 #   "/dns-query" -> DoH endpoint
 #   "/healthz" -> health/stats JSON
 [assets]
 directory = "./assets"
 binding = "ASSETS"
-run_worker_first = ["/", "/api/", "/dns-query", "/healthz"]
+#   "/api/*"   -> dashboard JSON API (glob `*` is required: "/api/" alone
+#                 matches only the literal path /api/, and API subpaths would
+#                 fall through to assets + SPA fallback -> HTML -> null JSON)
+run_worker_first = ["/api/*", "/dns-query", "/healthz", "/"]
 not_found_handling = "single-page-application"
 html_handling = "auto-trailing-slash"
 
