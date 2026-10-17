@@ -18,7 +18,7 @@ export default defineConfig({
     },
     vue(),
     unocss({
-      presets: [presetWind3({ preflight: false, dark: 'class' })],
+      presets: [presetWind3({ preflight: 'on-demand', dark: 'class' })],
       theme: {
         colors: {
           canvas: 'var(--c-canvas)',

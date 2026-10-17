@@ -50,20 +50,39 @@ function syncHash() {
 }
 
 // ---- notifications ----
+// Timers follow the toast's current ttl (pending -> saved can set it later).
+const dismissTimers = new Map();
+
+function armDismissTimer(id, ttl) {
+  cancelDismissTimer(id);
+  dismissTimers.set(id, setTimeout(() => dismissToast(id), ttl));
+}
+
+function cancelDismissTimer(id) {
+  clearTimeout(dismissTimers.get(id));
+  dismissTimers.delete(id);
+}
+
 function touch(id, patch) {
-  const t = state.toasts.find((t) => t.id === id);
-  if (t) Object.assign(t, patch);
+  const i = state.toasts.findIndex((t) => t.id === id);
+  if (i < 0) return;
+  Object.assign(state.toasts[i], patch);
+  if (state.toasts[i].ttl) armDismissTimer(id, state.toasts[i].ttl);
 }
 
 export function pushToast({ kind, text, detail, action, ttl }) {
   const id = state.lastId++;
   state.toasts.push({ id, kind, text, detail: detail || null, action: action || null, ttl: ttl || null });
-  if (state.toasts.length > 4) state.toasts.splice(0, state.toasts.length - 4);
-  if (ttl) setTimeout(() => dismissToast(id), ttl);
+  if (state.toasts.length > 4) {
+    const dropped = state.toasts.splice(0, state.toasts.length - 4);
+    dropped.forEach((t) => cancelDismissTimer(t.id));
+  }
+  if (ttl) armDismissTimer(id, ttl);
   return id;
 }
 
 export function dismissToast(id) {
+  cancelDismissTimer(id);
   const i = state.toasts.findIndex((t) => t.id === id);
   if (i >= 0) state.toasts.splice(i, 1);
 }

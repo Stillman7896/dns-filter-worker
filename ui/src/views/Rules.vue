@@ -175,16 +175,16 @@ function onFilter(e) {
           :key="r.domain"
           class="grid grid-cols-[1fr_auto] sm:grid-cols-[1fr_150px_44px] gap-x-3 gap-y-1 items-center px-4 sm:px-5 py-3 border-b border-line/70 last:border-0 hover:bg-raised/60 transition-colors"
         >
-          <span class="st text-[13.5px] truncate" :title="r.domain">{{ r.domain }}</span>
+          <span class="col-span-2 sm:col-span-1 min-w-0 st text-[13.5px] truncate" :title="r.domain">{{ r.domain }}</span>
 
           <span
-            class="sm:order-none order-1 justify-self-start text-[12px] st rounded border px-2 py-0.5"
+            class="justify-self-start text-[12px] st rounded border px-2 py-0.5"
             :class="r.kind === 'deny' ? 'text-block border-block/40' : 'text-pass border-pass/40'"
           >
             {{ r.kind === 'deny' ? 'block' : 'allow' }}
           </span>
 
-          <div class="order-2 sm:order-none justify-self-end">
+          <div class="justify-self-end">
             <ConfirmButton
               small
               label="Remove"
