@@ -11,7 +11,7 @@
 // the free plan's 1,000 different-keys/day write quota) — see README for the
 // one-time cleanup command.
 
-import { DATA_VERSION_KEY } from './lists.js';
+import { DATA_VERSION_KEY, readSharedVersion, noteSharedVersion } from './lists.js';
 
 const RULES_KEY = 'rules:data';
 const LEGACY_PREFIX = 'rule:';
@@ -37,6 +37,7 @@ export class RuleStore {
     this.kv = kv;
     /** @type {Map<string, 'allow'|'deny'>} */
     this.rules = new Map(); // domain -> 'allow' | 'deny'
+    /** @type {string|null} */
     this.version = null;
     this.loaded = false;
     this.cachedAt = 0;
@@ -70,10 +71,9 @@ export class RuleStore {
     // Guard on cachedAt, not `loaded`, so a failed load throttles retries too.
     if (!force && this.cachedAt && now - this.cachedAt < CACHE_TTL_MS) return;
 
-    let version;
-    try {
-      version = (await this.kv.get(DATA_VERSION_KEY)) || '0';
-    } catch {
+    /** @type {string|null} null = shared version read failed */
+    const version = await readSharedVersion(this.kv, force);
+    if (version === null) {
       this.cachedAt = Date.now(); // keep stale; retry after TTL
       return;
     }
@@ -258,6 +258,7 @@ export class RuleStore {
     const v = String(Date.now());
     await this.kv.put(DATA_VERSION_KEY, v);
     this.version = v;
+    noteSharedVersion(this.kv, v);
     this.cachedAt = Date.now();
   }
 }

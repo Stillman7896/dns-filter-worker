@@ -188,7 +188,47 @@ export function minTtl(respBuf) {
   }
 
   if (!Number.isFinite(min) || min <= 0) return 60;
-  return Math.min(min, 300);
+  // Cap: bounds how long both the client and the edge cache may reuse the
+  // answer (an hour matches ordinary resolver behaviour for long-TTL records).
+  return Math.min(min, 3600);
+}
+
+/**
+ * True when the query carries an EDNS OPT record with the DO (DNSSEC OK) bit.
+ * Used to split the answer cache: a validating client must not be served a
+ * stripped (non-DNSSEC) answer cached for a plain query, and vice versa.
+ * @param {Uint8Array} buf
+ * @returns {boolean}
+ */
+export function ednsDo(buf) {
+  if (!buf || buf.length < 12) return false;
+  const qd = (buf[4] << 8) | buf[5];
+  const rr =
+    ((buf[6] << 8) | buf[7]) +
+    ((buf[8] << 8) | buf[9]) +
+    ((buf[10] << 8) | buf[11]);
+  let off = 12;
+
+  for (let i = 0; i < qd; i++) {
+    off = skipName(buf, off);
+    if (off < 0) return false;
+    off += 4;
+  }
+
+  for (let i = 0; i < rr; i++) {
+    off = skipName(buf, off);
+    if (off < 0 || off + 10 > buf.length) return false;
+    const type = (buf[off] << 8) | buf[off + 1];
+    const rdlen = (buf[off + 8] << 8) | buf[off + 9];
+    if (type === 41) {
+      // OPT TTL = ext-rcode(8) version(8) flags(16); DO is the high bit of
+      // the flags, i.e. the third TTL byte.
+      return (buf[off + 6] & 0x80) !== 0;
+    }
+    off += 10 + rdlen;
+    if (off > buf.length) return false;
+  }
+  return false;
 }
 
 /** @param {Uint8Array} buf @param {number} off @returns {number} */

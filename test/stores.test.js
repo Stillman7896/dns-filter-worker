@@ -81,17 +81,39 @@ test('RuleStore: version cache avoids blob re-reads on warm refreshes', async ()
   await rs.refresh();
   assert.equal(kv.stats.gets, before, 'fresh TTL -> no KV reads at all');
 
-  // simulate TTL expiry: version unchanged -> only the version key is read
+  // store TTL expired, but the shared version window is still fresh -> no I/O
   rs.cachedAt = 0;
   await rs.refresh();
-  assert.equal(kv.stats.gets, before + 1, 'expiry reads version only, not the blob');
+  assert.equal(kv.stats.gets, before, 'shared version window covers every store');
 
-  // another isolate writes -> version changes -> blob re-read
+  // another isolate writes -> force bypasses the window, blob re-read
   rs.cachedAt = 0;
   kv.data.set(RULES_KEY, 'allow\ty.com');
   kv.data.set(DATA_VERSION_KEY, '999');
-  await rs.refresh();
+  await rs.refresh(true);
   assert.deepEqual(await rs.list(), [{ domain: 'y.com', kind: 'allow' }]);
+});
+
+test('shared version: parallel stores share one KV version read per window', async () => {
+  const kv = new FakeKV({ 'rules:data': 'deny\ta.com', 'tlds:data': 'zip', 'data:version': '7' });
+  const rs = new RuleStore(kv);
+  const ts = new TextSetStore(kv, 'tlds:data');
+
+  // concurrent refreshes must de-duplicate: 1 version read + 2 blob reads
+  await Promise.all([rs.refresh(), ts.refresh()]);
+  assert.equal(kv.stats.gets, 3, 'one shared version read instead of one per store');
+  assert.deepEqual(await rs.list(), [{ domain: 'a.com', kind: 'deny' }]);
+  assert.deepEqual(ts.list(), ['zip']);
+
+  // both stores expire together — the shared window still covers them
+  rs.cachedAt = 0;
+  ts.cachedAt = 0;
+  await Promise.all([rs.refresh(), ts.refresh()]);
+  assert.equal(kv.stats.gets, 3, 'shared window fresh -> zero extra reads');
+
+  // a write on either store publishes the version to the whole binding
+  await ts.add('mov');
+  assert.equal(kv.data.get('data:version'), ts.version, 'noteSharedVersion makes it visible');
 });
 
 test('RuleStore: KV read failure keeps stale rules, never an empty set', async () => {
@@ -190,7 +212,7 @@ test('TextSetStore: version cache + failure keeps stale set', async () => {
   const gets = kv.stats.gets;
   ts.cachedAt = 0; // simulate TTL expiry
   await ts.refresh();
-  assert.equal(kv.stats.gets, gets + 1, 'expiry reads version only');
+  assert.equal(kv.stats.gets, gets, 'shared version window fresh -> zero KV reads');
   assert.deepEqual(ts.list(), ['one', 'two'], 'blob untouched on version match');
 
   kv.fail.get = true;

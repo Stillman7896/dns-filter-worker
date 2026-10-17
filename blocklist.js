@@ -1,7 +1,13 @@
 // blocklist.js — Workers + Node compatible remote blocklist matcher
 //
-// The URL is a *default*; the worker overrides it at runtime from
-// `env.BLOCKLIST_URL` (see wrangler.toml [vars]).
+// Expected input is a PLAINTEXT domain list, one domain per line:
+//
+//   example.com
+//   sub.domain.com
+//
+// Blank lines and `#` comments are skipped; so is any line that is not a
+// single domain (whitespace, over-length). The URL is a *default*; the worker
+// overrides it at runtime from `env.BLOCKLIST_URL` (wrangler.toml [vars]).
 export const DEFAULT_BLOCKLIST_URL =
   'https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/pro-plus/domains';
 
@@ -21,31 +27,17 @@ export class Blocklist {
       let line = lines[i].trim();
       if (!line || line[0] === '#') continue;
 
-      const sp = line.indexOf(' ');
-      if (sp !== -1) {
-        const first = line.slice(0, sp);
-        if (first === '0.0.0.0' || first === '127.0.0.1' || first === '::1') {
-          line = line.slice(sp + 1).trim();
-          const sp2 = line.indexOf(' ');
-          if (sp2 !== -1) line = line.slice(0, sp2);
-        } else {
-          line = line.slice(0, sp);
-        }
-      }
-
       if (line.startsWith('*.')) line = line.slice(2);
       else if (line.startsWith('.')) line = line.slice(1);
-
       if (line.endsWith('.')) line = line.slice(0, -1);
-
-      const hash = line.indexOf('#');
-      if (hash !== -1) line = line.slice(0, hash).trim();
       if (!line) continue;
 
-      const lower = line.toLowerCase();
-      if (lower.length > 253) continue;
+      line = line.toLowerCase();
+      // plaintext format: anything with whitespace or over 253 chars is a
+      // malformed line (hosts-file rows, trailing commentary), never a domain
+      if (line.length > 253 || line.indexOf(' ') !== -1 || line.indexOf('\t') !== -1) continue;
 
-      set.add(lower);
+      set.add(line);
     }
 
     this.domains = set;

@@ -34,7 +34,7 @@ globalThis.caches = { default: new MemCache() };
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   if (url === BLOCKLIST_URL) {
-    return new Response('# comment\nblocklist.test\n0.0.0.0 ads.blocklist.test\n\n', { status: 200 });
+    return new Response('# comment\nblocklist.test\nads.blocklist.test\n\n', { status: 200 });
   }
   if (url === UPSTREAM_URL) {
     const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
@@ -360,4 +360,76 @@ test('logPassed=false: passed queries unlogged, blocked still logged', async () 
   assert.equal(inserts.length, 1, 'only the block was logged');
   assert.equal(d1.rows[0].domain, 'ads.blocklist.test');
   assert.equal(d1.rows[0].status, 'blocklist');
+});
+
+// ---- answer cache ----------------------------------------------------------------
+
+test('answer cache: repeat query skips upstream and gets its own transaction ID', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ d1 });
+  let upstreamCalls = 0;
+  const savedFetch = globalThis.fetch;
+  /** @param {string|Request|URL} input @param {RequestInit} [init] */
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === UPSTREAM_URL) {
+      upstreamCalls++;
+      const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
+      return new Response(buildResponse(q, [{ type: 1, rdata: v4rdata('93.184.216.34') }]));
+    }
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    throw new Error('unexpected fetch: ' + url);
+  };
+
+  try {
+    const first = await dohGet(env, buildQuery('cached.foo.com', { id: 0x1111 }));
+    const firstBody = new Uint8Array(await first.arrayBuffer());
+    assert.equal(upstreamCalls, 1);
+    assert.equal(ancount(firstBody), 1);
+
+    // same question, different transaction ID -> served from cache, ID patched
+    const second = await dohGet(env, buildQuery('cached.foo.com', { id: 0x2222 }));
+    const secondBody = new Uint8Array(await second.arrayBuffer());
+    assert.equal(upstreamCalls, 1, 'second query answered from the cache');
+    assert.equal((secondBody[0] << 8) | secondBody[1], 0x2222, 'client transaction ID rewritten');
+    assert.equal(ancount(secondBody), 1, 'answer intact');
+
+    // audit log still records both queries (filters run on hits too)
+    assert.equal(d1.rows.length, 2, 'cache hit logged exactly like a miss');
+    assert.deepEqual(d1.rows.map((r) => r.domain), ['cached.foo.com', 'cached.foo.com']);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('answer cache: a custom rule added via the API busts the cached answer', async () => {
+  const kv = new FakeKV();
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv, d1 });
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('93.184.216.34') }];
+
+  const open = await dohGet(env, buildQuery('busted.foo.com'));
+  const openBody = new Uint8Array(await open.arrayBuffer());
+  assert.equal(rcode(openBody), 0, 'resolves before the rule exists');
+
+  const login = await worker.fetch(new Request('https://worker.test/api/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'pw' }),
+  }), env);
+  const sc = login.headers.get('set-cookie');
+  assert.ok(sc, 'session cookie expected');
+  const cookie = sc.split(';')[0];
+
+  const deny = await worker.fetch(new Request('https://worker.test/api/rules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify({ domain: 'busted.foo.com', kind: 'deny' }),
+  }), env);
+  assert.equal(deny.status, 200);
+
+  const after = await dohGet(env, buildQuery('busted.foo.com'));
+  const afterBody = new Uint8Array(await after.arrayBuffer());
+  assert.equal(rcode(afterBody), 3, 'NXDOMAIN — epoch rotation killed the cached pass-through');
+  globalThis.__answers = undefined;
 });

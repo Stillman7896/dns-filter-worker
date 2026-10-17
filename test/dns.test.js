@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   Buf, parseQuestion, buildNxdomainResponse, buildRefusedResponse,
-  minTtl, base64urlDecode,
+  minTtl, base64urlDecode, ednsDo,
 } from '../dns.js';
 import { buildQuery, buildResponse, v4rdata } from './helpers.js';
 
@@ -71,13 +71,13 @@ test('buildRefusedResponse: RCODE=5', () => {
   assert.equal(resp[3] & 0x0f, 5);
 });
 
-test('minTtl: minimum across records, capped at 300', () => {
+test('minTtl: minimum across records, capped at 3600', () => {
   const q = buildQuery('a.b');
   const low = buildResponse(q, [{ type: 1, rdata: v4rdata('1.2.3.4'), ttl: 60 }]);
   assert.equal(minTtl(low), 60);
 
   const capped = buildResponse(q, [{ type: 1, rdata: v4rdata('1.2.3.4'), ttl: 86400 }]);
-  assert.equal(minTtl(capped), 300);
+  assert.equal(minTtl(capped), 3600);
 
   const mixed = buildResponse(q, [
     { type: 1, rdata: v4rdata('1.2.3.4'), ttl: 600 },
@@ -91,6 +91,29 @@ test('minTtl: degenerate inputs fall back to 60', () => {
   assert.equal(minTtl(new Uint8Array(4)), 60);
   const noAnswers = buildResponse(buildQuery('a.b'), []);
   assert.equal(minTtl(noAnswers), 60);
+});
+
+test('ednsDo: true only with an OPT record carrying the DO bit', () => {
+  /** Append an OPT RR (payload 1232) with DO on or off. */
+  /** @param {Uint8Array} query @param {boolean} doBit */
+  const withOpt = (query, doBit) => {
+    const out = [...query];
+    out[10] = 0;
+    out[11] = 1; // ARCOUNT = 1
+    out.push(
+      0,          // root NAME
+      0x00, 0x29, // TYPE = OPT (41)
+      0x04, 0xd0, // CLASS = payload size 1232
+      0, 0, doBit ? 0x80 : 0, 0, // TTL: ext-rcode, version, flags (DO bit), 0
+      0, 0,        // RDLEN = 0
+    );
+    return Uint8Array.from(out);
+  };
+
+  assert.equal(ednsDo(buildQuery('a.b')), false, 'no EDNS at all');
+  assert.equal(ednsDo(withOpt(buildQuery('a.b'), false)), false, 'OPT present, DO clear');
+  assert.equal(ednsDo(withOpt(buildQuery('a.b'), true)), true, 'OPT present, DO set');
+  assert.equal(ednsDo(new Uint8Array(0)), false, 'degenerate input');
 });
 
 test('base64urlDecode: round-trip and garbage handling', () => {
