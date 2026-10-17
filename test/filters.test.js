@@ -12,6 +12,10 @@ import { buildQuery, buildResponse, v4rdata, v6rdata } from './helpers.js';
 const ON = { rebindProtection: true, idnBlock: true, tldBlock: true, keywordBlock: true };
 const OFF = { rebindProtection: false, idnBlock: false, tldBlock: false, keywordBlock: false };
 
+/**
+ * @param {{rules?: Array<[string, 'allow'|'deny']>, block?: string[], keywords?: string[], tlds?: string[]}} [o]
+ * @returns {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, tldStore: {get(): Set<string>}}}
+ */
 function mkStores({ rules = [], block = [], keywords = [], tlds = [] } = {}) {
   const ruleMap = new Map(rules);
   const blockSet = new Set(block);
@@ -19,6 +23,7 @@ function mkStores({ rules = [], block = [], keywords = [], tlds = [] } = {}) {
     ruleStore: {
       match(name) {
         // walk parents like the real store (allow > deny)
+        /** @type {{kind:'deny', at:string}|null} */
         let deny = null;
         for (let d = name; ;) {
           const hit = ruleMap.get(d);
@@ -40,7 +45,6 @@ function mkStores({ rules = [], block = [], keywords = [], tlds = [] } = {}) {
           d = d.slice(dot + 1);
           if (d.indexOf('.') === -1) return blockSet.has(d) ? d : null;
         }
-        return null;
       },
     },
     keywordStore: { get: () => new Set(keywords) },
@@ -148,8 +152,13 @@ test('deny is reported with the matched parent rule', () => {
 
 // ---- private address classification ------------------------------------------
 
-function v4ok(ip, expect) {
-  assert.equal(isPrivateV4(Uint8Array.from(v4rdata(ip)), 0), expect, ip);
+/**
+ * @param {string} ip
+ * @param {boolean} expect
+ * @param {string} [msg]
+ */
+function v4ok(ip, expect, msg) {
+  assert.equal(isPrivateV4(Uint8Array.from(v4rdata(ip)), 0), expect, msg ? `${ip} (${msg})` : ip);
 }
 
 test('isPrivateV4: boundaries of every covered range', () => {
@@ -178,6 +187,7 @@ test('isPrivateV4: boundaries of every covered range', () => {
 });
 
 test('isPrivateV6: loopback, ULA, link-local, v4-mapped', () => {
+  /** @param {string} ip @returns {boolean} */
   const w = (ip) => isPrivateV6(Uint8Array.from(v6rdata(ip)), 0);
   assert.equal(w('::'), true);
   assert.equal(w('::1'), true);

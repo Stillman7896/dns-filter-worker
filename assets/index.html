@@ -65,6 +65,18 @@
   #status.err { color:var(--red); }
   #status.ok { color:var(--green); }
   code { background:var(--panel); padding:2px 6px; border-radius:4px; font-size:12px; }
+  #toast-container { position:fixed; bottom:20px; right:20px; z-index:9999; display:flex; flex-direction:column; gap:8px; pointer-events:none; }
+  .toast { pointer-events:auto; background:var(--panel); border:1px solid var(--border); border-left:4px solid var(--muted); border-radius:6px; padding:12px 16px; min-width:260px; max-width:380px; box-shadow:0 4px 12px rgba(0,0,0,.4); animation:slideIn .25s ease-out; display:flex; align-items:center; gap:10px; font-size:13px; }
+  .toast.success { border-left-color:var(--green); }
+  .toast.error { border-left-color:var(--red); }
+  .toast.info { border-left-color:var(--blue); }
+  .toast .icon { font-size:16px; flex-shrink:0; }
+  .toast .msg { flex:1; word-break:break-word; }
+  @keyframes slideIn { from { transform:translateX(100%); opacity:0; } to { transform:translateX(0); opacity:1; } }
+  @keyframes fadeOut { from { opacity:1; } to { opacity:0; transform:translateY(10px); } }
+  button.loading { position:relative; color:transparent !important; pointer-events:none; }
+  button.loading::after { content:''; position:absolute; left:50%; top:50%; width:14px; height:14px; margin:-7px 0 0 -7px; border:2px solid rgba(255,255,255,.3); border-top-color:#fff; border-radius:50%; animation:spin .6s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -254,6 +266,16 @@
           </span>
         </label>
 
+        <label class="toggle-row">
+          <input type="checkbox" id="set-logpassed">
+          <span class="toggle-text">
+            <strong>Log passed queries</strong>
+            <span class="muted">Write allow/forwarded rows to the audit log. Disable to log
+              <em>blocked</em> queries only — passed queries usually dominate, so this
+              cuts D1 write volume dramatically.</span>
+          </span>
+        </label>
+
         <div class="row">
           <label class="muted" for="set-retention" style="flex:0 0 auto;">Log retention</label>
           <input type="number" id="set-retention" min="0" max="3650" step="1"
@@ -288,9 +310,27 @@
         </div>
         <div id="kw-items" class="chips"></div>
       </div>
+
+      <div class="card" style="max-width:640px;margin-top:16px;">
+        <h3 class="sub" style="margin-top:0;">Backup / restore</h3>
+        <p class="muted" style="margin-top:0;">Download all dashboard config (settings, rules,
+          blocked TLDs, keywords) as JSON, or restore from a previous export.
+          <strong>Merge</strong> adds to what exists; <strong>replace</strong> clears each
+          section before importing it.</p>
+        <div class="row">
+          <button id="export-btn">Export config</button>
+          <select id="import-mode" title="Merge adds to what exists; replace clears first">
+            <option value="merge" selected>Merge</option>
+            <option value="replace">Replace</option>
+          </select>
+          <input type="file" id="import-file" accept="application/json,.json" style="max-width:230px;">
+          <button id="import-btn" class="ghost">Import</button>
+        </div>
+      </div>
     </section>
 
     <div id="status"></div>
+    <div id="toast-container"></div>
 
     <div id="rules-section">
       <div class="flex" style="margin:16px 0 8px;">
@@ -314,6 +354,29 @@ function setStatus(msg, kind) {
   el.textContent = msg || '';
   el.className = kind || '';
   if (msg) setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 4000);
+}
+
+const TOAST_ICONS = { success: '\u2713', error: '\u2715', info: '\u2139' };
+function toast(msg, type = 'info', duration = 3500) {
+  const c = $('toast-container');
+  const t = document.createElement('div');
+  t.className = 'toast ' + type;
+  const icon = document.createElement('span');
+  icon.className = 'icon';
+  icon.textContent = TOAST_ICONS[type] || TOAST_ICONS.info;
+  const m = document.createElement('span');
+  m.className = 'msg';
+  m.textContent = msg;
+  t.append(icon, m);
+  c.appendChild(t);
+  setTimeout(() => { t.style.animation = 'fadeOut .3s ease-in forwards'; setTimeout(() => t.remove(), 300); }, duration);
+}
+
+async function withLoading(btn, fn) {
+  btn.classList.add('loading');
+  btn.disabled = true;
+  try { return await fn(); }
+  finally { btn.classList.remove('loading'); btn.disabled = false; }
 }
 
 async function api(path, opts = {}) {
@@ -390,13 +453,13 @@ function render() {
     const del = document.createElement('button');
     del.className = 'danger';
     del.textContent = 'Delete';
-    del.onclick = async () => {
+    del.onclick = () => withLoading(del, async () => {
       try {
         await api('/api/rules?domain=' + encodeURIComponent(r.domain), { method: 'DELETE' });
-        setStatus('Deleted ' + r.domain, 'ok');
+        toast('Deleted ' + r.domain, 'success');
         loadRules();
-      } catch (e) { setStatus(e.message, 'err'); }
-    };
+      } catch (e) { toast(e.message, 'error'); }
+    });
     td3.appendChild(del);
     tr.append(td1, td2, td3);
     frag.appendChild(tr);
@@ -405,7 +468,7 @@ function render() {
 }
 
 // --- auth: single in-page form ---
-$('login-btn').onclick = async () => {
+$('login-btn').onclick = () => withLoading($('login-btn'), async () => {
   const pw = $('pw').value;
   if (!pw) return;
   try {
@@ -415,11 +478,12 @@ $('login-btn').onclick = async () => {
       body: JSON.stringify({ password: pw }),
     });
     if (res.status === 503) { showUnconfigured(); return; }
-    if (!res.ok) { setStatus('Incorrect password', 'err'); return; }
+    if (!res.ok) { toast('Incorrect password', 'error'); return; }
     $('pw').value = '';
+    toast('Signed in', 'success');
     showApp();
-  } catch { setStatus('Login failed', 'err'); }
-};
+  } catch { toast('Login failed', 'error'); }
+});
 $('pw').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('login-btn').click(); });
 $('logout').onclick = () => {
   document.cookie = 'dns_dash_session=; Path=/; Max-Age=0';
@@ -442,20 +506,20 @@ document.querySelectorAll('.tab').forEach((t) => {
 });
 
 // --- add ---
-$('add').onclick = async () => {
+$('add').onclick = () => withLoading($('add'), async () => {
   const domain = $('domain').value.trim();
   if (!domain) return;
   try {
     await api('/api/rules', { method: 'POST', body: JSON.stringify({ domain, kind: $('kind').value }) });
     $('domain').value = '';
-    setStatus('Added ' + domain, 'ok');
+    toast('Added ' + domain, 'success');
     loadRules();
-  } catch (e) { setStatus(e.message, 'err'); }
-};
+  } catch (e) { toast(e.message, 'error'); }
+});
 $('domain').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('add').click(); });
 
 // --- bulk ---
-$('bulk-add').onclick = async () => {
+$('bulk-add').onclick = () => withLoading($('bulk-add'), async () => {
   const domains = $('bulk-domains').value;
   if (!domains.trim()) return;
   try {
@@ -463,14 +527,14 @@ $('bulk-add').onclick = async () => {
       method: 'POST',
       body: JSON.stringify({ domains, kind: $('bulk-kind').value }),
     });
-    setStatus('Imported ' + r.added + ' rule(s)' + (r.skipped.length ? ', skipped ' + r.skipped.length : ''), 'ok');
+    toast('Imported ' + r.added + ' rule(s)' + (r.skipped.length ? ', skipped ' + r.skipped.length : ''), 'success');
     $('bulk-domains').value = '';
     loadRules();
-  } catch (e) { setStatus(e.message, 'err'); }
-};
+  } catch (e) { toast(e.message, 'error'); }
+});
 
 // --- test (server-side, covers blocklist too) ---
-$('test-btn').onclick = doTest;
+$('test-btn').onclick = () => withLoading($('test-btn'), doTest);
 $('test-domain').addEventListener('keydown', (e) => { if (e.key === 'Enter') doTest(); });
 
 async function doTest() {
@@ -592,24 +656,25 @@ function renderLogs() {
     btnAllow.className = 'ghost';
     btnAllow.textContent = 'Allow';
     btnAllow.title = 'Add to allowlist';
-    btnAllow.onclick = () => quickRule(l.domain, 'allow');
+    btnAllow.onclick = () => quickRule(btnAllow, l.domain, 'allow');
 
     const btnDeny = document.createElement('button');
     btnDeny.className = 'ghost';
     btnDeny.textContent = 'Deny';
     btnDeny.title = 'Add to denylist';
-    btnDeny.onclick = () => quickRule(l.domain, 'deny');
+    btnDeny.onclick = () => quickRule(btnDeny, l.domain, 'deny');
 
     const btnDel = document.createElement('button');
     btnDel.className = 'danger';
     btnDel.textContent = '×';
     btnDel.title = 'Delete this log row';
-    btnDel.onclick = async () => {
+    btnDel.onclick = () => withLoading(btnDel, async () => {
       try {
         await api('/api/logs/' + l.id, { method: 'DELETE' });
+        toast('Deleted log row', 'success');
         loadLogs();
-      } catch (e) { setStatus(e.message, 'err'); }
-    };
+      } catch (e) { toast(e.message, 'error'); }
+    });
 
     tdA.append(btnAllow, btnDeny, btnDel);
     tr.append(tdD, tdQ, tdS, tdT, tdA);
@@ -626,55 +691,58 @@ function renderPagination() {
   $('logs-next').disabled = logOffset + logLimit >= logTotal;
 }
 
-async function quickRule(domain, kind) {
+async function quickRule(btn, domain, kind) {
+  btn.classList.add('loading'); btn.disabled = true;
   try {
     await api('/api/rules', { method: 'POST', body: JSON.stringify({ domain, kind }) });
-    setStatus('Added ' + domain + ' to ' + kind + 'list', 'ok');
+    toast('Added ' + domain + ' to ' + kind + 'list', 'success');
     loadRules();
-  } catch (e) { setStatus(e.message, 'err'); }
+  } catch (e) { toast(e.message, 'error'); }
+  finally { btn.classList.remove('loading'); btn.disabled = false; }
 }
 
-$('logs-refresh').onclick = loadLogs;
+$('logs-refresh').onclick = () => withLoading($('logs-refresh'), loadLogs);
 $('log-search').oninput = debounce(() => { resetLogOffset(); loadLogs(); }, 300);
 $('log-status').onchange = () => { resetLogOffset(); loadLogs(); };
 $('log-limit').onchange = (e) => { logLimit = parseInt(e.target.value, 10) || 50; resetLogOffset(); loadLogs(); };
 $('logs-prev').onclick = () => { logOffset = Math.max(0, logOffset - logLimit); loadLogs(); };
 $('logs-next').onclick = () => { if (logOffset + logLimit < logTotal) { logOffset += logLimit; loadLogs(); } };
 
-$('logs-delete').onclick = async () => {
+$('logs-delete').onclick = () => withLoading($('logs-delete'), async () => {
   const search = ($('log-search').value || '').trim();
   const status = $('log-status').value;
   if (!search && !status) {
-    setStatus('Enter a search or status to delete filtered, or use Clear all', 'err');
+    toast('Enter a search or status to delete filtered, or use Clear all', 'info');
     return;
   }
   if (!confirm('Delete matching log rows?')) return;
   try {
     await api('/api/logs?search=' + encodeURIComponent(search) +
               '&status=' + encodeURIComponent(status), { method: 'DELETE' });
-    setStatus('Deleted matching logs', 'ok');
+    toast('Deleted matching logs', 'success');
     resetLogOffset();
     loadLogs();
-  } catch (e) { setStatus(e.message, 'err'); }
-};
+  } catch (e) { toast(e.message, 'error'); }
+});
 
-$('logs-clear').onclick = async () => {
+$('logs-clear').onclick = () => withLoading($('logs-clear'), async () => {
   if (!confirm('Clear ALL logs? This cannot be undone.')) return;
   try {
     await api('/api/logs?clear=1', { method: 'DELETE' });
-    setStatus('Cleared all logs', 'ok');
+    toast('Cleared all logs', 'success');
     resetLogOffset();
     loadLogs();
-  } catch (e) { setStatus(e.message, 'err'); }
-};
+  } catch (e) { toast(e.message, 'error'); }
+});
 
 // --- settings + filter lists (persistent, KV) ---
-const SETTINGS_KEYS = ['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock'];
+const SETTINGS_KEYS = ['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock', 'logPassed'];
 const SETTINGS_INPUT = {
   rebindProtection: 'set-rebind',
   idnBlock: 'set-idn',
   tldBlock: 'set-tld',
   keywordBlock: 'set-kw',
+  logPassed: 'set-logpassed',
 };
 
 async function loadSettings() {
@@ -732,24 +800,22 @@ async function loadFilterLists() {
 
 async function addFilter(kind, value) {
   if (!value.trim()) return;
+  const input = kind === 'tlds' ? $('tld-input') : $('kw-input');
+  const btn = kind === 'tlds' ? $('tld-add') : $('kw-add');
   try {
-    await api('/api/filters/' + kind, {
-      method: 'POST',
-      body: JSON.stringify({ value }),
-    });
-    const input = kind === 'tlds' ? $('tld-input') : $('kw-input');
+    await api('/api/filters/' + kind, { method: 'POST', body: JSON.stringify({ value }) });
     input.value = '';
-    setStatus('Added ' + value.trim(), 'ok');
+    toast('Added ' + value.trim(), 'success');
     await loadFilterLists();
-  } catch (e) { setStatus(e.message, 'err'); }
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 async function removeFilter(kind, value) {
   try {
     await api('/api/filters/' + kind + '?value=' + encodeURIComponent(value), { method: 'DELETE' });
-    setStatus('Removed ' + value, 'ok');
+    toast('Removed ' + value, 'success');
     await loadFilterLists();
-  } catch (e) { setStatus(e.message, 'err'); }
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 const addTld = (v) => addFilter('tlds', v);
@@ -762,7 +828,7 @@ $('kw-add').onclick = () => addKeyword($('kw-input').value);
 $('tld-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') addTld($('tld-input').value); });
 $('kw-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') addKeyword($('kw-input').value); });
 
-$('settings-save').onclick = async () => {
+$('settings-save').onclick = () => withLoading($('settings-save'), async () => {
   try {
     const body = {};
     for (const k of SETTINGS_KEYS) body[k] = $(SETTINGS_INPUT[k]).checked;
@@ -771,9 +837,51 @@ $('settings-save').onclick = async () => {
     for (const k of SETTINGS_KEYS) $(SETTINGS_INPUT[k]).checked = !!d.settings[k];
     $('set-retention').value = d.settings.logRetentionDays ?? 30;
     $('settings-status').textContent = 'Saved ✓ (propagates within ~30s)';
-    setStatus('Settings saved', 'ok');
-  } catch (e) { setStatus(e.message, 'err'); }
-};
+    toast('Settings saved', 'success');
+  } catch (e) { toast(e.message, 'error'); }
+});
+
+// --- backup / restore ---
+$('export-btn').onclick = () => withLoading($('export-btn'), async () => {
+  try {
+    const d = await api('/api/export');
+    const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'dns-filter-config-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('Config exported', 'success');
+  } catch (e) { toast(e.message, 'error'); }
+});
+
+$('import-btn').onclick = () => withLoading($('import-btn'), async () => {
+  const fileEl = $('import-file');
+  const file = fileEl.files && fileEl.files[0];
+  if (!file) { toast('Choose a config file first', 'info'); return; }
+  let data;
+  try { data = JSON.parse(await file.text()); }
+  catch { toast('Not valid JSON', 'error'); return; }
+  const mode = $('import-mode').value;
+  if (mode === 'replace' &&
+      !confirm('Replace mode clears each existing section before importing it. Continue?')) {
+    return;
+  }
+  try {
+    const r = await api('/api/import', { method: 'POST', body: JSON.stringify({ ...data, mode }) });
+    const part = (s, noun) => s
+      ? (s.applied + ' ' + noun + '(s)' + (s.skipped ? ', ' + s.skipped + ' skipped' : ''))
+      : null;
+    const parts = [
+      r.rules && part({ applied: r.rules.applied, skipped: r.rules.skipped }, 'rule'),
+      part(r.keywords, 'keyword'),
+      part(r.tlds, 'TLD'),
+      r.settings ? 'settings' : null,
+    ].filter(Boolean);
+    toast('Imported ' + (parts.join(', ') || 'nothing') + ' (' + r.mode + ')', 'success', 4500);
+    loadRules(); loadSettings(); loadFilterLists();
+  } catch (e) { toast(e.message, 'error'); }
+});
 
 // --- stats tab ---
 async function loadStats() {
@@ -890,7 +998,7 @@ function renderVolume(buckets) {
   el.appendChild(lbl);
 }
 
-$('stats-refresh').onclick = loadStats;
+$('stats-refresh').onclick = () => withLoading($('stats-refresh'), loadStats);
 
 // --- bootstrap: probe auth state without triggering a browser dialog ---
 (async () => {

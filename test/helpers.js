@@ -3,12 +3,19 @@ import { TextEncoder } from 'node:util';
 
 /** Map-backed Workers KV stand-in with failure injection and op counters. */
 export class FakeKV {
+  /** @param {Record<string, string>} [initial] */
   constructor(initial = {}) {
+    /** @type {Map<string, string>} */
     this.data = new Map(Object.entries(initial));
     this.stats = { gets: 0, puts: 0, lists: 0 };
     this.fail = { get: false, put: false, list: false };
   }
 
+  /**
+   * @param {string} key
+   * @param {'text'|'json'} [type]
+   * @returns {Promise<any>}
+   */
   async get(key, type) {
     this.stats.gets++;
     if (this.fail.get) throw new Error('kv get failed (injected)');
@@ -17,16 +24,19 @@ export class FakeKV {
     return type === 'json' ? JSON.parse(v) : v;
   }
 
+  /** @param {string} key @param {string} value */
   async put(key, value) {
     this.stats.puts++;
     if (this.fail.put) throw new Error('kv put failed (injected)');
     this.data.set(key, String(value));
   }
 
+  /** @param {string} key */
   async delete(key) {
     this.data.delete(key);
   }
 
+  /** @param {{prefix?: string, cursor?: string}} [opts] */
   async list({ prefix = '', cursor } = {}) {
     this.stats.lists++;
     if (this.fail.list) throw new Error('kv list failed (injected)');
@@ -39,6 +49,7 @@ export class FakeKV {
 }
 
 const enc = new TextEncoder();
+/** @param {string} s @returns {number[]} */
 const bytes = (s) => [...enc.encode(s)];
 
 /**
@@ -95,22 +106,30 @@ export function buildResponse(query, records) {
   return new Uint8Array(out);
 }
 
-/** IPv4 dotted quad -> 4-byte rdata array. */
+/** IPv4 dotted quad -> 4-byte rdata array.
+ * @param {string} ip
+ * @returns {number[]}
+ */
 export function v4rdata(ip) {
   return ip.split('.').map((n) => parseInt(n, 10) & 0xff);
 }
 
-/** Expand an IPv6 literal to a 16-byte rdata array (supports :: and ::ffff:x). */
+/** Expand an IPv6 literal to a 16-byte rdata array (supports :: and ::ffff:x).
+ * @param {string} ip
+ * @returns {number[]}
+ */
 export function v6rdata(ip) {
-  let [head, tail] = ip.split('::');
+  const [head, tail] = ip.split('::');
   const h = head ? head.split(':').filter(Boolean) : [];
   const t = tail !== undefined ? tail.split(':').filter(Boolean) : [];
+  /** @param {string} part @returns {number[]|null} */
   const expandV4 = (part) => {
     const m = part.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
     if (!m) return null;
     const a = m.slice(1).map(Number);
     return [(a[0] << 8) | a[1], (a[2] << 8) | a[3]];
   };
+  /** @param {string[]} parts @returns {number[]} */
   const toWords = (parts) => {
     const out = [];
     for (const p of parts) {

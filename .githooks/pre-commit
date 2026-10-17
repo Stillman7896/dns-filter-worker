@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fast local gate: syntax + types + lint (no tests — push hook runs those).
+npm run --silent typecheck || exit 1
+npm run --silent lint || exit 1

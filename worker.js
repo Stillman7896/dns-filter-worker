@@ -28,17 +28,20 @@ const PRUNE_EVERY = 500; // opportunistic D1 retention batch size
 
 // ---- Per-isolate singletons (one shared KV namespace) ----
 const blocklist = new Blocklist();
-const ruleStore = new RuleStore(null);
-const settingsStore = new SettingsStore(null);
-const keywordStore = new TextSetStore(null, 'keywords:data');
-const tldStore = new TextSetStore(null, 'tlds:data');
+const ruleStore = new RuleStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
+const settingsStore = new SettingsStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
+const keywordStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'keywords:data');
+const tldStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'tlds:data');
 const stores = { ruleStore, blocklist, keywordStore, tldStore };
 
+/** @type {KVLike|null} */
 let boundKv = null;
+/** @type {string|null} */
 let loadedBlocklistUrl = null;
 
+/** @param {Env} env */
 function ensureKv(env) {
-  if (env.RULES === boundKv) return;
+  if (!env.RULES || env.RULES === boundKv) return;
   boundKv = env.RULES;
   // Binding changed -> different namespace: drop ALL in-memory state so a
   // warm TTL cache can never serve the previous binding's rules/settings.
@@ -48,6 +51,7 @@ function ensureKv(env) {
   tldStore.bind(env.RULES);
 }
 
+/** @param {Env} env */
 async function ensureBlocklist(env) {
   const blUrl = env.BLOCKLIST_URL || DEFAULT_BLOCKLIST_URL;
   const fresh =
@@ -76,6 +80,7 @@ async function ensureBlocklist(env) {
   loadedBlocklistUrl = blUrl;
 }
 
+/** @param {Uint8Array} queryBuf @param {Env} env */
 async function forwardToUpstream(queryBuf, env) {
   const upstream = env.UPSTREAM_URL || DEFAULT_UPSTREAM_URL;
   const res = await fetch(upstream, {
@@ -88,6 +93,7 @@ async function forwardToUpstream(queryBuf, env) {
 }
 
 /** Refresh every KV-backed store. All TTL-cached, so this is usually free. */
+/** @returns {Promise<void>} */
 async function refreshStores() {
   await Promise.all([
     settingsStore.refresh(),
@@ -113,6 +119,14 @@ const LOGS_CREATE =
   'qtype INTEGER)';
 
 /** Never throws — logging must not break DNS responses. */
+/**
+ * @param {Env} env
+ * @param {string} domain
+ * @param {string} status
+ * @param {string} filter
+ * @param {string|number} qtype 'unknown' for nxdomain/refused paths
+ * @param {number} retentionDays
+ */
 async function logQuery(env, domain, status, filter, qtype, retentionDays) {
   if (!env.LOGS) return;
   try {
@@ -130,7 +144,7 @@ async function logQuery(env, domain, status, filter, qtype, retentionDays) {
     }
     await env.LOGS
       .prepare('INSERT INTO dns_logs (domain, status, filter, ts, qtype) VALUES (?, ?, ?, ?, ?)')
-      .bind(domain, status, filter, Date.now(), qtype == null ? null : qtype)
+      .bind(domain, status, filter, Date.now(), qtype === null || qtype === undefined ? null : qtype)
       .run();
 
     logCount++;
@@ -144,18 +158,20 @@ async function logQuery(env, domain, status, filter, qtype, retentionDays) {
         .run();
     }
   } catch (e) {
-    console.error('[logs] insert failed:', e.message);
+    console.error('[logs] insert failed:', e instanceof Error ? e.message : e);
   }
 }
 
 // ---- Response builders ----
 
+/** @param {Uint8Array} queryBuf @returns {Response} */
 function nxdomain(queryBuf) {
   return new Response(buildNxdomainResponse(queryBuf), {
     headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': 'max-age=30' },
   });
 }
 
+/** @param {Uint8Array} queryBuf @param {number} [maxAge] @returns {Response} */
 function refused(queryBuf, maxAge = 30) {
   return new Response(buildRefusedResponse(queryBuf), {
     headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': `max-age=${maxAge}` },
@@ -163,6 +179,7 @@ function refused(queryBuf, maxAge = 30) {
 }
 
 /** Upstream unreachable: SERVFAIL-ish (502) carrying a REFUSED answer. */
+/** @param {Uint8Array} queryBuf @returns {Response} */
 function upstreamFailure(queryBuf) {
   return new Response(buildRefusedResponse(queryBuf), {
     status: 502,
@@ -170,6 +187,7 @@ function upstreamFailure(queryBuf) {
   });
 }
 
+/** @param {Buf} upstream raw upstream answer bytes @returns {Response} */
 function passThrough(upstream) {
   return new Response(upstream, {
     headers: {
@@ -181,6 +199,7 @@ function passThrough(upstream) {
 
 // ---- Main query handler ----
 
+/** @param {Uint8Array} queryBuf @param {Env} env @returns {Promise<Response>} */
 async function handleQuery(queryBuf, env) {
   const q = parseQuestion(queryBuf);
   if (!q) return new Response('malformed DNS message', { status: 400 });
@@ -194,6 +213,7 @@ async function handleQuery(queryBuf, env) {
   const settings = settingsStore.get();
   const verdict = runQueryFilters(stores, settings, q.name);
   const retention = settings.logRetentionDays;
+  const logPassed = settings.logPassed !== false; // tolerate pre-toggle blobs
 
   if (BLOCKED_QUERY_STATUSES.has(verdict.status)) {
     await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
@@ -211,18 +231,23 @@ async function handleQuery(queryBuf, env) {
         return nxdomain(queryBuf);
       }
     }
-    await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
+    if (logPassed) {
+      await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
+    }
     return passThrough(upstream);
   } catch {
     // Upstream unavailable — never break DNS.
   }
 
-  await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
+  if (logPassed) {
+    await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
+  }
   return upstreamFailure(queryBuf);
 }
 
 // ---- Test endpoint (mirrors the live pipeline) ----
 
+/** @param {string} domain @param {Env} env @returns {Promise<unknown>} */
 async function testDomain(domain, env) {
   await ensureBlocklist(env);
   await refreshStores();
@@ -245,6 +270,7 @@ async function testDomain(domain, env) {
 // ---- Worker entry ----
 
 export default {
+  /** @param {Request} request @param {Env} env */
   async fetch(request, env) {
     const url = new URL(request.url);
     ensureKv(env);

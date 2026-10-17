@@ -17,6 +17,7 @@ const RULES_KEY = 'rules:data';
 const LEGACY_PREFIX = 'rule:';
 const CACHE_TTL_MS = 30_000;
 
+/** @param {string} raw @returns {Map<string, 'allow'|'deny'>} */
 function parseRules(raw) {
   const map = new Map();
   for (const line of raw.split('\n')) {
@@ -24,14 +25,17 @@ function parseRules(raw) {
     if (i === -1) continue;
     const kind = line.slice(0, i);
     const domain = line.slice(i + 1);
-    if ((kind === 'allow' || kind === 'deny') && domain) map.set(domain, kind);
+    if ((kind === 'allow' || kind === 'deny') && domain)   map.set(domain, kind);
   }
   return map;
 }
 
 export class RuleStore {
+  /** @param {KVLike|null} kv */
+  /** @param {KVLike} kv (start null; call bind() once the binding is known) */
   constructor(kv) {
     this.kv = kv;
+    /** @type {Map<string, 'allow'|'deny'>} */
     this.rules = new Map(); // domain -> 'allow' | 'deny'
     this.version = null;
     this.loaded = false;
@@ -43,6 +47,7 @@ export class RuleStore {
    * A binding change means a *different namespace* — keeping the TTL cache
    * would serve another namespace's rules for up to CACHE_TTL.
    */
+  /** @param {KVLike} kv */
   bind(kv) {
     this.kv = kv;
     this.rules = new Map();
@@ -79,13 +84,13 @@ export class RuleStore {
 
     let raw;
     let readOk = false;
-    try { raw = await this.kv.get(RULES_KEY, 'text'); readOk = true; } catch {}
+    try { raw = await this.kv.get(RULES_KEY, 'text'); readOk = true; } catch { /* stale read: retry after TTL */ }
     if (!readOk) {
       this.cachedAt = Date.now(); // keep stale; retry after TTL
       return;
     }
 
-    if (raw == null) {
+    if (raw === null || raw === undefined) {
       // Read succeeded and the key is genuinely absent -> maybe legacy layout.
       const migrated = await this.migrateLegacy();
       if (migrated === null) {
@@ -103,13 +108,13 @@ export class RuleStore {
 
   /**
    * One-time import of the old one-key-per-rule layout.
-   * @returns {Promise<Map|null>} the migrated map, or null if the scan failed
+   * @returns {Promise<Map<string, 'allow'|'deny'>|null>} the migrated map, or null if the scan failed
    *   (null tells the caller to keep its current data rather than trust an
    *   empty result).
    */
   async migrateLegacy() {
     const map = new Map();
-    let scanOk = false;
+    let scanOk;
     try {
       let cursor;
       do {
@@ -128,9 +133,7 @@ export class RuleStore {
         }
       } while (cursor);
       scanOk = true;
-    } catch {
-      scanOk = false;
-    }
+    } catch { /* list scan failed: map is discarded via !scanOk */ }
 
     // Scan failed -> indistinguishable from "no legacy keys"; don't write.
     if (!scanOk) return null;
@@ -147,6 +150,7 @@ export class RuleStore {
    * (may be a parent of `domain`). Allow wins across all parent levels;
    * otherwise the most specific deny wins.
    */
+  /** @param {string} domain @returns {{kind:'allow'|'deny', at:string}|null} */
   match(domain) {
     const map = this.rules;
     if (map.size === 0) return null;
@@ -154,6 +158,7 @@ export class RuleStore {
     let d = domain;
     if (d.charCodeAt(d.length - 1) === 46) d = d.slice(0, -1);
 
+    /** @type {{kind:'allow'|'deny', at:string}|null} */
     let denyHit = null;
     for (;;) {
       const hit = map.get(d);
@@ -174,11 +179,13 @@ export class RuleStore {
     return denyHit;
   }
 
+  /** @param {string} domain @returns {'allow'|'deny'|null} */
   lookup(domain) {
     const m = this.match(domain);
     return m ? m.kind : null;
   }
 
+  /** @param {string} domain @param {'allow'|'deny'} kind */
   async put(domain, kind) {
     const d = normalizeDomain(domain);
     if (!d) throw new Error('invalid domain');
@@ -191,7 +198,7 @@ export class RuleStore {
 
   /**
    * Bulk add in ONE read + ONE write (instead of N of each).
-   * @param {Array<{domain:string, kind:string}>} entries
+   * @param {Array<{domain?: unknown, kind?: unknown}>} entries
    * @returns {Promise<number>} count actually applied
    */
   async putBulk(entries) {
@@ -207,6 +214,26 @@ export class RuleStore {
     return n;
   }
 
+  /**
+   * Swap the entire rule map for `entries` in ONE read + ONE save.
+   * Used by config import in replace mode.
+   * @param {Array<{domain?: unknown, kind?: unknown}>} entries
+   * @returns {Promise<number>} total rules kept after the swap
+   */
+  async replaceAll(entries) {
+    const map = new Map();
+    for (const e of entries) {
+      const d = normalizeDomain(e.domain);
+      if (!d || (e.kind !== 'allow' && e.kind !== 'deny')) continue;
+      map.set(d, e.kind);
+    }
+    await this.refresh(true);
+    this.rules = map;
+    await this.save();
+    return map.size;
+  }
+
+  /** @param {string} domain @returns {Promise<boolean>} */
   async delete(domain) {
     const d = normalizeDomain(domain);
     if (!d) return false;
@@ -216,6 +243,7 @@ export class RuleStore {
     return true;
   }
 
+  /** @returns {Promise<Array<{domain:string, kind:'allow'|'deny'}>>} */
   async list() {
     const out = [];
     for (const [domain, kind] of this.rules) out.push({ domain, kind });
@@ -234,6 +262,7 @@ export class RuleStore {
   }
 }
 
+/** @param {unknown} raw @returns {string} */
 export function normalizeDomain(raw) {
   if (typeof raw !== 'string') return '';
   let s = raw.trim().toLowerCase();

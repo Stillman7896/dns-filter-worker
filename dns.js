@@ -2,6 +2,7 @@
 
 // ---------- Minimal Buffer shim (Uint8Array + BE accessors) ----------
 class Buf extends Uint8Array {
+  // @ts-expect-error — Buf.from deliberately accepts more inputs than Uint8Array.from
   static from(x) {
     if (x instanceof Uint8Array) {
       const b = new Buf(x.byteLength);
@@ -22,14 +23,22 @@ class Buf extends Uint8Array {
     throw new Error('Buf.from: unsupported input');
   }
 
+  /** @param {unknown} x @returns {boolean} */
   static isBuffer(x) {
     return x instanceof Buf || x instanceof Uint8Array;
   }
 
+  /**
+   * @param {number} o
+   * @returns {number}
+   */
+
+  /** @param {number} o @returns {number} */
   readUInt16BE(o) {
     return (this[o] << 8) | this[o + 1];
   }
 
+  /** @param {number} o @returns {number} */
   readUInt32BE(o) {
     return (
       this[o] * 0x1000000 +
@@ -37,11 +46,13 @@ class Buf extends Uint8Array {
     );
   }
 
+  /** @param {number} v @param {number} o */
   writeUInt16BE(v, o) {
     this[o] = (v >>> 8) & 0xff;
     this[o + 1] = v & 0xff;
   }
 
+  /** @param {number} v @param {number} o */
   writeUInt32BE(v, o) {
     this[o] = (v >>> 24) & 0xff;
     this[o + 1] = (v >>> 16) & 0xff;
@@ -49,6 +60,12 @@ class Buf extends Uint8Array {
     this[o + 3] = v & 0xff;
   }
 
+  /**
+   * @param {string} [_enc]
+   * @param {number} [s]
+   * @param {number} [e]
+   * @returns {string}
+   */
   toString(_enc, s, e) {
     s = s ?? 0;
     e = e ?? this.length;
@@ -64,6 +81,10 @@ export { Buf };
  * Parse QNAME out of a raw DNS query (wire format).
  * @param {Buf|Uint8Array} buf
  * @returns {{ name: string, qtype: number, qclass: number } | null}
+ */
+/**
+ * @param {Uint8Array|null} buf
+ * @returns {{name:string, qtype:number, qclass:number}|null}
  */
 export function parseQuestion(buf) {
   if (!buf || buf.length < 12) return null;
@@ -107,6 +128,7 @@ export function parseQuestion(buf) {
   return { name: labels.join('.'), qtype, qclass };
 }
 
+/** @param {Uint8Array} queryBuf @returns {Buf} */
 export function buildNxdomainResponse(queryBuf) {
   const out = Buf.from(queryBuf);
   const flags = out.readUInt16BE(2);
@@ -117,6 +139,7 @@ export function buildNxdomainResponse(queryBuf) {
   return out;
 }
 
+/** @param {Uint8Array} queryBuf @returns {Buf} */
 export function buildRefusedResponse(queryBuf) {
   const out = Buf.from(queryBuf);
   const flags = out.readUInt16BE(2);
@@ -127,6 +150,10 @@ export function buildRefusedResponse(queryBuf) {
   return out;
 }
 
+/** Degenerate/null buffers fall back to the default TTL (60s).
+ * @param {Uint8Array|null} respBuf
+ * @returns {number}
+ */
 export function minTtl(respBuf) {
   if (!respBuf || respBuf.length < 12) return 60;
 
@@ -164,6 +191,7 @@ export function minTtl(respBuf) {
   return Math.min(min, 300);
 }
 
+/** @param {Uint8Array} buf @param {number} off @returns {number} */
 function skipName(buf, off) {
   let jumps = 0;
   while (off < buf.length) {
@@ -176,6 +204,7 @@ function skipName(buf, off) {
   return -1;
 }
 
+/** @param {string} str @returns {Buf|null} */
 export function base64urlDecode(str) {
   try {
     const b64 = str.replace(/-/g, '+').replace(/_/g, '/');

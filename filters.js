@@ -15,7 +15,10 @@ export const BLOCKED_QUERY_STATUSES = new Set([
   'deny', 'blocklist', 'tld', 'keyword', 'rebind', 'idn',
 ]);
 
-/** Last label of a lowercased FQDN, or ''. */
+/** Last label of a lowercased FQDN, or ''.
+ * @param {string} name
+ * @returns {string}
+ */
 export function tldOf(name) {
   const dot = name.lastIndexOf('.');
   return dot === -1 ? '' : name.slice(dot + 1);
@@ -28,7 +31,10 @@ export const INTERNAL_SUFFIXES = [
   'localhost.localdomain',
 ];
 
-/** Returns the special-use name / TLD that matched, or null. */
+/** Returns the special-use name / TLD that matched, or null.
+ * @param {string} name
+ * @returns {string|null}
+ */
 export function rebindNameHit(name) {
   for (const s of INTERNAL_SUFFIXES) {
     if (name === s || name.endsWith('.' + s)) return s;
@@ -41,6 +47,7 @@ export function rebindNameHit(name) {
  * IDN homograph detection — block-all/off strategy: any punycode (xn--)
  * label, or non-ASCII bytes from non-compliant clients.
  * @returns {string|null} offending label or null
+ * @param {string} name
  */
 export function idnHit(name) {
   let start = 0;
@@ -58,8 +65,8 @@ export function idnHit(name) {
 /**
  * Ordered query-side decision chain (synchronous — stores must already be
  * refreshed by the caller).
- * @param {{ruleStore:object, blocklist:object, keywordStore:object, tldStore:object}} stores
- * @param {{rebindProtection:boolean, idnBlock:boolean, tldBlock:boolean, keywordBlock:boolean}} settings
+ * @param {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, tldStore: {get(): Set<string>}}} stores
+ * @param {Pick<FilterSettings, 'rebindProtection'|'idnBlock'|'tldBlock'|'keywordBlock'>} settings
  * @param {string} name lowercase QNAME
  * @returns {{status:string, filter:string, matched:string|null}}
  */
@@ -114,8 +121,10 @@ export function runQueryFilters(stores, settings, name) {
 
 // ---- Answer-level rebinding: private IP inspection (works on Buf or Uint8Array) ----
 
+/** @param {Uint8Array} b @param {number} o @returns {number} */
 function rd16(b, o) { return ((b[o] & 0xff) << 8) | (b[o + 1] & 0xff); }
 
+/** @param {Uint8Array} b @param {number} o @returns {boolean} */
 export function isPrivateV4(b, o) {
   const ip = ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
   if ((ip >>> 24) === 10) return true;                              // 10/8
@@ -127,6 +136,7 @@ export function isPrivateV4(b, o) {
   return ip === 0;
 }
 
+/** @param {Uint8Array} b @param {number} o @returns {boolean} */
 export function isPrivateV6(b, o) {
   let allZero = true;
   for (let i = o; i < o + 16; i++) if (b[i]) { allZero = false; break; }
@@ -145,6 +155,7 @@ export function isPrivateV6(b, o) {
   return false;
 }
 
+/** @param {Uint8Array} buf @param {number} off @returns {number} */
 function skipNameAt(buf, off) {
   let jumps = 0;
   while (off < buf.length) {
@@ -157,12 +168,13 @@ function skipNameAt(buf, off) {
   return -1;
 }
 
+/** @param {Uint8Array} b @param {number} o @returns {string} */
 function fmtV4(b, o) { return `${b[o]}.${b[o + 1]}.${b[o + 2]}.${b[o + 3]}`; }
 
 /**
  * Walk the ANSWER section of a DNS response and return the first private /
  * link-local A or AAAA address found, or null if all answers are public.
- * @param {Uint8Array} buf
+ * @param {Uint8Array|null} buf
  * @returns {string|null}
  */
 export function privateAnswerIP(buf) {

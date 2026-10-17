@@ -29,11 +29,13 @@ test('parseQuestion: standard A query', () => {
 
 test('parseQuestion: uppercases labels down (case-insensitive QNAME)', () => {
   const q = parseQuestion(buildQuery('EXAMPLE.COM'));
+  assert.ok(q, 'parseQuestion returned null');
   assert.equal(q.name, 'example.com');
 });
 
 test('parseQuestion: AAAA + non-IN class pass through', () => {
   const q = parseQuestion(buildQuery('a.b.test', { qtype: 28, qclass: 4 }));
+  assert.ok(q, 'parseQuestion returned null');
   assert.equal(q.qtype, 28);
   assert.equal(q.qclass, 4);
 });
@@ -95,6 +97,7 @@ test('base64urlDecode: round-trip and garbage handling', () => {
   const query = buildQuery('example.com');
   const b64 = Buffer.from(query).toString('base64url');
   const decoded = base64urlDecode(b64);
+  assert.ok(decoded, 'base64urlDecode returned null');
   assert.deepEqual([...decoded], [...query]);
   assert.equal(base64urlDecode('!!not-base64!!'), null);
 });

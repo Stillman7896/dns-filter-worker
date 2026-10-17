@@ -208,7 +208,7 @@ test('SettingsStore: defaults, JSON load, partial update', async () => {
 
   await ss.update({ idnBlock: true });
   assert.equal(ss.get().idnBlock, true);
-  const raw = JSON.parse(kv.data.get('settings:main'));
+  const raw = JSON.parse(kv.data.get('settings:main') ?? '');
   assert.equal(raw.idnBlock, true);
   assert.equal(raw.rebindProtection, true, 'unrelated keys preserved');
 
@@ -241,4 +241,40 @@ test('clampRetention: bounds and type checks', () => {
   assert.equal(clampRetention(12.7), 12);
   assert.ok(Number.isNaN(clampRetention('30')));
   assert.ok(Number.isNaN(clampRetention(NaN)));
+});
+
+// ---- bulk import primitives ----------------------------------------------------
+
+test('TextSetStore: addMany merges in one save; replaceAll swaps wholesale', async () => {
+  const kv = new FakeKV();
+  const ts = new TextSetStore(kv, 'tlds:data');
+  await ts.add('zip');
+  const putsBefore = kv.stats.puts;
+
+  const r1 = await ts.addMany(['mov', 'ZIP', '.top', 'no!tld', ''], normalizeTld);
+  assert.deepEqual(r1, { applied: 2, skipped: 2 }, 'mov+top applied; blank+invalid skipped; zip dedup');
+  assert.ok(!ts.list().includes('no!tld'));
+  assert.equal(kv.stats.puts, putsBefore + 2, 'exactly one save = blob + version');
+  assert.deepEqual(ts.list().sort(), ['mov', 'top', 'zip']);
+
+  const r2 = await ts.replaceAll(['io', 'bogus.tld!'], normalizeTld);
+  assert.deepEqual(r2, { applied: 1, skipped: 1 });
+  assert.deepEqual(ts.list(), ['io']);
+  assert.equal(await ts.addMany([]).then((r) => r.applied), 0, 'empty input -> no write');
+});
+
+test('RuleStore: replaceAll swaps the whole map in one save', async () => {
+  const kv = new FakeKV();
+  const rs = new RuleStore(kv);
+  await rs.put('old.com', 'deny');
+  const putsBefore = kv.stats.puts;
+
+  const n = await rs.replaceAll([
+    { domain: 'a.com', kind: 'allow' },
+    { domain: 'NO.dots..', kind: 'deny' },   // invalid -> dropped
+    { kind: 'deny' },                         // no domain -> dropped
+  ]);
+  assert.equal(n, 1);
+  assert.deepEqual(await rs.list(), [{ domain: 'a.com', kind: 'allow' }]);
+  assert.equal(kv.stats.puts, putsBefore + 2, 'one save = blob + version');
 });

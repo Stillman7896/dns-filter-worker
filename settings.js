@@ -12,21 +12,27 @@
 export const SETTINGS_KEY = 'settings:main';
 export const CACHE_TTL_MS = 30_000;
 
+/** @type {FilterSettings} */
 export const DEFAULT_SETTINGS = Object.freeze({
   rebindProtection: true, // block private/internal IPs in answers + internal hostnames
   idnBlock: false,        // block all punycode / non-ASCII labels (homograph defense)
   tldBlock: false,        // block queries whose TLD is in the Blocked-TLD list
   keywordBlock: false,    // block queries containing any Blocked-keyword
+  logPassed: true,        // write allow/none rows to dns_logs; false = blocks only
   logRetentionDays: 30,   // delete dns_logs rows older than this; 0 = keep forever
 });
 
-/** Clamp a candidate retention value; returns 0..3650 or NaN if not a number. */
+/** Clamp a candidate retention value; returns 0..3650 or NaN if not a number.
+ * @param {unknown} v
+ * @returns {number}
+ */
 export function clampRetention(v) {
   if (typeof v !== 'number' || !Number.isFinite(v)) return NaN;
   return Math.min(3650, Math.max(0, Math.floor(v)));
 }
 
 export class SettingsStore {
+  /** @param {KVLike} kv */
   constructor(kv) {
     this.kv = kv;
     this.cache = { ...DEFAULT_SETTINGS };
@@ -39,6 +45,7 @@ export class SettingsStore {
    * Point at a different KV binding and reset to defaults until the next
    * successful load (see rules.js for the rationale).
    */
+  /** @param {KVLike} kv */
   bind(kv) {
     this.kv = kv;
     this.cache = { ...DEFAULT_SETTINGS };
@@ -61,7 +68,7 @@ export class SettingsStore {
           const raw = await this.kv.get(SETTINGS_KEY, 'text');
           if (raw) {
             let parsed = {};
-            try { parsed = JSON.parse(raw); } catch {}
+            try { parsed = JSON.parse(raw); } catch { /* fall back to defaults */ }
             this.cache = { ...DEFAULT_SETTINGS, ...parsed };
           } else {
             // Read succeeded and the key is absent -> genuinely fresh install.
@@ -88,6 +95,7 @@ export class SettingsStore {
   }
 
   /** Persist a partial update; applies immediately in this isolate. */
+  /** @param {Partial<FilterSettings>} patch */
   async update(patch) {
     const next = { ...this.get(), ...patch };
     await this.kv.put(SETTINGS_KEY, JSON.stringify(next));

@@ -12,6 +12,7 @@ export class Blocklist {
     this.size = 0;
   }
 
+  /** @param {string} text */
   load(text) {
     const set = new Set();
     const lines = text.split('\n');
@@ -73,6 +74,7 @@ export class Blocklist {
     }
   }
 
+  /** @param {string} domain @returns {boolean} */
   isBlocked(domain) {
     return this.match(domain) !== null;
   }

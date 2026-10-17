@@ -8,19 +8,31 @@ import { TextSetStore } from '../lists.js';
 import { SettingsStore } from '../settings.js';
 import { FakeKV } from './helpers.js';
 
+/**
+ * @param {KVLike} kv
+ * @returns {ApiCtx}
+ */
 function mkCtx(kv) {
   return {
     rules: new RuleStore(kv),
     settings: new SettingsStore(kv),
     keywords: new TextSetStore(kv, 'keywords:data'),
     tlds: new TextSetStore(kv, 'tlds:data'),
-    testFn: async (domain) => ({ domain, status: 'none', filter: 'upstream', matched: null }),
+    testFn: async (domain, env) => ({ domain, status: 'none', filter: 'upstream', matched: null }),
   };
 }
 
 const PASSWORD = 'hunter2';
 
+/**
+ * @param {ApiCtx} ctx
+ * @param {Env} env
+ * @param {string} path
+ * @param {{method?: string, body?: unknown, cookie?: string}} [opts]
+ * @returns {Promise<Response>}
+ */
 function call(ctx, env, path, { method = 'GET', body, cookie } = {}) {
+  /** @type {Record<string, string>} */
   const headers = { 'Content-Type': 'application/json' };
   if (cookie) headers.Cookie = cookie;
   const req = new Request('https://worker.test' + path, {
@@ -31,6 +43,7 @@ function call(ctx, env, path, { method = 'GET', body, cookie } = {}) {
   return handleApi(req, env, new URL(req.url), ctx);
 }
 
+/** @param {Response} res @returns {string} */
 function cookieFrom(res) {
   const sc = res.headers.get('set-cookie');
   assert.ok(sc, 'session cookie set');
@@ -265,6 +278,7 @@ test('logs: missing D1 binding -> 501 (not 503, not 404)', async () => {
 
 // Minimal D1 for the stats endpoint: each prepare() sniffed and bound to a
 // canned handler that matches the real GROUP BY queries in dashboard.js.
+/** @returns {D1Like} */
 function statsD1() {
   const statusRows = [
     { status: 'blocklist', n: 5 }, { status: 'none', n: 3 },
@@ -275,6 +289,7 @@ function statsD1() {
   ];
   const hourRows = [{ hour: 10, n: 4 }, { hour: 11, n: 6 }];
   const totalRow = { n: 11 };
+  /** @param {string} sql @returns {any} */
   const handlerFor = (sql) => {
     if (/GROUP BY status/i.test(sql)) return statusRows;
     if (/WHERE status IN/i.test(sql)) return topBlocked;
@@ -282,6 +297,7 @@ function statsD1() {
     if (/^SELECT COUNT\(\*\) AS n FROM dns_logs$/i.test(sql.trim())) return totalRow;
     throw new Error('unexpected STATS sql: ' + sql);
   };
+  /** @param {any} rows @returns {{all: () => Promise<{results: any}>, first: () => Promise<any>, run: () => Promise<{success: boolean}>}} */
   const binding = (rows) => ({
     all: async () => ({ results: rows }),
     first: async () => (Array.isArray(rows) ? rows[0] : rows),
@@ -332,6 +348,7 @@ test('logs/stats: requires D1 (501 when missing)', async () => {
 
 // ---- config backup: export / import --------------------------------------------
 
+/** @param {KVLike} kv */
 async function login(kv) {
   const ctx = mkCtx(kv);
   const env = { DASHBOARD_PASSWORD: PASSWORD };

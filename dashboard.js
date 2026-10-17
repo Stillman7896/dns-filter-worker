@@ -12,11 +12,14 @@ import { clampRetention } from './settings.js';
 
 const SESSION_COOKIE = 'dns_dash_session';
 
+/** @param {Env} env @returns {boolean} */
 function isConfigured(env) {
   return typeof env.DASHBOARD_PASSWORD === 'string' && env.DASHBOARD_PASSWORD.length > 0;
 }
 
-/** Constant-time-ish string compare. */
+/** Constant-time-ish string compare.
+ * @param {unknown} a @param {unknown} b @returns {boolean}
+ */
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   if (a.length !== b.length) return false;
@@ -25,14 +28,21 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-/** Session is valid only if the cookie matches the configured password. */
+/** Session is valid only if the cookie matches the configured password.
+ * @param {Request} request
+ * @param {Env} env
+ * @returns {boolean}
+ */
 function authOk(request, env) {
+  const pw = env.DASHBOARD_PASSWORD;
+  if (typeof pw !== 'string') return false;
   const cookie = request.headers.get('cookie') || '';
   const m = cookie.match(/(?:^|;\s*)dns_dash_session=([^;]+)/);
   if (!m) return false;
-  return safeEqual(decodeURIComponent(m[1]), env.DASHBOARD_PASSWORD);
+  return safeEqual(decodeURIComponent(m[1]), pw);
 }
 
+/** @param {unknown} body @param {ResponseInit} [init] @returns {Response} */
 function json(body, init = {}) {
   return new Response(JSON.stringify(body), {
     ...init,
@@ -45,17 +55,37 @@ function json(body, init = {}) {
 }
 
 /** Build ` WHERE a=? AND b=? ` + args from the given filters. */
+/** @param {Array<[string, string|null|undefined]>} entries @returns {{where: string, args: string[]}} */
 function buildWhere(entries) {
   let where = '';
   const args = [];
   for (const [clause, value] of entries) {
-    if (value === '' || value == null) continue;
+    if (value === '' || value === null || value === undefined) continue;
     where += (where ? ' AND' : ' WHERE') + ' ' + clause;
     args.push(value);
   }
   return { where, args };
 }
 
+/** Whitelist + validate a settings object into a patch, or { error }.
+ * @param {Record<string, unknown>} source @returns {{patch?: Partial<FilterSettings>, error?: string}}
+ */
+function settingsPatch(source) {
+  /** @type {Partial<FilterSettings>} */
+  const patch = {};
+  const BOOL_KEYS = /** @type {const} */ (['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock', 'logPassed']);
+  for (const k of BOOL_KEYS) {
+    if (typeof source[k] === 'boolean') patch[k] = source[k]; // k is a boolean key
+  }
+  if ('logRetentionDays' in source) {
+    const days = clampRetention(source.logRetentionDays);
+    if (Number.isNaN(days)) return { error: 'logRetentionDays must be a number (0-3650)' };
+    patch.logRetentionDays = days;
+  }
+  return { patch };
+}
+
+/** @param {Request} request @param {Env} env @param {URL} url @param {ApiCtx} ctx */
 export async function handleApi(request, env, url, ctx) {
   const { rules, settings, keywords, tlds, testFn } = ctx;
 
@@ -72,9 +102,9 @@ export async function handleApi(request, env, url, ctx) {
       try {
         const b = await request.json();
         if (b && typeof b.password === 'string') password = b.password;
-      } catch {}
+      } catch { /* non-JSON login body: fall through to reject */ }
     }
-    if (!password || !safeEqual(password, env.DASHBOARD_PASSWORD)) {
+    if (!password || typeof env.DASHBOARD_PASSWORD !== 'string' || !safeEqual(password, env.DASHBOARD_PASSWORD)) {
       return json({ error: 'Invalid password' }, { status: 401 });
     }
 
@@ -173,24 +203,84 @@ export async function handleApi(request, env, url, ctx) {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
 
-      const patch = {};
-      for (const k of ['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock']) {
-        if (typeof body[k] === 'boolean') patch[k] = body[k];
-      }
-      if ('logRetentionDays' in body) {
-        const days = clampRetention(body.logRetentionDays);
-        if (Number.isNaN(days)) {
-          return json({ error: 'logRetentionDays must be a number (0-3650)' }, { status: 400 });
-        }
-        patch.logRetentionDays = days;
-      }
-      if (Object.keys(patch).length === 0) {
+      const { patch, error } = settingsPatch(body);
+      if (error) return json({ error }, { status: 400 });
+      if (!patch || Object.keys(patch).length === 0) {
         return json({ error: 'no valid settings provided' }, { status: 400 });
       }
 
       await settings.update(patch);
       return json({ ok: true, settings: settings.get() });
     }
+  }
+
+  // ---- config backup: export / import ----
+  if (path === '/api/export' && request.method === 'GET') {
+    await Promise.all([
+      settings.refresh(true),
+      rules.refresh(true),
+      keywords.refresh(true),
+      tlds.refresh(true),
+    ]);
+    return json({
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      settings: settings.get(),
+      rules: await rules.list(),
+      keywords: keywords.list(),
+      tlds: tlds.list(),
+    });
+  }
+
+  if (path === '/api/import' && request.method === 'POST') {
+    let body;
+    try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
+
+    const mode = body.mode === 'replace' ? 'replace' : 'merge';
+    const MAX_ITEMS = 200_000; // KV value cap is 25 MiB; 200k rows is well under it
+    /** @param {unknown} v @returns {any[]|null} */
+    const arr = (v) => (Array.isArray(v) ? v.slice(0, MAX_ITEMS) : null);
+    const rulesIn = arr(body.rules);
+    const kwIn = arr(body.keywords);
+    const tldIn = arr(body.tlds);
+
+    if (!rulesIn && !kwIn && !tldIn && !body.settings) {
+      return json({ error: 'nothing to import: provide rules, keywords, tlds, or settings' }, { status: 400 });
+    }
+
+    /** @type {{mode:'merge'|'replace', rules: {applied:number, skipped:number}|null, keywords: {applied:number, skipped:number}|null, tlds: {applied:number, skipped:number}|null, settings: boolean}} */
+    const summary = { mode, rules: null, keywords: null, tlds: null, settings: false };
+
+    if (rulesIn) {
+      const valid = rulesIn.filter(
+        (e) => e && typeof e.domain === 'string' && (e.kind === 'allow' || e.kind === 'deny'));
+      const applied = mode === 'replace'
+        ? await rules.replaceAll(valid)
+        : await rules.putBulk(valid);
+      summary.rules = { applied, skipped: rulesIn.length - valid.length };
+    }
+
+    if (kwIn) {
+      summary.keywords = mode === 'replace'
+        ? await keywords.replaceAll(kwIn, normalizeKeyword)
+        : await keywords.addMany(kwIn, normalizeKeyword);
+    }
+    if (tldIn) {
+      summary.tlds = mode === 'replace'
+        ? await tlds.replaceAll(tldIn, normalizeTld)
+        : await tlds.addMany(tldIn, normalizeTld);
+    }
+
+    if (body.settings && typeof body.settings === 'object') {
+      const { patch, error } = settingsPatch(body.settings);
+      if (error) return json({ error }, { status: 400 });
+      if (patch && Object.keys(patch).length) {
+        await settings.update(patch);
+        summary.settings = true;
+      }
+    }
+
+    return json({ ok: true, ...summary });
   }
 
   // ---- filter lists: blocked TLDs + blocked keywords ----
@@ -208,7 +298,7 @@ export async function handleApi(request, env, url, ctx) {
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
-      const value = normalize(body.value != null ? body.value : body.add);
+      const value = normalize(body.value === null || body.value === undefined ? body.add : body.value);
       if (!value) return json({ error: 'invalid value' }, { status: 400 });
       const added = await store.add(value);
       return json({ ok: true, added, items: store.list() });
