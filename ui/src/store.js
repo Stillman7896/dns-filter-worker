@@ -1,0 +1,218 @@
+// Single app store: boot/session, routed views, data, and the operation +
+// notification system every button reports through.
+import { reactive, computed } from 'vue';
+import { api, ApiError } from './api.js';
+
+export const VIEWS = [
+  { id: 'overview', label: 'Overview', verb: 'See traffic', group: 'traffic' },
+  { id: 'rules', label: 'Rules', verb: 'Add allow or deny rules', group: 'traffic' },
+  { id: 'probe', label: 'Probe', verb: 'Test one domain', group: 'traffic' },
+  { id: 'logs', label: 'Logs', verb: 'Read the query log', group: 'traffic' },
+  { id: 'lists', label: 'Filter lists', verb: 'Manage blocked TLDs and keywords', group: 'config' },
+  { id: 'settings', label: 'Settings', verb: 'Change logging and protections', group: 'config' },
+  { id: 'backup', label: 'Backup', verb: 'Export or import configuration', group: 'config' },
+];
+
+export const state = reactive({
+  phase: 'boot', // boot | unconfigured | auth | ready
+  bootError: null,
+  signingOut: false,
+  route: 'overview',
+
+  rules: [],
+  ruleFilter: '',
+  keywords: [],
+  tlds: [],
+  settings: null,
+
+  logs: { rows: [], total: 0, search: '', status: '', limit: 50, offset: 0 },
+  stats: null,
+  statsError: null,
+
+  ops: {},
+  flashes: {},
+  toasts: [],
+  lastId: 1,
+});
+
+export const pendingCount = computed(() => Object.keys(state.ops).length);
+
+// ---- routing (hash so a refresh keeps the open view) ----
+export function setRoute(id) {
+  if (!VIEWS.some((v) => v.id === id)) id = 'overview';
+  if (state.route !== id) location.hash = `#/${id}`;
+}
+
+function syncHash() {
+  const id = (location.hash || '').replace(/^#\/?/, '') || 'overview';
+  if (VIEWS.some((v) => v.id === id)) state.route = id;
+  else location.replace('#/overview');
+}
+
+// ---- notifications ----
+function touch(id, patch) {
+  const t = state.toasts.find((t) => t.id === id);
+  if (t) Object.assign(t, patch);
+}
+
+export function pushToast({ kind, text, detail, action, ttl }) {
+  const id = state.lastId++;
+  state.toasts.push({ id, kind, text, detail: detail || null, action: action || null, ttl: ttl || null });
+  if (state.toasts.length > 4) state.toasts.splice(0, state.toasts.length - 4);
+  if (ttl) setTimeout(() => dismissToast(id), ttl);
+  return id;
+}
+
+export function dismissToast(id) {
+  const i = state.toasts.findIndex((t) => t.id === id);
+  if (i >= 0) state.toasts.splice(i, 1);
+}
+
+// ---- "ing" copy for the pending alert, derived from the button's label ----
+export function ing(verb) {
+  const [head, ...rest] = verb.split(' ');
+  const stem = head.endsWith('e') ? head.slice(0, -1) : head;
+  return [stem + 'ing', ...rest].join(' ');
+}
+
+/**
+ * Run a backend operation with full feedback: disabled button + spinner
+ * (busyKey), a sticky alert that moves pending -> saved/failed, a short
+ * button flash, and an optional undo supplied from the result.
+ * @param {string} key
+ * @param {{verb: string, ok: string|((r:any)=>string), undo?: (r:any)=>Promise<any>|any, fn: () => Promise<any>}} spec
+ */
+export async function runOp(key, spec) {
+  const pending = pushToast({ kind: 'pending', text: ing(spec.verb) + '..' });
+  state.ops[key] = true;
+
+  let result;
+  try {
+    result = await spec.fn();
+  } catch (err) {
+    const e = err instanceof ApiError ? err : new ApiError(String(err && err.message ? err.message : err));
+    if (e.status === 401 && state.phase === 'ready') {
+      state.phase = 'auth';
+      touch(pending, { kind: 'error', text: 'Session expired', detail: 'Sign in to keep working.', ttl: null });
+    } else if (e.status === 503 && e.code === 'unconfigured') {
+      state.phase = 'unconfigured';
+      touch(pending, { kind: 'error', text: 'No dashboard password set', detail: 'Set DASHBOARD_PASSWORD in the worker, then reload.', ttl: null });
+    } else {
+      const detail = e.status === 500 ? `${e.message} — the worker logged the request; try again quietly later.` : e.message;
+      touch(pending, {
+        kind: 'error',
+        text: `${spec.verb} failed`,
+        detail,
+        action: { label: 'Try again', run: () => runOp(key, spec) },
+      });
+    }
+    state.flash(key, 'fail');
+    throw e;
+  } finally {
+    delete state.ops[key];
+  }
+
+  const ok = typeof spec.ok === 'function' ? spec.ok(result) : spec.ok;
+  const undo = spec.undo && result !== undefined
+    ? {
+        label: 'Undo',
+        run: async () => {
+          const undoToast = pushToast({ kind: 'pending', text: `Reverting ${ok}..`.replace(/\s+$/, '') });
+          try {
+            await spec.undo(result);
+            touch(undoToast, { kind: 'success', text: 'Reverted', ttl: 3500 });
+          } catch {
+            touch(undoToast, { kind: 'error', text: 'Revert failed', detail: 'The change stayed in place.', ttl: null });
+          }
+        },
+      }
+    : null;
+  touch(pending, { kind: 'success', text: ok, action: undo, ttl: undo ? 9000 : 4200 });
+  state.flash(key, 'ok', 1700);
+  return result;
+}
+
+state.flash = function flash(key, kind, ms = 1500) {
+  state.flashes[key] = kind;
+  setTimeout(() => {
+    if (state.flashes[key] === kind) delete state.flashes[key];
+  }, ms);
+};
+
+// ---- session / data ----
+export async function boot() {
+  state.phase = 'boot';
+  state.bootError = null;
+  try {
+    await api.getSettings(); // probe: 503 = unconfigured, 401 = needs sign-in
+    state.settings = (await api.getSettings()).settings;
+    await Promise.all([loadRules(), loadLists()]);
+    await Promise.all([loadLogs(), loadStats()]);
+    state.phase = 'ready';
+  } catch (e) {
+    if (e.status === 503) state.phase = 'unconfigured';
+    else if (e.status === 401) state.phase = 'auth';
+    else {
+      state.phase = 'boot';
+      state.bootError = e.message;
+    }
+  }
+}
+
+export async function login(password) {
+  await api.login(password);
+  state.signingOut = false;
+  await boot();
+}
+
+export async function signOut() {
+  try { await api.signOut(); } catch { /* cookie already gone */ }
+  state.signingOut = true;
+  state.phase = 'auth';
+}
+
+export async function loadRules() {
+  state.rules = (await api.rules()).rules;
+}
+
+export async function loadLists() {
+  const [k, t] = await Promise.all([api.listItems('keywords'), api.listItems('tlds')]);
+  state.keywords = k.items;
+  state.tlds = t.items;
+}
+
+export async function loadLogs() {
+  const { search, status, limit, offset } = state.logs;
+  const data = await api.logs({ search, status, limit, offset });
+  state.logs.rows = data.logs;
+  state.logs.total = data.total;
+}
+
+export async function loadStats() {
+  state.statsError = null;
+  try {
+    state.stats = await api.logStats();
+  } catch (e) {
+    if (e.code === 'no_d1') state.stats = null;
+    state.statsError = e.code === 'no_d1' ? 'no_d1' : e.message;
+  }
+}
+
+export const filteredRules = computed(() => {
+  const q = state.ruleFilter.trim().toLowerCase();
+  const rows = q ? state.rules.filter((r) => r.domain.includes(q) || r.kind.includes(q)) : state.rules;
+  return rows;
+});
+
+export const logPages = computed(() => {
+  const { total, limit, offset } = state.logs;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  return { pages, page: Math.floor(offset / limit) + 1 };
+});
+
+export function initStore() {
+  window.addEventListener('hashchange', syncHash);
+  if (location.hash) syncHash();
+  else location.replace('#/overview');
+  boot();
+}

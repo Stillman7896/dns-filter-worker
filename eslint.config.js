@@ -1,5 +1,9 @@
 import js from '@eslint/js';
 import globals from 'globals';
+import vueParser from 'vue-eslint-parser';
+
+// Browser globals not covered by node globals
+const browserGlobals = globals.browser;
 
 // Cloudflare Workers runtime globals not covered by node globals
 const workerGlobals = {
@@ -43,6 +47,27 @@ export default [
     rules: {
       // tests may over-assert on purpose
       'no-unused-vars': ['error', { args: 'none' }],
+    },
+  },
+  {
+    // browser app: DOM globals, and destructuring omission is idiomatic
+    files: ['ui/**/*.js'],
+    languageOptions: {
+      globals: { ...browserGlobals },
+    },
+    rules: {
+      'no-unused-vars': ['error', { args: 'none', ignoreRestSiblings: true }],
+    },
+  },
+  {
+    files: ['ui/**/*.vue'],
+    languageOptions: {
+      parser: vueParser,
+      parserOptions: { ecmaVersion: 2022, sourceType: 'module' },
+      globals: { ...browserGlobals },
+    },
+    rules: {
+      'no-unused-vars': ['error', { args: 'none', ignoreRestSiblings: true }],
     },
   },
 ];

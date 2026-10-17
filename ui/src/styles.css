@@ -1,0 +1,124 @@
+/* Design tokens: an operations console in slate, one amber signal, two status
+   colours. Values swap through CSS variables so every utility follows the
+   theme without dark: variants everywhere. */
+:root {
+  --c-canvas: #edf0f5;
+  --c-surface: #ffffff;
+  --c-raised: #f4f6fa;
+  --c-line: #d3dbe6;
+  --c-ink: #0d1420;
+  --c-muted: #5a6a80;
+  --c-beacon: #ffb02e;
+  --c-beacon-ink: #1a1204;
+  --c-pass: #12855f;
+  --c-block: #c8342d;
+  --shadow-card: 0 1px 2px rgb(13 20 32 / 0.06), 0 8px 24px -16px rgb(13 20 32 / 0.35);
+}
+
+html.dark {
+  --c-canvas: #0b1018;
+  --c-surface: #131a25;
+  --c-raised: #0f1521;
+  --c-line: #222d3d;
+  --c-ink: #e6ecf5;
+  --c-muted: #8a99ae;
+  --c-beacon: #ffb02e;
+  --c-beacon-ink: #1a1204;
+  --c-pass: #4fc99b;
+  --c-block: #ff6a61;
+  /* Dark surfaces invert text onto the amber signal. */
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 32px -20px rgb(0 0 0 / 0.8);
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif;
+  background: var(--c-canvas);
+  color: var(--c-ink);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--c-beacon) 45%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--c-beacon);
+  outline-offset: 2px;
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+/* Thin, theme-consistent scrollbars on wide tables. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--c-line) transparent;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes nudge {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-3px); }
+  75% { transform: translateX(3px); }
+}
+
+@keyframes erase {
+  from { width: 100%; }
+  to { width: 0; }
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.toast-enter {
+  animation: toast-in 240ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+.nudge {
+  animation: nudge 260ms ease-in-out 2;
+}
+
+.rise-in {
+  animation: rise 320ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+
+.toast-progress {
+  animation: erase 4.2s linear forwards;
+  transform-origin: left;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
