@@ -8,19 +8,31 @@ import { TextSetStore } from '../lists.js';
 import { SettingsStore } from '../settings.js';
 import { FakeKV } from './helpers.js';
 
+/**
+ * @param {KVLike} kv
+ * @returns {ApiCtx}
+ */
 function mkCtx(kv) {
   return {
     rules: new RuleStore(kv),
     settings: new SettingsStore(kv),
     keywords: new TextSetStore(kv, 'keywords:data'),
     tlds: new TextSetStore(kv, 'tlds:data'),
-    testFn: async (domain) => ({ domain, status: 'none', filter: 'upstream', matched: null }),
+    testFn: async (domain, env) => ({ domain, status: 'none', filter: 'upstream', matched: null }),
   };
 }
 
 const PASSWORD = 'hunter2';
 
+/**
+ * @param {ApiCtx} ctx
+ * @param {Env} env
+ * @param {string} path
+ * @param {{method?: string, body?: unknown, cookie?: string}} [opts]
+ * @returns {Promise<Response>}
+ */
 function call(ctx, env, path, { method = 'GET', body, cookie } = {}) {
+  /** @type {Record<string, string>} */
   const headers = { 'Content-Type': 'application/json' };
   if (cookie) headers.Cookie = cookie;
   const req = new Request('https://worker.test' + path, {
@@ -31,6 +43,7 @@ function call(ctx, env, path, { method = 'GET', body, cookie } = {}) {
   return handleApi(req, env, new URL(req.url), ctx);
 }
 
+/** @param {Response} res @returns {string} */
 function cookieFrom(res) {
   const sc = res.headers.get('set-cookie');
   assert.ok(sc, 'session cookie set');
@@ -184,13 +197,15 @@ test('settings: GET defaults, POST patch incl. retention validation', async () =
   const s0 = (await get.json()).settings;
   assert.equal(s0.rebindProtection, true);
   assert.equal(s0.idnBlock, false);
+  assert.equal(s0.logPassed, true);
   assert.equal(s0.logRetentionDays, 30);
 
   const post = await call(ctx, env, '/api/settings', {
-    method: 'POST', cookie, body: { idnBlock: true, logRetentionDays: 7 },
+    method: 'POST', cookie, body: { idnBlock: true, logRetentionDays: 7, logPassed: false },
   });
   const s1 = (await post.json()).settings;
   assert.equal(s1.idnBlock, true);
+  assert.equal(s1.logPassed, false);
   assert.equal(s1.logRetentionDays, 7);
 
   const clamped = await call(ctx, env, '/api/settings', {
@@ -263,6 +278,7 @@ test('logs: missing D1 binding -> 501 (not 503, not 404)', async () => {
 
 // Minimal D1 for the stats endpoint: each prepare() sniffed and bound to a
 // canned handler that matches the real GROUP BY queries in dashboard.js.
+/** @returns {D1Like} */
 function statsD1() {
   const statusRows = [
     { status: 'blocklist', n: 5 }, { status: 'none', n: 3 },
@@ -273,6 +289,7 @@ function statsD1() {
   ];
   const hourRows = [{ hour: 10, n: 4 }, { hour: 11, n: 6 }];
   const totalRow = { n: 11 };
+  /** @param {string} sql @returns {any} */
   const handlerFor = (sql) => {
     if (/GROUP BY status/i.test(sql)) return statusRows;
     if (/WHERE status IN/i.test(sql)) return topBlocked;
@@ -280,6 +297,7 @@ function statsD1() {
     if (/^SELECT COUNT\(\*\) AS n FROM dns_logs$/i.test(sql.trim())) return totalRow;
     throw new Error('unexpected STATS sql: ' + sql);
   };
+  /** @param {any} rows @returns {{all: () => Promise<{results: any}>, first: () => Promise<any>, run: () => Promise<{success: boolean}>}} */
   const binding = (rows) => ({
     all: async () => ({ results: rows }),
     first: async () => (Array.isArray(rows) ? rows[0] : rows),
@@ -326,4 +344,115 @@ test('logs/stats: requires D1 (501 when missing)', async () => {
   }));
   const res = await call(ctx, env, '/api/logs/stats', { cookie });
   assert.equal(res.status, 501);
+});
+
+// ---- config backup: export / import --------------------------------------------
+
+/** @param {KVLike} kv */
+async function login(kv) {
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+  return { ctx, env, cookie };
+}
+
+test('backup: export returns full config snapshot', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  await call(ctx, env, '/api/rules', { method: 'POST', cookie, body: { domain: 'old.com', kind: 'deny' } });
+  await call(ctx, env, '/api/filters/tlds', { method: 'POST', cookie, body: { value: '.ZIP' } });
+  await ctx.keywords.add('doubleclick');
+  await call(ctx, env, '/api/settings', { method: 'POST', cookie, body: { idnBlock: true } });
+
+  const res = await call(ctx, env, '/api/export', { cookie });
+  assert.equal(res.status, 200);
+  const payload = await res.json();
+  assert.equal(payload.version, 1);
+  assert.ok(payload.exportedAt);
+  assert.equal(payload.settings.idnBlock, true);
+  assert.deepEqual(payload.rules, [{ domain: 'old.com', kind: 'deny' }]);
+  assert.deepEqual(payload.tlds, ['zip']);
+  assert.ok(payload.keywords.includes('doubleclick'));
+});
+
+test('backup: import merge adds without clobbering existing state', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  await call(ctx, env, '/api/rules', { method: 'POST', cookie, body: { domain: 'old.com', kind: 'deny' } });
+  await call(ctx, env, '/api/filters/tlds', { method: 'POST', cookie, body: { value: '.ZIP' } });
+  await call(ctx, env, '/api/settings', { method: 'POST', cookie, body: { idnBlock: true } });
+  await ctx.keywords.add('tracker');
+  const exp = await (await call(ctx, env, '/api/export', { cookie })).json();
+
+  const kv2 = new FakeKV();
+  const { ctx: c2, env: e2, cookie: k2 } = await login(kv2);
+  await call(c2, e2, '/api/rules', { method: 'POST', cookie: k2, body: { domain: 'fresh.net', kind: 'allow' } });
+
+  const imp = await call(c2, e2, '/api/import', {
+    method: 'POST', cookie: k2,
+    body: {
+      mode: 'merge',
+      settings: exp.settings,
+      rules: exp.rules,
+      keywords: exp.keywords,
+      tlds: exp.tlds,
+    },
+  });
+  assert.equal(imp.status, 200);
+  const j = await imp.json();
+  assert.equal(j.mode, 'merge');
+  assert.deepEqual(j.rules, { applied: 1, skipped: 0 });
+  assert.deepEqual(j.tlds, { applied: 1, skipped: 0 });
+  assert.ok(j.keywords.applied >= 1);
+  assert.equal(j.settings, true);
+
+  const rules = (await (await call(c2, e2, '/api/rules', { cookie: k2 })).json()).rules;
+  assert.equal(rules.length, 2, 'merge keeps fresh.net');
+  const s = (await (await call(c2, e2, '/api/settings', { cookie: k2 })).json()).settings;
+  assert.equal(s.idnBlock, true, 'settings applied');
+});
+
+test('backup: import replace clears each section before writing', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  await call(ctx, env, '/api/rules', { method: 'POST', cookie, body: { domain: 'stale.com', kind: 'deny' } });
+  await call(ctx, env, '/api/filters/tlds', { method: 'POST', cookie, body: { value: 'zip' } });
+
+  const imp = await call(ctx, env, '/api/import', {
+    method: 'POST', cookie,
+    body: { mode: 'replace', rules: [{ domain: 'a.com', kind: 'allow' }], tlds: ['io'], keywords: [] },
+  });
+  assert.equal(imp.status, 200);
+  const j = await imp.json();
+  assert.equal(j.rules.applied, 1);
+  assert.deepEqual(j.tlds, { applied: 1, skipped: 0 });
+  assert.deepEqual(j.keywords, { applied: 0, skipped: 0 }, 'empty keywords clears the list');
+
+  const rules = (await (await call(ctx, env, '/api/rules', { cookie })).json()).rules;
+  assert.deepEqual(rules, [{ domain: 'a.com', kind: 'allow' }]);
+  const tlds = (await (await call(ctx, env, '/api/filters/tlds', { cookie })).json()).items;
+  assert.deepEqual(tlds, ['io']);
+});
+
+test('backup: import validation — bad json shape, invalid entries, empty payload', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+
+  const empty = await call(ctx, env, '/api/import', { method: 'POST', cookie, body: { mode: 'merge' } });
+  assert.equal(empty.status, 400);
+
+  const imp = await call(ctx, env, '/api/import', {
+    method: 'POST', cookie,
+    body: { rules: [{ domain: 'ok.com', kind: 'deny' }, 'garbage', { kind: 'deny' }, { domain: 'x.io', kind: 'maybe' }] },
+  });
+  assert.equal(imp.status, 200);
+  const j = await imp.json();
+  assert.deepEqual(j.rules, { applied: 1, skipped: 3 });
+
+  const badSettings = await call(ctx, env, '/api/import', {
+    method: 'POST', cookie, body: { settings: { logRetentionDays: 'nope' } },
+  });
+  assert.equal(badSettings.status, 400);
 });

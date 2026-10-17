@@ -81,17 +81,39 @@ test('RuleStore: version cache avoids blob re-reads on warm refreshes', async ()
   await rs.refresh();
   assert.equal(kv.stats.gets, before, 'fresh TTL -> no KV reads at all');
 
-  // simulate TTL expiry: version unchanged -> only the version key is read
+  // store TTL expired, but the shared version window is still fresh -> no I/O
   rs.cachedAt = 0;
   await rs.refresh();
-  assert.equal(kv.stats.gets, before + 1, 'expiry reads version only, not the blob');
+  assert.equal(kv.stats.gets, before, 'shared version window covers every store');
 
-  // another isolate writes -> version changes -> blob re-read
+  // another isolate writes -> force bypasses the window, blob re-read
   rs.cachedAt = 0;
   kv.data.set(RULES_KEY, 'allow\ty.com');
   kv.data.set(DATA_VERSION_KEY, '999');
-  await rs.refresh();
+  await rs.refresh(true);
   assert.deepEqual(await rs.list(), [{ domain: 'y.com', kind: 'allow' }]);
+});
+
+test('shared version: parallel stores share one KV version read per window', async () => {
+  const kv = new FakeKV({ 'rules:data': 'deny\ta.com', 'tlds:data': 'zip', 'data:version': '7' });
+  const rs = new RuleStore(kv);
+  const ts = new TextSetStore(kv, 'tlds:data');
+
+  // concurrent refreshes must de-duplicate: 1 version read + 2 blob reads
+  await Promise.all([rs.refresh(), ts.refresh()]);
+  assert.equal(kv.stats.gets, 3, 'one shared version read instead of one per store');
+  assert.deepEqual(await rs.list(), [{ domain: 'a.com', kind: 'deny' }]);
+  assert.deepEqual(ts.list(), ['zip']);
+
+  // both stores expire together — the shared window still covers them
+  rs.cachedAt = 0;
+  ts.cachedAt = 0;
+  await Promise.all([rs.refresh(), ts.refresh()]);
+  assert.equal(kv.stats.gets, 3, 'shared window fresh -> zero extra reads');
+
+  // a write on either store publishes the version to the whole binding
+  await ts.add('mov');
+  assert.equal(kv.data.get('data:version'), ts.version, 'noteSharedVersion makes it visible');
 });
 
 test('RuleStore: KV read failure keeps stale rules, never an empty set', async () => {
@@ -190,7 +212,7 @@ test('TextSetStore: version cache + failure keeps stale set', async () => {
   const gets = kv.stats.gets;
   ts.cachedAt = 0; // simulate TTL expiry
   await ts.refresh();
-  assert.equal(kv.stats.gets, gets + 1, 'expiry reads version only');
+  assert.equal(kv.stats.gets, gets, 'shared version window fresh -> zero KV reads');
   assert.deepEqual(ts.list(), ['one', 'two'], 'blob untouched on version match');
 
   kv.fail.get = true;
@@ -208,7 +230,7 @@ test('SettingsStore: defaults, JSON load, partial update', async () => {
 
   await ss.update({ idnBlock: true });
   assert.equal(ss.get().idnBlock, true);
-  const raw = JSON.parse(kv.data.get('settings:main'));
+  const raw = JSON.parse(kv.data.get('settings:main') ?? '');
   assert.equal(raw.idnBlock, true);
   assert.equal(raw.rebindProtection, true, 'unrelated keys preserved');
 
@@ -241,4 +263,40 @@ test('clampRetention: bounds and type checks', () => {
   assert.equal(clampRetention(12.7), 12);
   assert.ok(Number.isNaN(clampRetention('30')));
   assert.ok(Number.isNaN(clampRetention(NaN)));
+});
+
+// ---- bulk import primitives ----------------------------------------------------
+
+test('TextSetStore: addMany merges in one save; replaceAll swaps wholesale', async () => {
+  const kv = new FakeKV();
+  const ts = new TextSetStore(kv, 'tlds:data');
+  await ts.add('zip');
+  const putsBefore = kv.stats.puts;
+
+  const r1 = await ts.addMany(['mov', 'ZIP', '.top', 'no!tld', ''], normalizeTld);
+  assert.deepEqual(r1, { applied: 2, skipped: 2 }, 'mov+top applied; blank+invalid skipped; zip dedup');
+  assert.ok(!ts.list().includes('no!tld'));
+  assert.equal(kv.stats.puts, putsBefore + 2, 'exactly one save = blob + version');
+  assert.deepEqual(ts.list().sort(), ['mov', 'top', 'zip']);
+
+  const r2 = await ts.replaceAll(['io', 'bogus.tld!'], normalizeTld);
+  assert.deepEqual(r2, { applied: 1, skipped: 1 });
+  assert.deepEqual(ts.list(), ['io']);
+  assert.equal(await ts.addMany([]).then((r) => r.applied), 0, 'empty input -> no write');
+});
+
+test('RuleStore: replaceAll swaps the whole map in one save', async () => {
+  const kv = new FakeKV();
+  const rs = new RuleStore(kv);
+  await rs.put('old.com', 'deny');
+  const putsBefore = kv.stats.puts;
+
+  const n = await rs.replaceAll([
+    { domain: 'a.com', kind: 'allow' },
+    { domain: 'NO.dots..', kind: 'deny' },   // invalid -> dropped
+    { kind: 'deny' },                         // no domain -> dropped
+  ]);
+  assert.equal(n, 1);
+  assert.deepEqual(await rs.list(), [{ domain: 'a.com', kind: 'allow' }]);
+  assert.equal(kv.stats.puts, putsBefore + 2, 'one save = blob + version');
 });

@@ -10,12 +10,16 @@ BLOCKLIST_URL = "https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main
 UPSTREAM_URL = "https://dns.quad9.net/dns-query"
 
 # Static dashboard UI served as a Worker asset (no template-in-JS).
-# The Worker handles /api/* and /dns-query; everything else falls through
-# to these assets (index.html at / and /dashboard via SPA fallback).
+# The Worker only runs for these paths; everything else (static files,
+# /dashboard SPA fallback) is served directly from assets:
+#   "/"        -> worker redirect for browsers (HTML -> /dashboard)
+#   "/api/"    -> dashboard JSON API
+#   "/dns-query" -> DoH endpoint
+#   "/healthz" -> health/stats JSON
 [assets]
 directory = "./assets"
 binding = "ASSETS"
-run_worker_first = true
+run_worker_first = ["/", "/api/", "/dns-query", "/healthz"]
 not_found_handling = "single-page-application"
 html_handling = "auto-trailing-slash"
 

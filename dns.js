@@ -2,6 +2,7 @@
 
 // ---------- Minimal Buffer shim (Uint8Array + BE accessors) ----------
 class Buf extends Uint8Array {
+  // @ts-expect-error — Buf.from deliberately accepts more inputs than Uint8Array.from
   static from(x) {
     if (x instanceof Uint8Array) {
       const b = new Buf(x.byteLength);
@@ -22,14 +23,22 @@ class Buf extends Uint8Array {
     throw new Error('Buf.from: unsupported input');
   }
 
+  /** @param {unknown} x @returns {boolean} */
   static isBuffer(x) {
     return x instanceof Buf || x instanceof Uint8Array;
   }
 
+  /**
+   * @param {number} o
+   * @returns {number}
+   */
+
+  /** @param {number} o @returns {number} */
   readUInt16BE(o) {
     return (this[o] << 8) | this[o + 1];
   }
 
+  /** @param {number} o @returns {number} */
   readUInt32BE(o) {
     return (
       this[o] * 0x1000000 +
@@ -37,11 +46,13 @@ class Buf extends Uint8Array {
     );
   }
 
+  /** @param {number} v @param {number} o */
   writeUInt16BE(v, o) {
     this[o] = (v >>> 8) & 0xff;
     this[o + 1] = v & 0xff;
   }
 
+  /** @param {number} v @param {number} o */
   writeUInt32BE(v, o) {
     this[o] = (v >>> 24) & 0xff;
     this[o + 1] = (v >>> 16) & 0xff;
@@ -49,6 +60,12 @@ class Buf extends Uint8Array {
     this[o + 3] = v & 0xff;
   }
 
+  /**
+   * @param {string} [_enc]
+   * @param {number} [s]
+   * @param {number} [e]
+   * @returns {string}
+   */
   toString(_enc, s, e) {
     s = s ?? 0;
     e = e ?? this.length;
@@ -64,6 +81,10 @@ export { Buf };
  * Parse QNAME out of a raw DNS query (wire format).
  * @param {Buf|Uint8Array} buf
  * @returns {{ name: string, qtype: number, qclass: number } | null}
+ */
+/**
+ * @param {Uint8Array|null} buf
+ * @returns {{name:string, qtype:number, qclass:number}|null}
  */
 export function parseQuestion(buf) {
   if (!buf || buf.length < 12) return null;
@@ -107,6 +128,7 @@ export function parseQuestion(buf) {
   return { name: labels.join('.'), qtype, qclass };
 }
 
+/** @param {Uint8Array} queryBuf @returns {Buf} */
 export function buildNxdomainResponse(queryBuf) {
   const out = Buf.from(queryBuf);
   const flags = out.readUInt16BE(2);
@@ -117,6 +139,7 @@ export function buildNxdomainResponse(queryBuf) {
   return out;
 }
 
+/** @param {Uint8Array} queryBuf @returns {Buf} */
 export function buildRefusedResponse(queryBuf) {
   const out = Buf.from(queryBuf);
   const flags = out.readUInt16BE(2);
@@ -127,6 +150,10 @@ export function buildRefusedResponse(queryBuf) {
   return out;
 }
 
+/** Degenerate/null buffers fall back to the default TTL (60s).
+ * @param {Uint8Array|null} respBuf
+ * @returns {number}
+ */
 export function minTtl(respBuf) {
   if (!respBuf || respBuf.length < 12) return 60;
 
@@ -161,9 +188,50 @@ export function minTtl(respBuf) {
   }
 
   if (!Number.isFinite(min) || min <= 0) return 60;
-  return Math.min(min, 300);
+  // Cap: bounds how long both the client and the edge cache may reuse the
+  // answer (an hour matches ordinary resolver behaviour for long-TTL records).
+  return Math.min(min, 3600);
 }
 
+/**
+ * True when the query carries an EDNS OPT record with the DO (DNSSEC OK) bit.
+ * Used to split the answer cache: a validating client must not be served a
+ * stripped (non-DNSSEC) answer cached for a plain query, and vice versa.
+ * @param {Uint8Array} buf
+ * @returns {boolean}
+ */
+export function ednsDo(buf) {
+  if (!buf || buf.length < 12) return false;
+  const qd = (buf[4] << 8) | buf[5];
+  const rr =
+    ((buf[6] << 8) | buf[7]) +
+    ((buf[8] << 8) | buf[9]) +
+    ((buf[10] << 8) | buf[11]);
+  let off = 12;
+
+  for (let i = 0; i < qd; i++) {
+    off = skipName(buf, off);
+    if (off < 0) return false;
+    off += 4;
+  }
+
+  for (let i = 0; i < rr; i++) {
+    off = skipName(buf, off);
+    if (off < 0 || off + 10 > buf.length) return false;
+    const type = (buf[off] << 8) | buf[off + 1];
+    const rdlen = (buf[off + 8] << 8) | buf[off + 9];
+    if (type === 41) {
+      // OPT TTL = ext-rcode(8) version(8) flags(16); DO is the high bit of
+      // the flags, i.e. the third TTL byte.
+      return (buf[off + 6] & 0x80) !== 0;
+    }
+    off += 10 + rdlen;
+    if (off > buf.length) return false;
+  }
+  return false;
+}
+
+/** @param {Uint8Array} buf @param {number} off @returns {number} */
 function skipName(buf, off) {
   let jumps = 0;
   while (off < buf.length) {
@@ -176,6 +244,7 @@ function skipName(buf, off) {
   return -1;
 }
 
+/** @param {string} str @returns {Buf|null} */
 export function base64urlDecode(str) {
   try {
     const b64 = str.replace(/-/g, '+').replace(/_/g, '/');

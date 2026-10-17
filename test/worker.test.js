@@ -4,7 +4,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../worker.js';
-import { buildQuery, buildResponse, v4rdata } from './helpers.js';
+import { buildQuery, buildResponse, v4rdata, FakeKV } from './helpers.js';
 
 // ---- fake Workers globals (must precede any query that triggers loads) -------
 
@@ -12,28 +12,32 @@ const BLOCKLIST_URL = 'https://list.test/regression/domains';
 const UPSTREAM_URL = 'https://upstream.test/dns-query';
 
 class MemCache {
-  constructor() { this.map = new Map(); }
+  constructor() { /** @type {Map<string, Response>} */ this.map = new Map(); }
+  /**
+   * @param {Request|string} reqOrStr
+   * @returns {Promise<Response|undefined>}
+   */
   async match(reqOrStr) {
     const key = typeof reqOrStr === 'string' ? reqOrStr : reqOrStr.url;
     return this.map.get(key)?.clone();
   }
+  /** @param {Request|string} req @param {Response} res */
   async put(req, res) {
     this.map.set(typeof req === 'string' ? req : req.url, res.clone());
   }
 }
 
 const REAL_FETCH = globalThis.fetch;
-let lastUpstream = null;
 
 globalThis.caches = { default: new MemCache() };
+/** @param {string|Request|URL} input @param {RequestInit} [init] */
 globalThis.fetch = async (input, init) => {
-  const url = typeof input === 'string' ? input : input.url;
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   if (url === BLOCKLIST_URL) {
-    return new Response('# comment\nblocklist.test\n0.0.0.0 ads.blocklist.test\n\n', { status: 200 });
+    return new Response('# comment\nblocklist.test\nads.blocklist.test\n\n', { status: 200 });
   }
   if (url === UPSTREAM_URL) {
-    lastUpstream = init?.body;
-    const q = new Uint8Array(init.body);
+    const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
     // Echo the query with one public A record; mutated per-test below.
     return new Response(buildResponse(q, globalThis.__answers ?? [{ type: 1, rdata: v4rdata('93.184.216.34') }]));
   }
@@ -43,9 +47,17 @@ globalThis.fetch = async (input, init) => {
 after(() => { globalThis.fetch = REAL_FETCH; });
 
 class FakeD1 {
-  constructor() { this.rows = []; this.ops = []; this.sn = 1; }
+  constructor() {
+    /** @type {Array<Record<string, any>>} */
+    this.rows = [];
+    /** @type {Array<{sql: string, args: any[]}>} */
+    this.ops = [];
+    this.sn = 1;
+  }
+  /** @param {string} sql */
   prepare(sql) {
     const self = this;
+    /** @param {any[]} args */
     const exec = (args) => {
       self.ops.push({ sql, args });
       if (/^INSERT/i.test(sql)) {
@@ -64,6 +76,7 @@ class FakeD1 {
     };
     return {
       run: () => exec([]),
+      /** @param {any[]} a */
       bind: (...a) => ({
         run: () => exec(a),
         all: async () => ({ results: self.rows }),
@@ -77,17 +90,27 @@ class FakeD1 {
 
 // ---- env / request helpers -----------------------------------------------------
 
+/**
+ * @param {{RULES?: KVLike, kv?: FakeKV, d1?: FakeD1, password?: string, assets?: unknown}} [overrides]
+ * @returns {Env}
+ */
 function mkEnv(overrides = {}) {
   return {
     RULES: overrides.RULES ?? overrides.kv ?? null,
-    LOGS: overrides.d1,
+    LOGS: /** @type {D1Like|undefined} */ (overrides.d1),
     DASHBOARD_PASSWORD: overrides.password ?? 'pw',
     BLOCKLIST_URL,
     UPSTREAM_URL,
-    ASSETS: overrides.assets,
+    ASSETS: /** @type {Env['ASSETS']} */ (overrides.assets),
   };
 }
 
+/**
+ * @param {Env} env
+ * @param {Uint8Array} query
+ * @param {{headers?: Record<string, string>}} [extra]
+ * @returns {Promise<Response>}
+ */
 function dohGet(env, query, extra = {}) {
   const b64 = Buffer.from(query).toString('base64url');
   const url = 'https://worker.test/dns-query?dns=' + b64;
@@ -99,6 +122,11 @@ function dohGet(env, query, extra = {}) {
   return worker.fetch(req, env);
 }
 
+/**
+ * @param {Env} env
+ * @param {Uint8Array} query
+ * @returns {Promise<Response>}
+ */
 function dohPost(env, query) {
   const req = new Request('https://worker.test/dns-query', {
     method: 'POST',
@@ -108,7 +136,9 @@ function dohPost(env, query) {
   return worker.fetch(req, env);
 }
 
+/** @param {Uint8Array} buf */
 const rcode = (buf) => buf[3] & 0x0f;
+/** @param {Uint8Array} buf */
 const ancount = (buf) => (buf[6] << 8) | buf[7];
 
 // ---- tests ---------------------------------------------------------------------
@@ -257,6 +287,7 @@ test('healthz: reports settings and resolved URLs', async () => {
 });
 
 test('D1 insert failure never breaks the DNS answer', async () => {
+  /** @type {any} */
   const d1 = {
     prepare: () => ({
       run: async () => { throw new Error('d1 down'); },
@@ -283,8 +314,9 @@ test('unknown API route -> 404 even without D1', async () => {
 test('upstream failure -> 502 with REFUSED payload', async () => {
   const env = mkEnv({});
   const savedFetch = globalThis.fetch;
+  /** @param {string|Request|URL} input @returns {Promise<Response>} */
   globalThis.fetch = async (input) => {
-    const url = typeof input === 'string' ? input : input.url;
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (url === BLOCKLIST_URL) return new Response('ok.test\n');
     throw new Error('upstream unreachable');
   };
@@ -296,4 +328,108 @@ test('upstream failure -> 502 with REFUSED payload', async () => {
   } finally {
     globalThis.fetch = savedFetch;
   }
+});
+test('logPassed=false: passed queries unlogged, blocked still logged', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ d1, kv: new FakeKV() });
+
+  const login = await worker.fetch(new Request('https://worker.test/api/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'pw' }),
+  }), env);
+  const sc = login.headers.get('set-cookie');
+  assert.ok(sc, 'session cookie expected');
+  const cookie = sc.split(';')[0];
+
+  const off = await worker.fetch(new Request('https://worker.test/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify({ logPassed: false }),
+  }), env);
+  assert.equal(off.status, 200);
+
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('5.6.7.8') }];
+  const passed = await dohGet(env, buildQuery('passed.example.net'));
+  assert.equal(passed.status, 200, 'answer still delivered when unlogged');
+
+  const blocked = await dohGet(env, buildQuery('ads.blocklist.test'));
+  assert.equal(blocked.status, 200);
+
+  const inserts = d1.ops.filter((o) => /^INSERT/i.test(o.sql));
+  assert.equal(inserts.length, 1, 'only the block was logged');
+  assert.equal(d1.rows[0].domain, 'ads.blocklist.test');
+  assert.equal(d1.rows[0].status, 'blocklist');
+});
+
+// ---- answer cache ----------------------------------------------------------------
+
+test('answer cache: repeat query skips upstream and gets its own transaction ID', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ d1 });
+  let upstreamCalls = 0;
+  const savedFetch = globalThis.fetch;
+  /** @param {string|Request|URL} input @param {RequestInit} [init] */
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === UPSTREAM_URL) {
+      upstreamCalls++;
+      const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
+      return new Response(buildResponse(q, [{ type: 1, rdata: v4rdata('93.184.216.34') }]));
+    }
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    throw new Error('unexpected fetch: ' + url);
+  };
+
+  try {
+    const first = await dohGet(env, buildQuery('cached.foo.com', { id: 0x1111 }));
+    const firstBody = new Uint8Array(await first.arrayBuffer());
+    assert.equal(upstreamCalls, 1);
+    assert.equal(ancount(firstBody), 1);
+
+    // same question, different transaction ID -> served from cache, ID patched
+    const second = await dohGet(env, buildQuery('cached.foo.com', { id: 0x2222 }));
+    const secondBody = new Uint8Array(await second.arrayBuffer());
+    assert.equal(upstreamCalls, 1, 'second query answered from the cache');
+    assert.equal((secondBody[0] << 8) | secondBody[1], 0x2222, 'client transaction ID rewritten');
+    assert.equal(ancount(secondBody), 1, 'answer intact');
+
+    // audit log still records both queries (filters run on hits too)
+    assert.equal(d1.rows.length, 2, 'cache hit logged exactly like a miss');
+    assert.deepEqual(d1.rows.map((r) => r.domain), ['cached.foo.com', 'cached.foo.com']);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('answer cache: a custom rule added via the API busts the cached answer', async () => {
+  const kv = new FakeKV();
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv, d1 });
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('93.184.216.34') }];
+
+  const open = await dohGet(env, buildQuery('busted.foo.com'));
+  const openBody = new Uint8Array(await open.arrayBuffer());
+  assert.equal(rcode(openBody), 0, 'resolves before the rule exists');
+
+  const login = await worker.fetch(new Request('https://worker.test/api/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'pw' }),
+  }), env);
+  const sc = login.headers.get('set-cookie');
+  assert.ok(sc, 'session cookie expected');
+  const cookie = sc.split(';')[0];
+
+  const deny = await worker.fetch(new Request('https://worker.test/api/rules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify({ domain: 'busted.foo.com', kind: 'deny' }),
+  }), env);
+  assert.equal(deny.status, 200);
+
+  const after = await dohGet(env, buildQuery('busted.foo.com'));
+  const afterBody = new Uint8Array(await after.arrayBuffer());
+  assert.equal(rcode(afterBody), 3, 'NXDOMAIN — epoch rotation killed the cached pass-through');
+  globalThis.__answers = undefined;
 });

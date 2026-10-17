@@ -1,0 +1,3 @@
+#!/bin/sh
+# Full gate before code leaves this machine.
+npm run check

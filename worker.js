@@ -1,7 +1,9 @@
 // worker.js — DoH filter
-// Query path: qclass guard -> custom allowlist -> denylist -> blocklist
-//           -> blocked TLD -> blocked keyword -> rebinding -> IDN -> upstream
-// Response path: answer-level rebinding check (private IPs)
+// Query path: qclass guard -> answer cache -> custom allowlist -> denylist ->
+//           blocklist -> blocked TLD -> blocked keyword -> rebinding -> IDN ->
+//           upstream -> answer-level rebinding check
+// Response path: answers cached under a normalized key (config epoch + name +
+//           type + DO bit), transaction ID patched per client on hits.
 //
 // Runtime-configurable: env.BLOCKLIST_URL / env.UPSTREAM_URL (wrangler [vars])
 // with defaults from blocklist.js / DEFAULT_UPSTREAM_URL below.
@@ -19,63 +21,148 @@ import {
   buildRefusedResponse,
   minTtl,
   base64urlDecode,
+  ednsDo,
 } from './dns.js';
 
 const DEFAULT_UPSTREAM_URL = 'https://dns.quad9.net/dns-query';
 const DNS_MEDIA_TYPE = 'application/dns-message';
-const BLOCKLIST_STALE_MS = 6 * 60 * 60 * 1000; // 6h
+const BLOCKLIST_STALE_MS = 24 * 60 * 60 * 1000; // 24h fresh window
+const BLOCKLIST_FETCH_TTL = Math.floor(BLOCKLIST_STALE_MS / 1000);
+const FETCHED_AT_HEADER = 'x-blocklist-fetched-at';
+const BLOCKED_MAX_AGE = 300; // filter-list / policy blocks: rarely unblocked
+const RULE_MAX_AGE = 30;     // custom allow/deny: user edits stay snappy
+const RESP_CACHE_MAX = 2048; // isolate answer-cache cap (entries)
+const CACHE_ORIGIN = 'https://answer.cache/';
 const PRUNE_EVERY = 500; // opportunistic D1 retention batch size
 
 // ---- Per-isolate singletons (one shared KV namespace) ----
 const blocklist = new Blocklist();
-const ruleStore = new RuleStore(null);
-const settingsStore = new SettingsStore(null);
-const keywordStore = new TextSetStore(null, 'keywords:data');
-const tldStore = new TextSetStore(null, 'tlds:data');
+const ruleStore = new RuleStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
+const settingsStore = new SettingsStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
+const keywordStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'keywords:data');
+const tldStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'tlds:data');
 const stores = { ruleStore, blocklist, keywordStore, tldStore };
 
+/** @type {KVLike|null} */
 let boundKv = null;
+/** @type {string|null} */
 let loadedBlocklistUrl = null;
 
+/** @param {Env} env */
 function ensureKv(env) {
-  if (env.RULES === boundKv) return;
-  boundKv = env.RULES;
-  // Binding changed -> different namespace: drop ALL in-memory state so a
-  // warm TTL cache can never serve the previous binding's rules/settings.
-  ruleStore.bind(env.RULES);
-  settingsStore.bind(env.RULES);
-  keywordStore.bind(env.RULES);
-  tldStore.bind(env.RULES);
+  const kv = env.RULES ?? null;
+  if (kv === boundKv) return;
+  boundKv = kv;
+  // Binding changed (or removed) -> different namespace: drop ALL in-memory
+  // state so a warm TTL cache can never serve the previous binding's
+  // rules/settings.
+  ruleStore.bind(/** @type {KVLike} */ (kv));
+  settingsStore.bind(/** @type {KVLike} */ (kv));
+  keywordStore.bind(/** @type {KVLike} */ (kv));
+  tldStore.bind(/** @type {KVLike} */ (kv));
 }
 
-async function ensureBlocklist(env) {
-  const blUrl = env.BLOCKLIST_URL || DEFAULT_BLOCKLIST_URL;
-  const fresh =
-    blocklist.size > 0 &&
-    loadedBlocklistUrl === blUrl &&
-    Date.now() - blocklist.loadedAt < BLOCKLIST_STALE_MS;
-  if (fresh) return;
-
-  // Cache key derives from the configured URL so switching BLOCKLIST_URL
-  // never serves a stale cached copy.
-  const cacheKey = new Request(blUrl);
-  let text;
-  const cached = await caches.default.match(cacheKey);
-  if (cached) {
-    text = await cached.text();
-  } else {
-    const cacheTtl = Math.floor(BLOCKLIST_STALE_MS / 1000);
-    const res = await fetch(blUrl, { cf: { cacheTtl } });
-    if (!res.ok) throw new Error(`blocklist HTTP ${res.status}`);
-    text = await res.text();
-    caches.default.put(cacheKey, new Response(text, {
-      headers: { 'Content-Type': 'text/plain', 'Cache-Control': `max-age=${cacheTtl}` },
-    }));
+/**
+ * Keep `work` off the response path when an ExecutionContext exists
+ * (`waitUntil`), or inline when there is none (tests, healthz callers).
+ * Always returns a settled-never-rejecting promise; safe to `await`.
+ * @param {ExecutionContext|undefined} ctx
+ * @param {Promise<unknown>} work
+ * @returns {Promise<unknown>|undefined}
+ */
+function bg(ctx, work) {
+  const safe = Promise.resolve(work).catch((e) => {
+    console.error('[bg] failed:', e instanceof Error ? e.message : e);
+  });
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    ctx.waitUntil(safe);
+    return undefined;
   }
-  blocklist.load(text);
-  loadedBlocklistUrl = blUrl;
+  return safe;
 }
 
+/** Cache lookup that never throws (no Cache API in some test harnesses). */
+/** @param {Request} req @returns {Promise<Response|undefined>} */
+async function matchCache(req) {
+  try {
+    return (await caches.default.match(req)) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Conditional fetch of the blocklist: revalidates on a stored ETag, refreshes
+ * the edge copy with a new freshness marker, and loads a changed body.
+ * @param {Request} cacheKey
+ * @param {string} blUrl
+ * @param {{etag: string|null, text: string|null}} prev
+ * @param {ExecutionContext} [ctx]
+ */
+async function fetchBlocklist(cacheKey, blUrl, prev, ctx) {
+  const headers = prev.etag ? { 'If-None-Match': prev.etag } : undefined;
+  const res = await fetch(blUrl, { headers, cf: { cacheTtl: BLOCKLIST_FETCH_TTL } });
+
+  let text = prev.text;
+  if (res.status === 304) {
+    if (text === null) throw new Error('blocklist 304 without a cached body');
+  } else if (res.ok) {
+    text = await res.text();
+    blocklist.load(text);
+    loadedBlocklistUrl = blUrl;
+  } else {
+    throw new Error(`blocklist HTTP ${res.status}`);
+  }
+
+  /** @type {Record<string, string>} */
+  const putHeaders = {
+    'Content-Type': 'text/plain',
+    'Cache-Control': `max-age=${BLOCKLIST_FETCH_TTL}`,
+    [FETCHED_AT_HEADER]: String(Date.now()),
+  };
+  const etag = res.headers.get('etag') || prev.etag;
+  if (etag) putHeaders['ETag'] = etag;
+  bg(ctx, caches.default.put(cacheKey, new Response(text, { headers: putHeaders })));
+}
+
+/**
+ * Load the blocklist with zero blocking work when a usable copy exists:
+ *   fresh in-memory -> return; edge copy -> serve it (past its 24h window it
+ *   is revalidated in the background); cold colo -> blocking fetch that falls
+ *   back to the in-memory copy on failure (stale-if-error).
+ * @param {Env} env
+ * @param {ExecutionContext} [ctx]
+ */
+async function ensureBlocklist(env, ctx) {
+  const blUrl = env.BLOCKLIST_URL || DEFAULT_BLOCKLIST_URL;
+  const hasMemory = blocklist.size > 0 && loadedBlocklistUrl === blUrl;
+  if (hasMemory && Date.now() - blocklist.loadedAt < BLOCKLIST_STALE_MS) return;
+
+  const cacheKey = new Request(blUrl);
+  const cached = await matchCache(cacheKey);
+  if (cached) {
+    const text = await cached.text();
+    const fetchedAt = Number(cached.headers.get(FETCHED_AT_HEADER)) || 0;
+    const etag = cached.headers.get('etag');
+    blocklist.load(text);
+    loadedBlocklistUrl = blUrl;
+    // Stale-while-revalidate: serve the old copy now, fetch off the hot path.
+    if (Date.now() - fetchedAt >= BLOCKLIST_STALE_MS && ctx) {
+      bg(ctx, fetchBlocklist(cacheKey, blUrl, { etag, text }, ctx));
+    }
+    return;
+  }
+
+  // Cold colo: nothing cached anywhere -> the fetch must block this request.
+  try {
+    await fetchBlocklist(cacheKey, blUrl, { etag: null, text: null }, ctx);
+  } catch (e) {
+    if (!hasMemory) throw e;
+    console.error('[blocklist] refresh failed, keeping stale copy:', e instanceof Error ? e.message : e);
+  }
+}
+
+/** @param {Uint8Array} queryBuf @param {Env} env */
 async function forwardToUpstream(queryBuf, env) {
   const upstream = env.UPSTREAM_URL || DEFAULT_UPSTREAM_URL;
   const res = await fetch(upstream, {
@@ -88,6 +175,7 @@ async function forwardToUpstream(queryBuf, env) {
 }
 
 /** Refresh every KV-backed store. All TTL-cached, so this is usually free. */
+/** @returns {Promise<void>} */
 async function refreshStores() {
   await Promise.all([
     settingsStore.refresh(),
@@ -113,6 +201,14 @@ const LOGS_CREATE =
   'qtype INTEGER)';
 
 /** Never throws — logging must not break DNS responses. */
+/**
+ * @param {Env} env
+ * @param {string} domain
+ * @param {string} status
+ * @param {string} filter
+ * @param {string|number} qtype 'unknown' for nxdomain/refused paths
+ * @param {number} retentionDays
+ */
 async function logQuery(env, domain, status, filter, qtype, retentionDays) {
   if (!env.LOGS) return;
   try {
@@ -130,7 +226,7 @@ async function logQuery(env, domain, status, filter, qtype, retentionDays) {
     }
     await env.LOGS
       .prepare('INSERT INTO dns_logs (domain, status, filter, ts, qtype) VALUES (?, ?, ?, ?, ?)')
-      .bind(domain, status, filter, Date.now(), qtype == null ? null : qtype)
+      .bind(domain, status, filter, Date.now(), qtype === null || qtype === undefined ? null : qtype)
       .run();
 
     logCount++;
@@ -144,18 +240,13 @@ async function logQuery(env, domain, status, filter, qtype, retentionDays) {
         .run();
     }
   } catch (e) {
-    console.error('[logs] insert failed:', e.message);
+    console.error('[logs] insert failed:', e instanceof Error ? e.message : e);
   }
 }
 
 // ---- Response builders ----
 
-function nxdomain(queryBuf) {
-  return new Response(buildNxdomainResponse(queryBuf), {
-    headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': 'max-age=30' },
-  });
-}
-
+/** @param {Uint8Array} queryBuf @param {number} [maxAge] @returns {Response} */
 function refused(queryBuf, maxAge = 30) {
   return new Response(buildRefusedResponse(queryBuf), {
     headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': `max-age=${maxAge}` },
@@ -163,6 +254,7 @@ function refused(queryBuf, maxAge = 30) {
 }
 
 /** Upstream unreachable: SERVFAIL-ish (502) carrying a REFUSED answer. */
+/** @param {Uint8Array} queryBuf @returns {Response} */
 function upstreamFailure(queryBuf) {
   return new Response(buildRefusedResponse(queryBuf), {
     status: 502,
@@ -170,18 +262,113 @@ function upstreamFailure(queryBuf) {
   });
 }
 
-function passThrough(upstream) {
-  return new Response(upstream, {
-    headers: {
-      'Content-Type': DNS_MEDIA_TYPE,
-      'Cache-Control': `max-age=${minTtl(upstream)}`,
-    },
+// ---- Answer cache (isolate LRU in front of the edge cache) ----
+// Keyed by config epoch + QNAME + QTYPE + DNSSEC-OK bit: cache hits survive
+// across clients (the transaction ID is patched per query), and any rule or
+// filter-toggle change rotates the epoch so a stale verdict is never served.
+
+/** @type {Map<string, {bytes: Uint8Array, cacheControl: string, expiresAt: number}>} */
+const respLru = new Map();
+
+/** @param {string} epoch @param {string} name @param {number} qtype @param {boolean} dnssec */
+function answerCacheKey(epoch, name, qtype, dnssec) {
+  return 'v1|' + epoch + '|' + name + '|' + qtype + '|' + (dnssec ? 'd' : 's');
+}
+
+/** Epoch covering every setting that can change a verdict (rules share data:version). */
+/** @param {FilterSettings} settings @returns {string} */
+function configEpoch(settings) {
+  return (ruleStore.version || '0') +
+    '.' + (settings.rebindProtection ? 1 : 0) +
+    (settings.idnBlock ? 1 : 0) +
+    (settings.tldBlock ? 1 : 0) +
+    (settings.keywordBlock ? 1 : 0);
+}
+
+/**
+ * Response for a client with transaction ID `qid` — cached payloads come from
+ * a different message, so the header ID is always rewritten.
+ * @param {Uint8Array} bytes @param {string} cacheControl @param {number} qid @returns {Response}
+ */
+function clientResponse(bytes, cacheControl, qid) {
+  const out = bytes.slice();
+  out[0] = (qid >>> 8) & 0xff;
+  out[1] = qid & 0xff;
+  return new Response(out, {
+    headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': cacheControl },
+  });
+}
+
+/** Note: maxAge/age are seconds; LRU touches re-insert for recency. */
+/** @param {string} key @param {Uint8Array} bytes @param {string} cacheControl @param {number} maxAge @param {number} age */
+function lruPut(key, bytes, cacheControl, maxAge, age) {
+  respLru.delete(key);
+  respLru.set(key, {
+    bytes,
+    cacheControl,
+    expiresAt: Date.now() + Math.max(0, maxAge - age) * 1000,
+  });
+  while (respLru.size > RESP_CACHE_MAX) {
+    respLru.delete(/** @type {string} */ (respLru.keys().next().value));
+  }
+}
+
+/**
+ * Answer lookup: isolate LRU first, then the edge cache (promoted into the
+ * LRU). Null on miss; `qid` patched on every hit.
+ * @param {string} key @param {number} qid @returns {Promise<Response|null>}
+ */
+async function cachedAnswer(key, qid) {
+  const hit = respLru.get(key);
+  if (hit) {
+    if (hit.expiresAt > Date.now()) {
+      respLru.delete(key);
+      respLru.set(key, hit); // recency touch
+      return clientResponse(hit.bytes, hit.cacheControl, qid);
+    }
+    respLru.delete(key);
+  }
+
+  const res = await matchCache(new Request(CACHE_ORIGIN + encodeURIComponent(key)));
+  if (!res) return null;
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.length < 12) return null;
+  const cacheControl = res.headers.get('cache-control') || 'max-age=60';
+  const maxAge = Number(/max-age=(\d+)/.exec(cacheControl)?.[1]) || 0;
+  const age = Number(res.headers.get('age')) || 0;
+  lruPut(key, bytes, cacheControl, maxAge, age);
+  return clientResponse(bytes, cacheControl, qid);
+}
+
+/**
+ * Deliver answer bytes, caching them under `key` for `maxAge` seconds in both
+ * cache tiers (a falsy key or zero TTL skips caching entirely).
+ * @param {Uint8Array} bytes @param {string} key @param {number} maxAge
+ * @param {ExecutionContext} [ctx]
+ * @returns {Promise<Response>}
+ */
+async function respond(bytes, key, maxAge, ctx) {
+  const ttl = Math.max(0, Math.floor(maxAge));
+  const cacheControl = `max-age=${ttl}`;
+  if (key && ttl > 0) {
+    lruPut(key, bytes, cacheControl, ttl, 0);
+    await bg(ctx, caches.default.put(
+      new Request(CACHE_ORIGIN + encodeURIComponent(key)),
+      new Response(bytes, { headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': cacheControl } }),
+    ));
+  }
+  return new Response(bytes, {
+    headers: { 'Content-Type': DNS_MEDIA_TYPE, 'Cache-Control': cacheControl },
   });
 }
 
 // ---- Main query handler ----
 
-async function handleQuery(queryBuf, env) {
+/**
+ * @param {Uint8Array} queryBuf @param {Env} env @param {ExecutionContext} [ctx]
+ * @returns {Promise<Response>}
+ */
+async function handleQuery(queryBuf, env, ctx) {
   const q = parseQuestion(queryBuf);
   if (!q) return new Response('malformed DNS message', { status: 400 });
 
@@ -192,12 +379,28 @@ async function handleQuery(queryBuf, env) {
 
   await refreshStores();
   const settings = settingsStore.get();
-  const verdict = runQueryFilters(stores, settings, q.name);
   const retention = settings.logRetentionDays;
+  const logPassed = settings.logPassed !== false; // tolerate pre-toggle blobs
+
+  const key = answerCacheKey(configEpoch(settings), q.name, q.qtype, ednsDo(queryBuf));
+  const qid = (queryBuf[0] << 8) | queryBuf[1];
+  const hit = await cachedAnswer(key, qid);
+  if (hit) {
+    // Filters still run on a hit (pure in-memory) so the audit log is
+    // identical whether an answer came from cache or upstream.
+    const verdict = runQueryFilters(stores, settings, q.name);
+    if (BLOCKED_QUERY_STATUSES.has(verdict.status) || logPassed) {
+      await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
+    }
+    return hit;
+  }
+
+  const verdict = runQueryFilters(stores, settings, q.name);
 
   if (BLOCKED_QUERY_STATUSES.has(verdict.status)) {
-    await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
-    return nxdomain(queryBuf);
+    await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
+    const maxAge = verdict.filter === 'denylist' ? RULE_MAX_AGE : BLOCKED_MAX_AGE;
+    return respond(buildNxdomainResponse(queryBuf), key, maxAge, ctx);
   }
 
   // allow | none -> forward upstream
@@ -207,24 +410,31 @@ async function handleQuery(queryBuf, env) {
     if (verdict.status === 'none' && settings.rebindProtection) {
       const priv = privateAnswerIP(upstream);
       if (priv) {
-        await logQuery(env, q.name, 'rebind', 'rebind', q.qtype, retention);
-        return nxdomain(queryBuf);
+        await bg(ctx, logQuery(env, q.name, 'rebind', 'rebind', q.qtype, retention));
+        // Every answer can differ here; never cache the verdict (TTL only
+        // tells the client not to re-ask before re-resolving).
+        return respond(buildNxdomainResponse(queryBuf), '', RULE_MAX_AGE, ctx);
       }
     }
-    await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
-    return passThrough(upstream);
+    if (logPassed) {
+      await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
+    }
+    return respond(upstream, key, minTtl(upstream), ctx);
   } catch {
     // Upstream unavailable — never break DNS.
   }
 
-  await logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention);
+  if (logPassed) {
+    await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
+  }
   return upstreamFailure(queryBuf);
 }
 
 // ---- Test endpoint (mirrors the live pipeline) ----
 
-async function testDomain(domain, env) {
-  await ensureBlocklist(env);
+/** @param {string} domain @param {Env} env @param {ExecutionContext} [ctx] @returns {Promise<unknown>} */
+async function testDomain(domain, env, ctx) {
+  await ensureBlocklist(env, ctx);
   await refreshStores();
 
   const settings = settingsStore.get();
@@ -242,10 +452,27 @@ async function testDomain(domain, env) {
   };
 }
 
+/**
+ * Warm blocklist + stores concurrently. Returns an error Response when the
+ * blocklist cannot be loaded at all (cold fetch failed, no usable copy),
+ * null when the worker is ready to answer.
+ * @param {Env} env @param {ExecutionContext} [ctx] @returns {Promise<Response|null>}
+ */
+async function ensureReady(env, ctx) {
+  try {
+    await Promise.all([ensureBlocklist(env, ctx), refreshStores()]);
+    return null;
+  } catch (e) {
+    console.error('[boot] blocklist unavailable:', e instanceof Error ? e.message : e);
+    return new Response('blocklist unavailable', { status: 503 });
+  }
+}
+
 // ---- Worker entry ----
 
 export default {
-  async fetch(request, env) {
+  /** @param {Request} request @param {Env} env @param {ExecutionContext} [ctx] */
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     ensureKv(env);
 
@@ -257,13 +484,13 @@ export default {
         tlds: tldStore,
         blocklist,
         settings: settingsStore,
-        testFn: testDomain,
+        testFn: (domain, e) => testDomain(domain, /** @type {Env} */ (e || env), ctx),
       });
     }
 
     // ---- health ----
     if (url.pathname === '/healthz') {
-      await Promise.all([ensureBlocklist(env), refreshStores()]);
+      await Promise.all([ensureBlocklist(env, ctx), refreshStores()]);
       return Response.json({
         ok: true,
         blocklistSize: blocklist.size,
@@ -293,8 +520,6 @@ export default {
       return new Response('Not Found', { status: 404 });
     }
 
-    await ensureBlocklist(env);
-
     if (request.method === 'GET') {
       const accept = request.headers.get('accept') || '';
       if (!accept.includes(DNS_MEDIA_TYPE) && !accept.includes('*/*')) {
@@ -304,7 +529,10 @@ export default {
       if (!b64) return new Response('missing ?dns=', { status: 400 });
       const buf = base64urlDecode(b64);
       if (!buf) return new Response('bad base64url', { status: 400 });
-      return handleQuery(buf, env);
+      // Validation first: malformed requests never pay for a blocklist load.
+      const ready = await ensureReady(env, ctx);
+      if (ready) return ready;
+      return handleQuery(buf, env, ctx);
     }
 
     if (request.method === 'POST') {
@@ -316,7 +544,9 @@ export default {
       if (raw.byteLength === 0 || raw.byteLength > 4096) {
         return new Response('bad body', { status: 400 });
       }
-      return handleQuery(Buf.from(new Uint8Array(raw)), env);
+      const ready = await ensureReady(env, ctx);
+      if (ready) return ready;
+      return handleQuery(Buf.from(new Uint8Array(raw)), env, ctx);
     }
 
     return new Response('Method Not Allowed', { status: 405 });
