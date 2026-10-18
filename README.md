@@ -249,8 +249,8 @@ Every resolved query is written to D1 (`dns_logs`) with:
 - `filter` — which layer decided: `allowlist` | `denylist` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `upstream`
 - `ts` — unix epoch ms
 - `qtype` — DNS RR type number (`1`=A, `28`=AAAA, `16`=TXT, `65`=HTTPS, …), shown in the
-  dashboard as `A` / `AAAA` / `HTTPS` / `TYPE<n>` for unknown codes. `NULL` for rows
-  written before this column existed.
+  dashboard as the common mnemonic (`A`, `AAAA`, `HTTPS`, …), `other` for uncommon codes,
+  and `—` for rows written before this column existed.
 
 `qtype` is added to pre-existing tables automatically on the first insert
 (`ALTER TABLE ... ADD COLUMN`, duplicate-column errors ignored), so no manual

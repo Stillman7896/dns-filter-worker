@@ -146,7 +146,7 @@ function onFilter(e) {
       </div>
     </section>
 
-    <!-- Table -->
+    <!-- Rows: one row per rule, labels always visible -->
     <section class="panel overflow-hidden">
       <div class="flex flex-wrap items-center gap-3 px-4 sm:px-5 py-3.5 border-b border-line">
         <h2 class="text-[15px] font-medium">All rules</h2>
@@ -162,39 +162,42 @@ function onFilter(e) {
         </label>
       </div>
 
-      <!-- column labels (desktop) -->
-      <div class="hidden sm:grid grid-cols-[1fr_150px_44px] gap-3 px-5 py-2 text-[12.5px] text-muted border-b border-line" aria-hidden="true">
-        <span>Domain</span>
-        <span>Answer</span>
-        <span />
+      <div v-if="filteredRules.length" class="overflow-x-auto">
+        <table class="w-full min-w-[420px] border-collapse text-left">
+          <caption class="sr-only">Custom allow and deny rules</caption>
+          <thead class="text-[12.5px] text-muted border-b border-line">
+            <tr>
+              <th scope="col" class="px-5 py-2 font-medium">Domain</th>
+              <th scope="col" class="px-3 py-2 font-medium whitespace-nowrap">Answer</th>
+              <th scope="col" class="px-5 py-2 font-medium text-right"><span class="sr-only">Action</span></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-line/70">
+            <tr v-for="r in filteredRules" :key="r.domain" class="hover:bg-raised/60 transition-colors">
+              <td class="px-5 py-3 w-full min-w-0">
+                <span class="st text-[13.5px] truncate block" :title="r.domain">{{ r.domain }}</span>
+              </td>
+              <td class="px-3 py-3 whitespace-nowrap">
+                <span
+                  class="text-[12px] st rounded border px-2 py-0.5"
+                  :class="r.kind === 'deny' ? 'text-block border-block/40' : 'text-pass border-pass/40'"
+                >
+                  {{ r.kind === 'deny' ? 'blocked' : 'allowed' }}
+                </span>
+              </td>
+              <td class="px-5 py-3 text-right whitespace-nowrap">
+                <ConfirmButton
+                  small
+                  label="Remove"
+                  :armed-label="`Remove ${r.domain}?`"
+                  :busy-key="`rules.del:${r.domain}`"
+                  @confirm="removeRule(r)"
+                />
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
-
-      <ul>
-        <li
-          v-for="r in filteredRules"
-          :key="r.domain"
-          class="grid grid-cols-[1fr_auto] sm:grid-cols-[1fr_150px_44px] gap-x-3 gap-y-1 items-center px-4 sm:px-5 py-3 border-b border-line/70 last:border-0 hover:bg-raised/60 transition-colors"
-        >
-          <span class="col-span-2 sm:col-span-1 min-w-0 st text-[13.5px] truncate" :title="r.domain">{{ r.domain }}</span>
-
-          <span
-            class="justify-self-start text-[12px] st rounded border px-2 py-0.5"
-            :class="r.kind === 'deny' ? 'text-block border-block/40' : 'text-pass border-pass/40'"
-          >
-            {{ r.kind === 'deny' ? 'block' : 'allow' }}
-          </span>
-
-          <div class="justify-self-end">
-            <ConfirmButton
-              small
-              label="Remove"
-              :armed-label="`Remove ${r.domain}?`"
-              :busy-key="`rules.del:${r.domain}`"
-              @confirm="removeRule(r)"
-            />
-          </div>
-        </li>
-      </ul>
 
       <div v-if="!filteredRules.length" class="px-5 py-10 text-center">
         <p class="text-[14px] font-medium">

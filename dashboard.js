@@ -116,6 +116,16 @@ export async function handleApi(request, env, url, ctx) {
     return res;
   }
 
+  // ---- Sign out: DELETE /api/session ----
+  if (url.pathname === '/api/session' && request.method === 'DELETE') {
+    const res = json({ ok: true });
+    res.headers.append(
+      'Set-Cookie',
+      `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`
+    );
+    return res;
+  }
+
   // ---- Everything else requires a valid session ----
   if (!isConfigured(env)) {
     return json({ error: 'Password not configured', code: 'unconfigured' }, { status: 503 });

@@ -22,18 +22,19 @@ const busy = computed(() => Boolean(props.busyKey && state.ops[props.busyKey]));
       </span>
       <p class="hint mt-0.5">{{ effect }}</p>
     </div>
+    <!-- 40x24 track, 16x16 knob, 3px inset: centre-aligned, travel 16px -->
     <button
       type="button"
       role="switch"
       :aria-checked="modelValue"
       :aria-label="label"
-      class="shrink-0 mt-0.5 w-10 h-6 rounded-full border transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-beacon"
+      class="shrink-0 mt-0.5 w-10 h-6 rounded-full border inline-flex items-center p-[3px] transition-colors duration-150 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-beacon disabled:opacity-50"
       :class="modelValue ? 'bg-beacon border-beacon' : 'bg-raised border-line'"
       :disabled="busy"
       @click="emit('update:modelValue', !modelValue)"
     >
       <span
-        class="block w-4 h-4 mt-0.5 ml-0.5 rounded-full bg-white shadow transition-transform duration-150"
+        class="block w-4 h-4 rounded-full bg-white shadow transition-transform duration-150"
         :class="modelValue ? 'translate-x-4' : 'translate-x-0'"
         aria-hidden="true"
       />

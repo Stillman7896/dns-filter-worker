@@ -73,7 +73,7 @@ function seedLogs() {
       domain: domains[Math.floor(rnd() * domains.length)],
       status,
       filter,
-      qtype: ['A', 'A', 'A', 'AAAA', 'HTTPS'][Math.floor(rnd() * 5)],
+      qtype: [1, 1, 1, 28, 65, 99][Math.floor(rnd() * 6)],
       ts: now - Math.floor(rnd() * 72 * 3600 * 1000),
       blocked: blockedish,
     });
@@ -124,6 +124,12 @@ export function mockApi(req, res, next) {
         json(res, 401, { error: 'Invalid password' });
       }
       return;
+    }
+
+    if (p === '/api/session' && req.method === 'DELETE') {
+      return json(res, 200, { ok: true }, {
+        'Set-Cookie': `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
+      });
     }
 
     if (!authed(req)) {

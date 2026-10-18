@@ -4,10 +4,11 @@ import { runOp } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import StatusPill from '../components/StatusPill.vue';
+import { loadProbeHistory, rememberProbe, clearProbeHistory } from '../probeHistory.js';
 
 const domain = ref('');
 const result = ref(null);
-const history = ref([]);
+const history = ref(loadProbeHistory());
 
 async function probe() {
   const value = domain.value.trim();
@@ -19,15 +20,35 @@ async function probe() {
     fn: async () => {
       const r = await api.probe(value);
       result.value = r;
-      history.value = [r, ...history.value.filter((h) => h.domain !== r.domain)].slice(0, 5);
+      history.value = rememberProbe(history.value, r);
       return r;
     },
   }).catch(() => {});
 }
 
+function reuse(value) {
+  domain.value = value;
+  probe();
+}
+
+function forget() {
+  clearProbeHistory();
+  history.value = [];
+}
+
 const isBlocked = (r) => r && r.status !== 'none' && r.status !== 'allow';
 const actionWord = (r) =>
   isBlocked(r) ? 'Stopped' : r && r.status === 'allow' ? 'Forced through' : 'Let through';
+
+/** @param {number} ts @returns {string} */
+function ago(ts) {
+  if (!ts) return '';
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return 'just now';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} min ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} h ago`;
+  return `${Math.floor(diff / 86_400_000)} d ago`;
+}
 </script>
 
 <template>
@@ -90,21 +111,28 @@ const actionWord = (r) =>
       </dl>
     </section>
 
-    <!-- Recent probes -->
+    <!-- Recent probes, kept in this browser only -->
     <section v-if="history.length" class="panel divide-y divide-line/70">
-      <div class="px-5 py-3">
+      <div class="px-5 py-3 flex items-center gap-3">
         <h2 class="text-[15px] font-medium">Recent probes</h2>
+        <button
+          type="button"
+          class="ml-auto text-[12.5px] text-muted hover:text-ink underline underline-offset-2"
+          @click="forget"
+        >
+          Clear
+        </button>
       </div>
       <button
         v-for="h in history"
         :key="h.domain"
         type="button"
         class="w-full flex items-center gap-3 px-5 py-2.5 text-left hover:bg-raised transition-colors"
-        @click="domain = h.domain, probe()"
+        @click="reuse(h.domain)"
       >
         <StatusPill :status="h.status" />
         <span class="st text-[13px] truncate flex-1">{{ h.domain }}</span>
-        <span class="text-[12.5px] text-muted hidden sm:inline">{{ h.filter || 'no match' }}</span>
+        <span class="text-[12px] text-muted whitespace-nowrap">{{ ago(h.ts) }}</span>
       </button>
     </section>
 

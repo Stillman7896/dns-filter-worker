@@ -5,6 +5,7 @@ import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import ConfirmButton from '../components/ConfirmButton.vue';
 import StatusPill from '../components/StatusPill.vue';
+import { qtypeLabel } from '../qtype.js';
 
 const STATUSES = ['', 'allow', 'deny', 'blocklist', 'tld', 'keyword', 'rebind', 'idn', 'none'];
 const LIMITS = [25, 50, 100, 250];
@@ -52,14 +53,10 @@ async function refresh() {
   await runOp('logs.refresh', { verb: 'Reload logs', ok: `${total.value} rows loaded`, fn: loadLogs }).catch(() => {});
 }
 
-const filteredAlert = computed(() => ({
-  verb: 'Delete filtered logs',
-  ok: `${total.value} rows deleted`,
-}));
-
 async function deleteFiltered() {
   await runOp('logs.deleteFiltered', {
-    ...filteredAlert.value,
+    verb: 'Delete filtered logs',
+    ok: `${total.value} rows deleted`,
     fn: async () => {
       await api.deleteLogs({ ...currentQuery(), clear: undefined });
       state.logs.offset = 0;
@@ -94,8 +91,7 @@ async function removeRow(row) {
 async function page(dir) {
   state.logs.offset = Math.max(0, state.logs.offset + dir * state.logs.limit);
   await loadLogs().catch(() => {});
-  const heading = document.getElementById('log-heading');
-  heading?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.getElementById('log-heading')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function timeOf(ts) {
@@ -175,46 +171,45 @@ function timeOf(ts) {
       <AppButton variant="solid" class="mt-4" @click="setRoute('settings')">Open settings</AppButton>
     </div>
 
-    <!-- Rows -->
+    <!-- Rows: a real table, labels stay visible, narrow screens scroll it -->
     <section v-else class="panel overflow-hidden">
-      <div class="hidden sm:grid grid-cols-[110px_1fr_130px_150px_70px_76px] gap-3 px-5 py-2 text-[12.5px] text-muted border-b border-line" aria-hidden="true">
-        <span>When</span>
-        <span>Domain</span>
-        <span>Outcome</span>
-        <span>Decided by</span>
-        <span>Type</span>
-        <span />
+      <div v-if="rows.length" class="overflow-x-auto">
+        <table class="w-full min-w-[540px] border-collapse text-left">
+          <caption class="sr-only">Recent DNS queries</caption>
+          <thead class="text-[12.5px] text-muted border-b border-line">
+            <tr>
+              <th scope="col" class="px-4 sm:px-5 py-2 font-medium whitespace-nowrap">When</th>
+              <th scope="col" class="px-3 py-2 font-medium">Domain</th>
+              <th scope="col" class="px-3 py-2 font-medium whitespace-nowrap">Outcome</th>
+              <th scope="col" class="px-3 py-2 font-medium whitespace-nowrap">Type</th>
+              <th scope="col" class="px-4 sm:px-5 py-2 font-medium text-right"><span class="sr-only">Action</span></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-line/70">
+            <tr v-for="r in rows" :key="r.id" class="hover:bg-raised/60 transition-colors">
+              <td class="px-4 sm:px-5 py-3 whitespace-nowrap st text-[12.5px] text-muted" :title="timeOf(r.ts).full">
+                {{ timeOf(r.ts).rel }}
+              </td>
+              <td class="px-3 py-3 w-full min-w-0">
+                <span class="st text-[13.5px] truncate block" :title="r.domain">{{ r.domain }}</span>
+              </td>
+              <td class="px-3 py-3 whitespace-nowrap">
+                <StatusPill :status="r.status" />
+              </td>
+              <td class="px-3 py-3 whitespace-nowrap st text-[12.5px] text-muted">{{ qtypeLabel(r.qtype) }}</td>
+              <td class="px-4 sm:px-5 py-3 text-right whitespace-nowrap">
+                <ConfirmButton
+                  small
+                  label="Remove"
+                  armed-label="Delete row?"
+                  :busy-key="`logs.del:${r.id}`"
+                  @confirm="removeRow(r)"
+                />
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
-
-      <ul v-if="rows.length" class="divide-y divide-line/70">
-        <li
-          v-for="r in rows"
-          :key="r.id"
-          class="grid grid-cols-[1fr_auto] sm:grid-cols-[110px_1fr_130px_150px_70px_76px] gap-x-3 gap-y-1 px-4 sm:px-5 py-3 items-center hover:bg-raised/60 transition-colors"
-        >
-          <span class="hidden sm:block st text-[12.5px] text-muted" :title="timeOf(r.ts).full">{{ timeOf(r.ts).rel }}</span>
-
-          <span class="st text-[13.5px] truncate" :title="r.domain">{{ r.domain }}</span>
-
-          <span class="order-1 sm:order-none justify-self-start sm:justify-self-auto">
-            <StatusPill :status="r.status" />
-          </span>
-
-          <span class="hidden sm:block truncate text-[13px] text-muted st">{{ r.filter || '—' }}</span>
-          <span class="hidden sm:block st text-[12.5px] text-muted">{{ r.qtype }}</span>
-
-          <span class="order-2 sm:order-none justify-self-end flex items-center gap-2">
-            <span class="sm:hidden st text-[12px] text-muted" :title="timeOf(r.ts).full">{{ timeOf(r.ts).rel }}</span>
-            <ConfirmButton
-              small
-              label="Remove"
-              armed-label="Delete row?"
-              :busy-key="`logs.del:${r.id}`"
-              @confirm="removeRow(r)"
-            />
-          </span>
-        </li>
-      </ul>
 
       <div v-if="!rows.length" class="px-5 py-10 text-center">
         <p class="text-[14px] font-medium">{{ activeFilter ? 'Nothing matches that filter.' : 'The log is empty.' }}</p>

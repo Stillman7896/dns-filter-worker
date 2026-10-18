@@ -456,3 +456,20 @@ test('backup: import validation — bad json shape, invalid entries, empty paylo
   });
   assert.equal(badSettings.status, 400);
 });
+
+test('session: DELETE clears the dashboard cookie', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+
+  const login = await call(ctx, env, '/api/session', { method: 'POST', body: { password: PASSWORD } });
+  const cookie = cookieFrom(login);
+  const rules = await call(ctx, env, '/api/rules', { cookie });
+  assert.equal(rules.status, 200);
+
+  const out = await call(ctx, env, '/api/session', { method: 'DELETE', cookie });
+  assert.equal(out.status, 200);
+  const sc = out.headers.get('set-cookie') || '';
+  assert.match(sc, /dns_dash_session=;/);
+  assert.match(sc, /Max-Age=0/);
+});

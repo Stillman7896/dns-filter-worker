@@ -18,13 +18,24 @@ export const isDark = ref(false);
 
 const mq = typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)') : null;
 
+function resolve() {
+  return themeMode.value === 'dark' || (themeMode.value === 'auto' && Boolean(mq?.matches));
+}
+
 function apply() {
-  const dark = themeMode.value === 'dark' || (themeMode.value === 'auto' && Boolean(mq?.matches));
+  const dark = resolve();
   isDark.value = dark;
-  document.documentElement.classList.toggle('dark', dark);
+  const root = document.documentElement;
+  root.classList.toggle('dark', dark);
+  // Native controls ride along with the resolved theme.
+  root.style.colorScheme = dark ? 'dark' : 'light';
   const meta = document.querySelector('meta[name="theme-color"]:not([media])');
   if (meta) meta.setAttribute('content', dark ? '#0B1018' : '#EEF1F6');
 }
+
+// index.html paints the pre-hydration frame; this brings the reactive state and
+// DOM in step as soon as the module evaluates.
+apply();
 
 export function setTheme(mode) {
   themeMode.value = mode;
@@ -39,4 +50,6 @@ export function cycleTheme() {
 export const THEME_LABEL = { auto: 'System', light: 'Light', dark: 'Dark' };
 export const THEME_NEXT = { auto: 'next: light', light: 'next: dark', dark: 'next: system' };
 
-mq?.addEventListener?.('change', () => themeMode.value === 'auto' && apply());
+mq?.addEventListener?.('change', () => {
+  if (themeMode.value === 'auto') apply();
+});

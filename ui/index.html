@@ -4,8 +4,24 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="theme-color" content="#0B1018" media="(prefers-color-scheme: dark)" />
-    <meta name="theme-color" content="#EEF1F6" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#EEF1F6" />
+    <script>
+      // Resolve the theme before first paint so a reload never flashes light.
+      (() => {
+        let mode = 'auto';
+        try {
+          const raw = localStorage.getItem('dns-dash-theme');
+          if (raw === 'light' || raw === 'dark' || raw === 'auto') mode = raw;
+        } catch {}
+        const systemDark = typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches;
+        const dark = mode === 'dark' || (mode === 'auto' && systemDark);
+        const root = document.documentElement;
+        root.classList.toggle('dark', dark);
+        root.style.colorScheme = dark ? 'dark' : 'light';
+        const meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', dark ? '#0B1018' : '#EEF1F6');
+      })();
+    </script>
     <title>DNS Filter — control</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />

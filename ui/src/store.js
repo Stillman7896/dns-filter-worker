@@ -186,6 +186,18 @@ export async function login(password) {
 
 export async function signOut() {
   try { await api.signOut(); } catch { /* cookie already gone */ }
+  // Drop every cached payload so a reload can never rehydrate a signed-in view
+  // from stale state, and the cleared cookie is the only thing left to trust.
+  state.rules = [];
+  state.keywords = [];
+  state.tlds = [];
+  state.settings = null;
+  state.stats = null;
+  state.statsError = null;
+  state.logs = { rows: [], total: 0, search: '', status: '', limit: state.logs.limit, offset: 0 };
+  state.toasts = [];
+  state.ops = {};
+  state.flashes = {};
   state.signingOut = true;
   state.phase = 'auth';
 }
