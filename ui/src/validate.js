@@ -3,3 +3,28 @@
 // exact same rules the API validates with — no second opinion to drift.
 export { normalizeDomain } from '../../rules.js';
 export { normalizeTld, normalizeKeyword } from '../../lists.js';
+export { normalizeRouteValue } from '../../routing.js';
+
+/** Same test the API applies to a custom provider URL.
+ * @param {string} value
+ * @returns {boolean}
+ */
+export function isHttpsUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return false;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === 'https:' && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
+/** Same shape check the API applies to an ODoH relay template.
+ * @param {string} value
+ * @returns {boolean}
+ */
+export function isRelayTemplate(value) {
+  if (typeof value !== 'string' || !value.startsWith('https://')) return false;
+  const vars = value.match(/\{[^}]*\}/g) || [];
+  return vars.length === 1 && vars[0] === '{?targethost,targetpath}';
+}

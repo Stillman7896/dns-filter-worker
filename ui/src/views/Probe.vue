@@ -42,9 +42,11 @@ function forget() {
   history.value = [];
 }
 
-const isBlocked = (r) => r && r.status !== 'none' && r.status !== 'allow';
+const isBlocked = (r) => r && !['none', 'allow', 'route'].includes(r.status);
+const isRouted = (r) => r && r.status === 'route';
 const actionWord = (r) =>
-  isBlocked(r) ? 'Stopped' : r && r.status === 'allow' ? 'Forced through' : 'Let through';
+  isRouted(r) ? 'Answered locally' : isBlocked(r) ? 'Stopped' : r && r.status === 'allow' ? 'Forced through' : 'Let through';
+const tone = (r) => (isBlocked(r) ? 'text-block border-l-block' : isRouted(r) ? 'text-beacon border-l-beacon' : 'text-pass border-l-pass');
 
 /** @param {number} ts @returns {string} */
 function ago(ts) {
@@ -92,11 +94,11 @@ function ago(ts) {
     <section
       v-if="result"
       class="panel p-5 rise-in border-l-4"
-      :class="isBlocked(result) ? 'border-l-block' : 'border-l-pass'"
+      :class="tone(result)"
       aria-live="polite"
     >
       <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-        <span class="text-[19px] font-semibold tracking-tight" :class="isBlocked(result) ? 'text-block' : 'text-pass'">
+        <span class="text-[19px] font-semibold tracking-tight" :class="tone(result).split(' ')[0]">
           {{ actionWord(result) }}
         </span>
         <StatusPill :status="result.status" />
@@ -112,11 +114,18 @@ function ago(ts) {
           <dt class="text-[12.5px] text-muted">Decided by</dt>
           <dd class="st text-[13.5px] mt-0.5">{{ result.filter }}</dd>
         </div>
+        <div v-if="result.route">
+          <dt class="text-[12.5px] text-muted">Answer served</dt>
+          <dd class="st text-[13.5px] mt-0.5 break-all">
+            {{ result.route.type.toUpperCase() }} · {{ result.route.value }}
+            <span class="text-muted">({{ result.route.ttl }} s)</span>
+          </dd>
+        </div>
         <div>
           <dt class="text-[12.5px] text-muted">Blocklist in memory</dt>
           <dd class="st text-[13.5px] mt-0.5">{{ result.blocklistSize.toLocaleString() }} entries</dd>
         </div>
-        <div v-if="result.note">
+        <div v-if="result.note && !result.route">
           <dt class="text-[12.5px] text-muted">Still applies</dt>
           <dd class="hint mt-0.5">{{ result.note }}</dd>
         </div>

@@ -60,9 +60,15 @@ export const api = {
   // verdict probe
   probe: (domain) => request('/api/test', { query: { domain } }),
 
-  // settings
+  // settings + upstream provider
   getSettings: () => request('/api/settings'),
   saveSettings: (patch) => request('/api/settings', { method: 'POST', body: patch }),
+  testUpstream: (candidate) => request('/api/upstream/test', { method: 'POST', body: candidate }),
+
+  // response routes
+  routes: () => request('/api/routes'),
+  addRoute: (route) => request('/api/routes', { method: 'POST', body: route }),
+  deleteRoute: (domain) => request('/api/routes', { method: 'DELETE', query: { domain } }),
 
   // backup
   exportConfig: () => request('/api/export'),

@@ -1,7 +1,10 @@
 <script setup>
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { state, runOp, loadStats, setRoute } from '../store.js';
 import AppButton from '../components/AppButton.vue';
+import CopyField from '../components/CopyField.vue';
+import Modal from '../components/Modal.vue';
+import Segmented from '../components/Segmented.vue';
 
 const BLOCKED = ['deny', 'blocklist', 'tld', 'keyword', 'rebind', 'idn'];
 
@@ -25,14 +28,58 @@ const topBlocked = computed(() => stats.value?.topBlocked || []);
 
 const counts = computed(() => ({
   rules: state.rules.length,
+  routes: state.routes.length,
   keywords: state.keywords.length,
   tlds: state.tlds.length,
 }));
 
 // Only the on/off switches count here; logRetentionDays is a number and would
-// otherwise sit in the denominator unmovable.
+// otherwise be in the denominator unmovable.
 const switches = computed(() => Object.values(state.settings || {}).filter((v) => typeof v === 'boolean'));
 const switchesOn = computed(() => switches.value.filter(Boolean).length);
+
+// ---- endpoint + setup guide ---------------------------------------------------
+
+const endpoint = `${location.origin}/dns-query`;
+const setupOpen = ref(false);
+const guide = ref('browsers');
+
+const GUIDES = [
+  {
+    id: 'browsers',
+    label: 'Browsers',
+    lines: [
+      'Firefox — Settings → Privacy & Security → DNS over HTTPS → Max Protection → Custom, then paste the endpoint.',
+      'Chrome / Edge — Settings → Privacy and security → Security → Use secure DNS → With → Custom, then paste the endpoint.',
+    ],
+  },
+  {
+    id: 'router',
+    label: 'Router',
+    lines: [
+      'AdGuard Home — Settings → DNS settings → Upstream DNS servers, add the endpoint, then Test upstreams.',
+      'Pi-hole — run cloudflared against the endpoint and point Pi-hole at 127.0.0.1#5053.',
+    ],
+    snippet: 'cloudflared proxy-dns --upstream {endpoint} --port 5053',
+  },
+  {
+    id: 'mobile',
+    label: 'Mobile',
+    lines: [
+      'Android — Private DNS only speaks DoT, so use a DoH client app and point it at the endpoint.',
+      'iOS / macOS — install a DoH configuration profile or use a DoH client app; both just need the endpoint.',
+    ],
+  },
+  {
+    id: 'curl',
+    label: 'curl',
+    lines: ['query.bin is a raw DNS message; the response is one too.'],
+    snippet: "curl -sS -H 'content-type: application/dns-message' \\\n  --data-binary @query.bin {endpoint} | xxd",
+  },
+];
+
+const currentGuide = computed(() => GUIDES.find((g) => g.id === guide.value) || GUIDES[0]);
+const snippet = computed(() => (currentGuide.value.snippet || '').replaceAll('{endpoint}', endpoint));
 
 async function refresh() {
   await runOp('overview.refresh', { verb: 'Refresh overview', ok: 'Overview up to date', fn: loadStats });
@@ -50,6 +97,68 @@ async function refresh() {
         Refresh
       </AppButton>
     </div>
+
+    <!-- Endpoint: the one thing every client needs -->
+    <section class="panel p-5">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 class="text-[15px] font-medium">Connect a client</h2>
+          <p class="hint mt-0.5">Any DoH client pointed at this endpoint is filtered — no agent, no extra deploy.</p>
+        </div>
+        <AppButton small variant="solid" @click="setupOpen = true">Setup guide</AppButton>
+      </div>
+
+      <div class="mt-4">
+        <CopyField :value="endpoint" label="DNS over HTTPS endpoint" />
+      </div>
+
+      <div class="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1">
+        <p class="hint">
+          Upstream: <span class="st text-ink">{{ state.upstream?.label || '—' }}</span> ·
+          <button type="button" class="underline underline-offset-2 text-muted hover:text-ink" @click="setRoute('settings')">
+            change
+          </button>
+        </p>
+        <p class="hint">
+          {{ counts.routes }} {{ counts.routes === 1 ? 'route answers locally' : 'routes answer locally' }}
+        </p>
+      </div>
+    </section>
+
+    <Modal :open="setupOpen" title="Point a client at this resolver" @close="setupOpen = false">
+      <CopyField :value="endpoint" label="DNS over HTTPS endpoint" />
+
+      <div class="mt-4">
+        <Segmented
+          v-model="guide"
+          :options="GUIDES.map((g) => ({ value: g.id, label: g.label }))"
+          label="Client type"
+        />
+      </div>
+
+      <ul class="mt-3.5 space-y-2">
+        <li v-for="line in currentGuide.lines" :key="line" class="flex gap-2.5 text-[13px] leading-relaxed">
+          <span class="mt-1.5 w-1 h-1 shrink-0 rounded-full bg-beacon" aria-hidden="true" />
+          <span>{{ line }}</span>
+        </li>
+      </ul>
+
+      <div v-if="snippet" class="mt-3.5">
+        <CopyField :value="snippet" label="Command" />
+      </div>
+
+      <p class="hint mt-3.5">
+        Filtering runs before the answer is cached, so blocked names stay blocked for every client using this
+        endpoint. The endpoint requires no credentials — put it behind Cloudflare Access if it must stay private.
+      </p>
+
+      <template #footer>
+        <div class="flex items-center justify-between gap-3">
+          <span class="hint">DoH only — plain port 53 is not served by this worker.</span>
+          <AppButton small @click="setupOpen = false">Done</AppButton>
+        </div>
+      </template>
+    </Modal>
 
     <!-- Empty / unconfigured logging -->
     <div v-if="state.statsError === 'no_d1'" class="panel p-5 rise-in">
@@ -79,7 +188,7 @@ async function refresh() {
         <div class="panel p-4">
           <p class="text-[12.5px] text-muted">Custom rules</p>
           <p class="st text-[26px] mt-1 leading-none">{{ counts.rules }}</p>
-          <p class="hint mt-1">{{ counts.keywords }} keywords · {{ counts.tlds }} TLDs</p>
+          <p class="hint mt-1">{{ counts.routes }} routes · {{ counts.keywords }} keywords · {{ counts.tlds }} TLDs</p>
         </div>
         <div class="panel p-4">
           <p class="text-[12.5px] text-muted">Protections on</p>
@@ -131,7 +240,7 @@ async function refresh() {
               <div class="mt-1 h-2 rounded-full bg-raised overflow-hidden">
                 <div
                   class="h-full rounded-full transition-all duration-500"
-                  :class="BLOCKED.includes(r.status) ? 'bg-block' : 'bg-pass/70'"
+                  :class="BLOCKED.includes(r.status) ? 'bg-block' : r.status === 'route' ? 'bg-beacon' : 'bg-pass/70'"
                   :style="{ width: Math.max(2, (r.n / maxStatus) * 100) + '%' }"
                 />
               </div>

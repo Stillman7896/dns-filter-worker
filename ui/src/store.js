@@ -9,7 +9,7 @@ export const VIEWS = [
   { id: 'probe', label: 'Probe', verb: 'Test one domain', group: 'traffic' },
   { id: 'logs', label: 'Logs', verb: 'Read the query log', group: 'traffic' },
   { id: 'lists', label: 'Filter lists', verb: 'Manage blocked TLDs and keywords', group: 'config' },
-  { id: 'settings', label: 'Settings', verb: 'Change logging and protections', group: 'config' },
+  { id: 'settings', label: 'Settings', verb: 'Change resolver, routes and logging', group: 'config' },
   { id: 'backup', label: 'Backup', verb: 'Export or import configuration', group: 'config' },
 ];
 
@@ -21,9 +21,12 @@ export const state = reactive({
 
   rules: [],
   ruleFilter: '',
+  routes: [],
   keywords: [],
   tlds: [],
   settings: null,
+  upstream: null,
+  upstreamPresets: [],
 
   logs: { rows: [], total: 0, search: '', status: '', limit: 50, offset: 0 },
   stats: null,
@@ -175,8 +178,11 @@ export async function boot() {
   state.bootError = null;
   try {
     // One call doubles as the probe: 503 = unconfigured, 401 = needs sign-in.
-    state.settings = (await api.getSettings()).settings;
-    await Promise.all([loadRules(), loadLists()]);
+    const config = await api.getSettings();
+    state.settings = config.settings;
+    state.upstream = config.upstream;
+    state.upstreamPresets = config.upstreamPresets || [];
+    await Promise.all([loadRules(), loadRoutes(), loadLists()]);
     await Promise.all([loadLogs(), loadStats()]);
     state.phase = 'ready';
   } catch (e) {
@@ -200,9 +206,12 @@ export async function signOut() {
   // Drop every cached payload so a reload can never rehydrate a signed-in view
   // from stale state, and the cleared cookie is the only thing left to trust.
   state.rules = [];
+  state.routes = [];
   state.keywords = [];
   state.tlds = [];
   state.settings = null;
+  state.upstream = null;
+  state.upstreamPresets = [];
   state.stats = null;
   state.statsError = null;
   state.logs = { rows: [], total: 0, search: '', status: '', limit: state.logs.limit, offset: 0 };
@@ -217,6 +226,10 @@ export async function signOut() {
 
 export async function loadRules() {
   state.rules = (await api.rules()).rules;
+}
+
+export async function loadRoutes() {
+  state.routes = (await api.routes()).routes;
 }
 
 export async function loadLists() {

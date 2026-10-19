@@ -2,6 +2,9 @@
 // Keeps the same routes, payload shapes and, importantly, the same auth flow:
 // everything is 401 until /api/session accepts a password.
 
+import { UPSTREAM_PRESETS, findPreset, probeUpstream, resolveUpstream } from '../../upstream.js';
+import { normalizeRoute } from '../../routing.js';
+
 const SESSION_COOKIE = 'dns_dash_session';
 const PASSWORD = 'demo';
 
@@ -19,6 +22,10 @@ const fixtures = {
     { domain: 'releases.example.com', kind: 'allow' },
     { domain: 'beacon.partner.dev', kind: 'deny' },
   ],
+  routes: [
+    { domain: 'nas.home.lan', type: 'a', value: '192.168.1.20', ttl: 300 },
+    { domain: 'media.example.com', type: 'cname', value: 'nas.home.lan', ttl: 300 },
+  ],
   keywords: ['doubleclick', 'metrics-gateway', 'telemetry'],
   tlds: ['zip', 'mov', 'xyz'],
   settings: {
@@ -28,6 +35,9 @@ const fixtures = {
     keywordBlock: true,
     logPassed: true,
     logRetentionDays: 30,
+    upstreamPreset: 'cloudflare',
+    upstreamUrl: '',
+    upstreamRelay: '',
   },
   logs: [],
 };
@@ -194,11 +204,60 @@ export function mockApi(req, res, next) {
 
     // ---- settings ----
     if (p === '/api/settings') {
-      if (req.method === 'GET') return json(res, 200, { settings: fixtures.settings });
+      if (req.method === 'GET') {
+        return json(res, 200, {
+          settings: fixtures.settings,
+          upstream: resolveUpstream(fixtures.settings, {}),
+          upstreamPresets: UPSTREAM_PRESETS,
+        });
+      }
       if (req.method === 'POST') {
         if (!body) return json(res, 400, { error: 'bad json' });
         Object.assign(fixtures.settings, body);
-        return json(res, 200, { ok: true, settings: fixtures.settings });
+        return json(res, 200, {
+          ok: true,
+          settings: fixtures.settings,
+          upstream: resolveUpstream(fixtures.settings, {}),
+        });
+      }
+    }
+
+    // ---- upstream connection test (hits the network from `vite dev`) ----
+    if (p === '/api/upstream/test' && req.method === 'POST') {
+      const preset = body && body.preset ? findPreset(body.preset) : undefined;
+      if (body && body.preset && !preset) return json(res, 400, { error: 'unknown upstream provider' });
+      /** @type {{url: string, kind: 'doh'|'odoh', relay?: string}} */
+      let candidate;
+      if (preset && preset.id === 'custom') {
+        candidate = { url: String((body || {}).url || ''), kind: 'doh' };
+      } else if (preset) {
+        candidate = { url: preset.url, kind: preset.kind || 'doh', relay: String((body || {}).relay || '') };
+      } else {
+        candidate = {
+          url: String((body || {}).url || ''),
+          kind: (body || {}).kind === 'odoh' ? 'odoh' : 'doh',
+          relay: String((body || {}).relay || ''),
+        };
+      }
+      return json(res, 200, await probeUpstream(candidate));
+    }
+
+    // ---- response routes ----
+    if (p === '/api/routes') {
+      if (req.method === 'GET') return json(res, 200, { routes: fixtures.routes });
+      if (req.method === 'POST') {
+        const route = normalizeRoute(body);
+        if (!route) return json(res, 400, { error: 'invalid route: needs a domain and an IPv4, IPv6 or hostname answer' });
+        const i = fixtures.routes.findIndex((r) => r.domain === route.domain);
+        if (i >= 0) fixtures.routes[i] = route; else fixtures.routes.push(route);
+        fixtures.routes.sort((a, b) => a.domain.localeCompare(b.domain));
+        return json(res, 200, { ok: true, route });
+      }
+      if (req.method === 'DELETE') {
+        const domain = String(url.searchParams.get('domain') || '');
+        const i = fixtures.routes.findIndex((r) => r.domain === domain);
+        if (i >= 0) fixtures.routes.splice(i, 1);
+        return json(res, 200, { ok: true, existed: i >= 0 });
       }
     }
 
@@ -209,13 +268,24 @@ export function mockApi(req, res, next) {
         exportedAt: new Date().toISOString(),
         settings: fixtures.settings,
         rules: fixtures.rules,
+        routes: fixtures.routes,
         keywords: fixtures.keywords,
         tlds: fixtures.tlds,
       });
     }
     if (p === '/api/import' && req.method === 'POST') {
       const mode = body.mode === 'replace' ? 'replace' : 'merge';
-      const summary = { mode, rules: null, keywords: null, tlds: null, settings: false };
+      const summary = { mode, rules: null, routes: null, keywords: null, tlds: null, settings: false };
+      if (Array.isArray(body.routes)) {
+        const valid = body.routes.map(normalizeRoute).filter(Boolean);
+        if (mode === 'replace') fixtures.routes = valid.slice();
+        else for (const r of valid) {
+          const i = fixtures.routes.findIndex((x) => x.domain === r.domain);
+          if (i >= 0) fixtures.routes[i] = r; else fixtures.routes.push(r);
+        }
+        fixtures.routes.sort((a, b) => a.domain.localeCompare(b.domain));
+        summary.routes = { applied: valid.length, skipped: body.routes.length - valid.length };
+      }
       if (Array.isArray(body.rules)) {
         if (mode === 'replace') fixtures.rules = body.rules.slice();
         else for (const r of body.rules) if (!fixtures.rules.some((x) => x.domain === r.domain)) fixtures.rules.push(r);

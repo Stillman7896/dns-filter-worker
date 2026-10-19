@@ -2,25 +2,30 @@
 
 DNS over HTTPS (RFC 8484) endpoint for Cloudflare Workers. Filters against the
 Hagezi `pro-plus` blocklist and a user-managed allow/deny rule set stored in
-Workers KV. Upstream resolver: Quad9.
+Workers KV, answers chosen names locally, and forwards everything else to a
+resolver picked from the dashboard (Cloudflare, Quad9, Google, AdGuard — plain
+DoH or Oblivious DoH — or your own endpoint).
 
 ## Precedence
 
 ```
-Custom allowlist
+Response route — a fixed answer for the name + subdomains
   > Custom denylist
+  > Custom allowlist
   > Remote blocklist (Hagezi pro-plus)
   > Blocked TLD (last-label match)                       [if tldBlock]
   > Blocked keyword (substring match)                    [if keywordBlock]
   > DNS rebinding — internal/special-use names           [if rebindProtection]
   > IDN homograph block — xn-- / non-ASCII labels        [if idnBlock]
-  > Quad9 upstream
+  > Upstream resolver (Settings, or UPSTREAM_URL)
   > DNS rebinding — private IP in the ANSWER section      [if rebindProtection]
 ```
 
-Allow always wins, so you can carve holes in the upstream Hagezi list —
-including letting an allowlisted name resolve to a private IP past the
-rebinding check.
+A route answers first because it is a direct instruction about that name: the
+worker never asks an upstream for it, and it outranks even an explicit deny
+rule. Allow wins over deny everywhere else, so you can carve holes in the
+upstream Hagezi list — including letting an allowlisted name resolve to a
+private IP past the rebinding check.
 
 ### DNS rebinding protection (`rebindProtection`, default ON)
 - **Name level**: blocks `localhost`, `*.local`, `*.lan`, `*.home`, `*.internal`,
@@ -95,7 +100,8 @@ So each list lives in **one KV value**:
 | `rules:data` | newline `kind<TAB>domain` |
 | `keywords:data` | newline keywords |
 | `tlds:data` | newline TLDs |
-| `settings:main` | JSON of the toggles |
+| `routes:data` | newline `domain<TAB>type<TAB>value<TAB>ttl` |
+| `settings:main` | JSON of the toggles + the chosen provider |
 | `data:version` | timestamp bumped on **any** list write |
 
 A shared `data:version` means one tiny read per cache TTL tells *every* store
@@ -130,8 +136,11 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 | `blocklist.js`      | Hagezi remote list loader + subdomain matcher       |
 | `rules.js`          | KV-backed allow/deny store (single blob) + subdomain matching |
 | `lists.js`          | Generic newline KV blob stores (keywords, TLDs) + normalizers |
-| `settings.js`       | KV-backed persistent filter settings (toggles)      |
-| `dashboard.js`      | JSON API for rules/logs/test/session/settings/lists |
+| `settings.js`       | KV-backed persistent filter settings (toggles, provider) |
+| `routing.js`        | KV-backed response routes + record synthesis        |
+| `upstream.js`       | Provider presets, resolution order, connection probe |
+| `odoh.js`           | Oblivious DoH client: HPKE (RFC 9180) + ODoH (RFC 9230) |
+| `dashboard.js`      | JSON API for rules/routes/logs/settings/session     |
 | `assets/index.html` | Dashboard UI (static Worker asset)                  |
 | `schema.sql`        | D1 schema for query audit logs                      |
 | `wrangler.toml`     | Worker config, assets, KV, D1, runtime vars         |
@@ -146,7 +155,9 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 | `/api/rules`      | List / add (POST `{domain,kind}`) / delete                              |
 | `/api/rules/bulk` | Bulk import `{kind, domains}`                                           |
 | `/api/test`       | Run full pipeline for a domain (mirrors live filtering)                |
-| `/api/settings`   | Get (GET) / save (POST `{rebindProtection, idnBlock, tldBlock, keywordBlock}`) persistent toggles |
+| `/api/settings`   | Get (GET: settings + resolved provider + preset list) / save (POST `{rebindProtection, idnBlock, tldBlock, keywordBlock, logPassed, logRetentionDays, upstreamPreset, upstreamUrl, upstreamRelay}`) |
+| `/api/routes`     | List / add (POST `{domain,value,ttl?}`) / delete (`?domain=`) response routes |
+| `/api/upstream/test` | Send one real query to a candidate provider: `{ok, ms, rcode, answers, sample}` or `{ok:false, error}` |
 | `/api/filters/tlds` | List (GET) / add (POST `{value}`) / remove (DELETE `?value=`) blocked TLDs |
 | `/api/filters/keywords` | Same, for blocked keywords                              |
 | `/api/logs`       | Search + paginate logs (GET); delete filtered/all (DELETE)             |
@@ -154,25 +165,86 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 | `/api/session`    | Login (sets session cookie)                                             |
 | `/healthz`        | Stats, effective settings, resolved URLs                                |
 
+## Upstream resolver
+
+The resolver is a **dashboard setting**, stored in KV and switched without a
+redeploy. `env.UPSTREAM_URL` still works, but only as a fallback for a
+deployment that has never picked a provider:
+
+```
+Dashboard provider (KV)  >  UPSTREAM_URL (wrangler [vars])  >  built-in default
+```
+
+| Preset | Endpoint | What it adds |
+|---|---|---|
+| Cloudflare | `cloudflare-dns.com` | nothing — fast and neutral |
+| Cloudflare — malware protection | `security.cloudflare-dns.com` | blocks malware/phishing |
+| Cloudflare — family | `family.cloudflare-dns.com` | malware + adult content |
+| Cloudflare — oblivious (ODoH) | `odoh.cloudflare-dns.com` | encrypted through a relay you name |
+| Quad9 | `dns.quad9.net` | blocks malware/phishing |
+| Quad9 — ECS | `dns11.quad9.net` | no blocking, forwards client subnet |
+| Google Public DNS | `dns.google` | nothing |
+| AdGuard DNS / family / unfiltered | `*.adguard-dns.com` | ads, or ads + adult content, or nothing |
+| Custom DoH URL | yours | anything RFC 8484 |
+
+**Test connection** sends a real `example.com` A query to the chosen endpoint
+(or to the URL you are typing) and reports latency, rcode and the first answer —
+so a typo or an unreachable resolver shows up before a client ever asks.
+
+### Oblivious DoH
+
+ODoH needs a relay: the query is HPKE-sealed for the resolver's key, the relay
+forwards ciphertext, and neither hop learns both the name and your address. The
+worker fetches the target key from
+`https://<target>/.well-known/odohconfigs` (cached 6 h) and accepts any relay
+that speaks the RFC 9230 URI template:
+
+```
+https://relay.example/proxy{?targethost,targetpath}
+```
+
+Relay URIs are operator-specific — there is no default, and the panel refuses
+to save the preset without one. A saved relay that stops working makes queries
+fail with SERVFAIL; the connection test is the quickest way to notice.
+
+The relay is only used for forwarding: no plaintext query is ever sent to it,
+and the relay URL is never shared with the target.
+
+## Domain response routing
+
+Settings → Domain response routing answers a domain, and every subdomain of it,
+with a fixed record instead of asking upstream:
+
+| Answer you type | Record served | Good for |
+|---|---|---|
+| `192.168.1.20` | A | devices on the LAN |
+| `fd00::20` | AAAA | IPv6 hosts |
+| `nas.home.lan` | CNAME | aliasing one name onto another |
+
+- Routes are checked **before every other filter**, including allow/deny rules.
+- Private and special-use names are allowed on purpose (`nas.home.lan` is the
+  point); the rebinding guard does not second-guess a route.
+- A route covers only its own record type. An `A` route answers `A` queries and
+  returns NODATA (NOERROR, no records) for everything else, so an overridden
+  name never leaks to the upstream on another type.
+- TTL is per route (default 300 s, max 86400) and is what clients are told.
+
 ## Runtime configuration
 
-Two URLs are read per-request from environment variables — change them
-without touching code:
+The blocklist URL is still a deploy-time variable:
 
 ```toml
 [vars]
 BLOCKLIST_URL = "https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/pro-plus/domains"
-UPSTREAM_URL  = "https://dns.quad9.net/dns-query"
 ```
 
 ```bash
 wrangler deploy --var BLOCKLIST_URL:https://example.com/mylist.txt
-wrangler deploy --var UPSTREAM_URL:https://dns.quad9.net/dns-query
 ```
 
-The blocklist's edge cache key derives from `BLOCKLIST_URL`, so switching the
-URL never serves a stale cached copy. Fallbacks live in `blocklist.js`
-(`DEFAULT_BLOCKLIST_URL`) and `worker.js` (`DEFAULT_UPSTREAM_URL`).
+Its edge cache key derives from `BLOCKLIST_URL`, so switching the URL never
+serves a stale cached copy. The default lives in `blocklist.js`
+(`DEFAULT_BLOCKLIST_URL`).
 
 ## Deploy
 
@@ -203,8 +275,12 @@ route `/api/*` and `/dns-query` before falling through to the assets, and
 `not_found_handling = "single-page-application"` makes `/dashboard` serve
 `index.html`.
 
-Point a DoH client (e.g. Firefox, Unbound, `doh` CLI) at:
+Point a DoH client (e.g. Firefox, AdGuard Home, `curl`) at:
 `https://<your-worker>.workers.dev/dns-query`
+
+The dashboard's Overview shows that URL with a copy button and a setup guide
+per client type — the endpoint is always this worker's own origin, so there is
+nothing to configure twice.
 
 ## Dashboard auth
 
@@ -231,6 +307,11 @@ parent wins over a `deny` at a more specific name.
 | `idnBlock`         | `false` | `settings:main` (JSON blob)  |
 | `tldBlock`         | `false` | `settings:main` (JSON blob)  |
 | `keywordBlock`     | `false` | `settings:main` (JSON blob)  |
+| `logPassed`        | `true`  | `settings:main` (JSON blob)  |
+| `logRetentionDays` | `30`    | `settings:main` (JSON blob)  |
+| `upstreamPreset`   | `''` (deploy var, else Quad9) | `settings:main` |
+| `upstreamUrl`      | `''`    | `settings:main` (custom provider) |
+| `upstreamRelay`    | `''`    | `settings:main` (ODoH relay) |
 
 Managed from the **Settings** tab. Persisted to KV (same namespace as rules),
 so they survive deploys and are shared across every colo.
@@ -245,8 +326,8 @@ isolates pick it up within ~30 s.
 Every resolved query is written to D1 (`dns_logs`) with:
 
 - `domain` — requested QNAME (lowercased)
-- `status` — `allow` | `deny` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `none`
-- `filter` — which layer decided: `allowlist` | `denylist` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `upstream`
+- `status` — `route` | `allow` | `deny` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `none`
+- `filter` — which layer decided: `route` | `allowlist` | `denylist` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `upstream`
 - `ts` — unix epoch ms
 - `qtype` — DNS RR type number (`1`=A, `28`=AAAA, `16`=TXT, `65`=HTTPS, …), shown in the
   dashboard as the common mnemonic (`A`, `AAAA`, `HTTPS`, …), `other` for uncommon codes,

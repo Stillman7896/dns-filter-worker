@@ -6,6 +6,7 @@ const props = defineProps({ status: { type: String, required: true } });
 const TOKENS = {
   none: { text: 'let through', cls: 'text-muted border-line' },
   allow: { text: 'allow rule', cls: 'text-pass border-pass/40' },
+  route: { text: 'route', cls: 'text-beacon border-beacon/40' },
   deny: { text: 'deny rule', cls: 'text-block border-block/40' },
   blocklist: { text: 'blocklist', cls: 'text-block border-block/40' },
   tld: { text: 'TLD rule', cls: 'text-block border-block/40' },

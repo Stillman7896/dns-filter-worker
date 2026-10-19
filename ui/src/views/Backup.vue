@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed } from 'vue';
-import { state, runOp, loadRules, loadLists, pushError } from '../store.js';
+import { state, runOp, loadRules, loadRoutes, loadLists, pushError } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import ConfirmButton from '../components/ConfirmButton.vue';
@@ -17,6 +17,7 @@ const summary = computed(() => {
   if (!p) return null;
   return {
     rules: lines(p.rules),
+    routes: lines(p.routes),
     keywords: lines(p.keywords),
     tlds: lines(p.tlds),
     settings: p.settings && typeof p.settings === 'object',
@@ -27,7 +28,7 @@ const canImport = computed(() => Boolean(summary.value) && Object.values(summary
 async function exportConfig() {
   await runOp('backup.export', {
     verb: 'Export config',
-    ok: (p) => `${lines(p.rules)} rules, ${lines(p.keywords)} keywords, ${lines(p.tlds)} TLDs exported`,
+    ok: (p) => `${lines(p.rules)} rules, ${lines(p.routes)} routes, ${lines(p.keywords)} keywords, ${lines(p.tlds)} TLDs exported`,
     fn: async () => {
       const data = await api.exportConfig();
       const stamp = new Date().toISOString().slice(0, 10);
@@ -71,7 +72,7 @@ async function importConfig() {
         r.rules ? ` · ${r.rules.applied} rules` : '' }`,
       fn: async () => {
         const r = await api.importConfig({ ...payload.value, mode: mode.value });
-        await Promise.all([loadRules(), loadLists()]);
+        await Promise.all([loadRules(), loadRoutes(), loadLists()]);
         state.settings = (await api.getSettings()).settings;
         return r;
       },
@@ -85,7 +86,7 @@ async function importConfig() {
   <div class="space-y-6">
     <div>
       <h1 class="text-[21px] font-semibold tracking-tight">Backup</h1>
-      <p class="hint mt-1">One JSON file holds every change you have made here: settings, rules, keywords, TLDs.</p>
+      <p class="hint mt-1">One JSON file holds every change you have made here: settings, rules, routes, keywords, TLDs.</p>
     </div>
 
     <section class="panel p-5">
@@ -121,6 +122,9 @@ async function importConfig() {
       <div v-if="summary" class="mt-4 rounded-md border border-line bg-raised p-3.5 space-y-2 rise-in">
         <div class="flex justify-between gap-4 text-[13px]">
           <span class="st">rules</span><span class="st text-muted">{{ summary.rules }}</span>
+        </div>
+        <div class="flex justify-between gap-4 text-[13px]">
+          <span class="st">routes</span><span class="st text-muted">{{ summary.routes }}</span>
         </div>
         <div class="flex justify-between gap-4 text-[13px]">
           <span class="st">keywords</span><span class="st text-muted">{{ summary.keywords }}</span>
