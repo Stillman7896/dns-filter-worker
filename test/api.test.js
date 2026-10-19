@@ -4,9 +4,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleApi } from '../dashboard.js';
 import { RuleStore } from '../rules.js';
+import { RouteStore } from '../routing.js';
 import { TextSetStore } from '../lists.js';
 import { SettingsStore } from '../settings.js';
-import { FakeKV } from './helpers.js';
+import { buildQuery, buildResponse, FakeKV, v4rdata } from './helpers.js';
 
 /**
  * @param {KVLike} kv
@@ -16,6 +17,7 @@ function mkCtx(kv) {
   return {
     rules: new RuleStore(kv),
     settings: new SettingsStore(kv),
+    routes: new RouteStore(kv),
     keywords: new TextSetStore(kv, 'keywords:data'),
     tlds: new TextSetStore(kv, 'tlds:data'),
     testFn: async (domain, env) => ({ domain, status: 'none', filter: 'upstream', matched: null }),
@@ -184,6 +186,68 @@ test('test endpoint: delegates to injected pipeline', async () => {
 });
 
 // ---- settings -----------------------------------------------------------------
+
+test('settings: upstream provider + presets travel with the settings payload', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  const body = await (await call(ctx, env, '/api/settings', { cookie })).json();
+  assert.equal(body.settings.upstreamPreset, '');
+  assert.equal(body.settings.upstreamUrl, '');
+  assert.equal(body.settings.upstreamRelay, '');
+  assert.equal(body.upstream.id, 'quad9', 'default provider when nothing is chosen');
+  assert.ok(Array.isArray(body.upstreamPresets));
+  assert.ok(body.upstreamPresets.some((/** @type {{id: string}} */ p) => p.id === 'cloudflare-odoh'));
+
+  const saved = await call(ctx, env, '/api/settings', {
+    method: 'POST', cookie, body: { upstreamPreset: 'google' },
+  });
+  assert.equal(saved.status, 200);
+  const j = await saved.json();
+  assert.equal(j.settings.upstreamPreset, 'google');
+  assert.equal(j.upstream.url, 'https://dns.google/dns-query');
+});
+
+test('settings: an unusable provider combination is refused, not saved', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  const unknown = await call(ctx, env, '/api/settings', {
+    method: 'POST', cookie, body: { upstreamPreset: 'mystery' },
+  });
+  assert.equal(unknown.status, 400);
+  assert.match((await unknown.json()).error, /unknown upstream provider/);
+
+  const custom = await call(ctx, env, '/api/settings', {
+    method: 'POST', cookie, body: { upstreamPreset: 'custom' },
+  });
+  assert.equal(custom.status, 400);
+  assert.match((await custom.json()).error, /https:\/\/ DoH URL/);
+
+  const odoh = await call(ctx, env, '/api/settings', {
+    method: 'POST', cookie, body: { upstreamPreset: 'cloudflare-odoh' },
+  });
+  assert.equal(odoh.status, 400);
+  assert.match((await odoh.json()).error, /relay URL/);
+
+  // Nothing above changed the stored provider.
+  const current = await (await call(ctx, env, '/api/settings', { cookie })).json();
+  assert.equal(current.settings.upstreamPreset, '');
+
+  const customOk = await call(ctx, env, '/api/settings', {
+    method: 'POST', cookie, body: { upstreamPreset: 'custom', upstreamUrl: 'https://doh.internal/dns-query' },
+  });
+  assert.equal(customOk.status, 200);
+  assert.equal((await customOk.json()).upstream.url, 'https://doh.internal/dns-query');
+});
 
 test('settings: GET defaults, POST patch incl. retention validation', async () => {
   const kv = new FakeKV();
@@ -493,4 +557,130 @@ test('session: DELETE clears the dashboard cookie', async () => {
   const sc = out.headers.get('set-cookie') || '';
   assert.match(sc, /dns_dash_session=;/);
   assert.match(sc, /Max-Age=0/);
+});
+
+// ---- response routes -----------------------------------------------------------
+
+test('routes: add / list / delete with validation', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+
+  const added = await call(ctx, env, '/api/routes', {
+    method: 'POST', cookie, body: { domain: 'Printer.Home.LAN', value: '192.168.1.9', ttl: 60 },
+  });
+  assert.equal(added.status, 200);
+  assert.deepEqual((await added.json()).route, {
+    domain: 'printer.home.lan', type: 'a', value: '192.168.1.9', ttl: 60,
+  });
+
+  const cname = await call(ctx, env, '/api/routes', {
+    method: 'POST', cookie, body: { domain: 'media.example.com', value: 'nas.home.lan' },
+  });
+  assert.equal((await cname.json()).route.type, 'cname');
+
+  const listed = await call(ctx, env, '/api/routes', { cookie });
+  assert.deepEqual((await listed.json()).routes.map((/** @type {RouteRule} */ r) => r.domain), ['media.example.com', 'printer.home.lan']);
+
+  const badDomain = await call(ctx, env, '/api/routes', {
+    method: 'POST', cookie, body: { domain: 'nodots', value: '192.168.1.9' },
+  });
+  assert.equal(badDomain.status, 400);
+
+  const badValue = await call(ctx, env, '/api/routes', {
+    method: 'POST', cookie, body: { domain: 'x.example.com', value: '999.1.1.1' },
+  });
+  assert.equal(badValue.status, 400);
+  assert.match((await badValue.json()).error, /invalid route/);
+
+  const del = await call(ctx, env, '/api/routes?domain=printer.home.lan', { method: 'DELETE', cookie });
+  assert.equal((await del.json()).existed, true);
+
+  const again = await call(ctx, env, '/api/routes?domain=printer.home.lan', { method: 'DELETE', cookie });
+  assert.equal((await again.json()).existed, false);
+
+  const left = await (await call(ctx, env, '/api/routes', { cookie })).json();
+  assert.deepEqual(left.routes.map((/** @type {RouteRule} */ r) => r.domain), ['media.example.com']);
+});
+
+test('routes: export + import round-trip (merge keeps, replace clears)', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  await call(ctx, env, '/api/routes', {
+    method: 'POST', cookie, body: { domain: 'nas.home.lan', value: '192.168.1.20' },
+  });
+
+  const exported = await (await call(ctx, env, '/api/export', { cookie })).json();
+  assert.deepEqual(exported.routes, [
+    { domain: 'nas.home.lan', type: 'a', value: '192.168.1.20', ttl: 300 },
+  ]);
+
+  const merged = await call(ctx, env, '/api/import', {
+    method: 'POST', cookie,
+    body: { mode: 'merge', routes: [...exported.routes, { domain: 'tv.home.lan', value: '2001:db8::5' }] },
+  });
+  assert.equal(merged.status, 200);
+  assert.deepEqual((await merged.json()).routes, { applied: 2, skipped: 0 });
+
+  const replaced = await call(ctx, env, '/api/import', {
+    method: 'POST', cookie,
+    body: { mode: 'replace', routes: [{ domain: 'only.example.com', value: '203.0.113.5' }, { bogus: 1 }] },
+  });
+  assert.deepEqual((await replaced.json()).routes, { applied: 1, skipped: 1 });
+
+  const left = await (await call(ctx, env, '/api/routes', { cookie })).json();
+  assert.deepEqual(left.routes.map((/** @type {RouteRule} */ r) => r.domain), ['only.example.com']);
+});
+
+// ---- upstream connection test --------------------------------------------------
+
+test('upstream test: unknown provider and bad custom URL are rejected with 400', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+
+  const unknown = await call(ctx, env, '/api/upstream/test', {
+    method: 'POST', cookie, body: { preset: 'mystery' },
+  });
+  assert.equal(unknown.status, 400);
+
+  const noUrl = await call(ctx, env, '/api/upstream/test', {
+    method: 'POST', cookie, body: { preset: 'custom' },
+  });
+  assert.equal(noUrl.status, 400);
+
+  const noUrl2 = await call(ctx, env, '/api/upstream/test', {
+    method: 'POST', cookie, body: { url: 'http://dns.example' },
+  });
+  assert.equal(noUrl2.status, 400);
+});
+
+test('upstream test: sends a probe query and reports latency + sample answer', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  const realFetch = globalThis.fetch;
+  /** @type {string[]} */
+  const urls = [];
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input) => {
+    urls.push(String(input));
+    return new Response(buildResponse(buildQuery('example.com'), [{ type: 1, rdata: v4rdata('93.184.216.34') }]));
+  });
+
+  try {
+    const res = await call(ctx, env, '/api/upstream/test', {
+      method: 'POST', cookie, body: { preset: 'cloudflare' },
+    });
+    assert.equal(res.status, 200);
+    const j = await res.json();
+    assert.equal(j.ok, true);
+    assert.equal(j.url, 'https://cloudflare-dns.com/dns-query');
+    assert.equal(j.sample, '93.184.216.34');
+    assert.equal(typeof j.ms, 'number');
+    assert.deepEqual(urls, ['https://cloudflare-dns.com/dns-query']);
+
+    const failing = await call(ctx, env, '/api/upstream/test', {
+      method: 'POST', cookie, body: { preset: 'adguard' },
+    });
+    assert.equal(failing.status, 200, 'a probe failure is a result, not an HTTP error');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

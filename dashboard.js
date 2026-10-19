@@ -7,8 +7,18 @@
 //   { rules, settings, keywords, tlds, testFn }
 
 import { normalizeDomain } from './rules.js';
+import { normalizeRoute } from './routing.js';
 import { normalizeTld, normalizeKeyword } from './lists.js';
-import { clampRetention } from './settings.js';
+import { clampRetention, DEFAULT_SETTINGS } from './settings.js';
+import {
+  UPSTREAM_PRESETS,
+  findPreset,
+  isHttpsUrl,
+  probeUpstream,
+  resolveUpstream,
+  upstreamPatch,
+  validateUpstreamSettings,
+} from './upstream.js';
 
 const SESSION_COOKIE = 'dns_dash_session';
 
@@ -68,9 +78,11 @@ function buildWhere(entries) {
 }
 
 /** Whitelist + validate a settings object into a patch, or { error }.
- * @param {Record<string, unknown>} source @returns {{patch?: Partial<FilterSettings>, error?: string}}
+ * @param {Record<string, unknown>} source
+ * @param {Record<string, unknown>} [current] stored settings, for cross-field checks
+ * @returns {{patch?: Partial<FilterSettings>, error?: string}}
  */
-function settingsPatch(source) {
+function settingsPatch(source, current = {}) {
   /** @type {Partial<FilterSettings>} */
   const patch = {};
   const BOOL_KEYS = /** @type {const} */ (['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock', 'logPassed']);
@@ -82,12 +94,24 @@ function settingsPatch(source) {
     if (Number.isNaN(days)) return { error: 'logRetentionDays must be a number (0-3650)' };
     patch.logRetentionDays = days;
   }
+
+  const upstream = upstreamPatch(source);
+  if (upstream.error) return { error: upstream.error };
+  if (upstream.patch) {
+    Object.assign(patch, upstream.patch);
+    // The chosen provider has to be usable straight away: an ODoH preset
+    // without a relay (or a custom preset without a URL) would leave the
+    // resolver without an upstream after the save.
+    const merged = { ...DEFAULT_SETTINGS, ...current, ...patch };
+    const invalid = validateUpstreamSettings(/** @type {FilterSettings} */ (merged));
+    if (invalid) return { error: invalid };
+  }
   return { patch };
 }
 
 /** @param {Request} request @param {Env} env @param {URL} url @param {ApiCtx} ctx */
 export async function handleApi(request, env, url, ctx) {
-  const { rules, settings, keywords, tlds, testFn } = ctx;
+  const { rules, routes, settings, keywords, tlds, testFn } = ctx;
 
   // ---- Login: POST /api/session { password } or Authorization: Bearer <pw> ----
   if (url.pathname === '/api/session' && request.method === 'POST') {
@@ -192,6 +216,34 @@ export async function handleApi(request, env, url, ctx) {
     return json({ ok: true, added, skipped });
   }
 
+  // ---- response routes: fixed answers for a domain and its subdomains ----
+  if (path === '/api/routes' && request.method === 'GET') {
+    if (!routes) return json({ error: 'routes not available' }, { status: 501 });
+    await routes.refresh(true);
+    return json({ routes: routes.list() });
+  }
+
+  if (path === '/api/routes' && request.method === 'POST') {
+    if (!routes) return json({ error: 'routes not available' }, { status: 501 });
+    let body;
+    try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
+
+    const route = normalizeRoute(body);
+    if (!route) {
+      return json({ error: 'invalid route: needs a domain and an IPv4, IPv6 or hostname answer' }, { status: 400 });
+    }
+    await routes.put(route);
+    return json({ ok: true, route });
+  }
+
+  if (path === '/api/routes' && request.method === 'DELETE') {
+    if (!routes) return json({ error: 'routes not available' }, { status: 501 });
+    const domain = normalizeDomain(url.searchParams.get('domain') || '');
+    if (!domain) return json({ error: 'invalid domain' }, { status: 400 });
+    const existed = await routes.delete(domain);
+    return json({ ok: true, existed });
+  }
+
   // ---- test domain: full server-side pipeline (custom rules + blocklist + policies) ----
   if (path === '/api/test' && request.method === 'GET') {
     const domain = normalizeDomain(url.searchParams.get('domain') || '');
@@ -206,22 +258,61 @@ export async function handleApi(request, env, url, ctx) {
 
     if (request.method === 'GET') {
       await settings.refresh(true);
-      return json({ settings: settings.get() });
+      const current = settings.get();
+      return json({
+        settings: current,
+        upstream: resolveUpstream(current, env),
+        upstreamPresets: UPSTREAM_PRESETS,
+      });
     }
 
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
 
-      const { patch, error } = settingsPatch(body);
+      const { patch, error } = settingsPatch(body, settings.get());
       if (error) return json({ error }, { status: 400 });
       if (!patch || Object.keys(patch).length === 0) {
         return json({ error: 'no valid settings provided' }, { status: 400 });
       }
 
       await settings.update(patch);
-      return json({ ok: true, settings: settings.get() });
+      return json({
+        ok: true,
+        settings: settings.get(),
+        upstream: resolveUpstream(settings.get(), env),
+      });
     }
+  }
+
+  // ---- upstream connection test: one real query, reported with latency ----
+  if (path === '/api/upstream/test' && request.method === 'POST') {
+    let body;
+    try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
+
+    const preset = typeof body.preset === 'string' && body.preset ? findPreset(body.preset) : undefined;
+    if (body.preset && !preset) return json({ error: 'unknown upstream provider' }, { status: 400 });
+
+    /** @type {{url: string, kind: 'doh'|'odoh', relay?: string}} */
+    let candidate;
+    if (preset && preset.id === 'custom') {
+      const customUrl = typeof body.url === 'string' ? body.url.trim() : '';
+      if (!isHttpsUrl(customUrl)) return json({ error: 'a custom provider needs an https:// DoH URL' }, { status: 400 });
+      candidate = { url: customUrl, kind: 'doh' };
+    } else if (preset) {
+      candidate = {
+        url: preset.url,
+        kind: preset.kind,
+        relay: preset.kind === 'odoh' && typeof body.relay === 'string' ? body.relay.trim() : '',
+      };
+    } else {
+      // No preset: test whatever URL the caller is about to save.
+      const rawUrl = typeof body.url === 'string' ? body.url.trim() : '';
+      if (!isHttpsUrl(rawUrl)) return json({ error: 'needs an https:// DoH URL' }, { status: 400 });
+      candidate = { url: rawUrl, kind: body.kind === 'odoh' ? 'odoh' : 'doh', relay: typeof body.relay === 'string' ? body.relay.trim() : '' };
+    }
+
+    return json(await probeUpstream(candidate));
   }
 
   // ---- config backup: export / import ----
@@ -229,6 +320,7 @@ export async function handleApi(request, env, url, ctx) {
     await Promise.all([
       settings.refresh(true),
       rules.refresh(true),
+      routes && routes.refresh(true),
       keywords.refresh(true),
       tlds.refresh(true),
     ]);
@@ -237,6 +329,7 @@ export async function handleApi(request, env, url, ctx) {
       exportedAt: new Date().toISOString(),
       settings: settings.get(),
       rules: await rules.list(),
+      routes: routes ? routes.list() : [],
       keywords: keywords.list(),
       tlds: tlds.list(),
     });
@@ -251,15 +344,16 @@ export async function handleApi(request, env, url, ctx) {
     /** @param {unknown} v @returns {any[]|null} */
     const arr = (v) => (Array.isArray(v) ? v.slice(0, MAX_ITEMS) : null);
     const rulesIn = arr(body.rules);
+    const routesIn = arr(body.routes);
     const kwIn = arr(body.keywords);
     const tldIn = arr(body.tlds);
 
-    if (!rulesIn && !kwIn && !tldIn && !body.settings) {
-      return json({ error: 'nothing to import: provide rules, keywords, tlds, or settings' }, { status: 400 });
+    if (!rulesIn && !routesIn && !kwIn && !tldIn && !body.settings) {
+      return json({ error: 'nothing to import: provide rules, routes, keywords, tlds, or settings' }, { status: 400 });
     }
 
-    /** @type {{mode:'merge'|'replace', rules: {applied:number, skipped:number}|null, keywords: {applied:number, skipped:number}|null, tlds: {applied:number, skipped:number}|null, settings: boolean}} */
-    const summary = { mode, rules: null, keywords: null, tlds: null, settings: false };
+    /** @type {{mode:'merge'|'replace', rules: {applied:number, skipped:number}|null, routes: {applied:number, skipped:number}|null, keywords: {applied:number, skipped:number}|null, tlds: {applied:number, skipped:number}|null, settings: boolean}} */
+    const summary = { mode, rules: null, routes: null, keywords: null, tlds: null, settings: false };
 
     if (rulesIn) {
       const valid = rulesIn.filter(
@@ -268,6 +362,13 @@ export async function handleApi(request, env, url, ctx) {
         ? await rules.replaceAll(valid)
         : await rules.putBulk(valid);
       summary.rules = { applied, skipped: rulesIn.length - valid.length };
+    }
+
+    if (routesIn && routes) {
+      // The store validates and counts, so skipped entries are reported here.
+      summary.routes = mode === 'replace'
+        ? await routes.replaceAll(routesIn)
+        : await routes.addMany(routesIn);
     }
 
     if (kwIn) {
@@ -282,7 +383,7 @@ export async function handleApi(request, env, url, ctx) {
     }
 
     if (body.settings && typeof body.settings === 'object') {
-      const { patch, error } = settingsPatch(body.settings);
+      const { patch, error } = settingsPatch(body.settings, settings.get());
       if (error) return json({ error }, { status: 400 });
       if (patch && Object.keys(patch).length) {
         await settings.update(patch);

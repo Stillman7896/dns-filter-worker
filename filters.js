@@ -2,7 +2,7 @@
 //
 // No I/O here: every store is injected, so tests pass in-memory instances
 // and worker.js passes the KV-backed singletons. Layer order:
-//   allowlist > denylist > blocklist > tld > keyword > rebinding > idn > none
+//   route > denylist > allowlist > blocklist > tld > keyword > rebinding > idn > none
 
 /** RFC 6761/6762 special-use TLDs (single label) that must never reach upstream. */
 export const INTERNAL_TLDS = new Set([
@@ -65,13 +65,28 @@ export function idnHit(name) {
 /**
  * Ordered query-side decision chain (synchronous — stores must already be
  * refreshed by the caller).
- * @param {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, tldStore: {get(): Set<string>}}} stores
+ *
+ * A response route comes first: it is a direct answer for the name, so it
+ * outranks even an explicit deny rule. The caller turns `verdict.route` into
+ * answer records with routeRecords().
+ * @param {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, tldStore: {get(): Set<string>}, routeStore?: {match(name: string): ({type:'a'|'aaaa'|'cname', value:string, ttl:number}&{at:string})|null}}} stores
  * @param {Pick<FilterSettings, 'rebindProtection'|'idnBlock'|'tldBlock'|'keywordBlock'>} settings
  * @param {string} name lowercase QNAME
- * @returns {{status:string, filter:string, matched:string|null}}
+ * @returns {{status:string, filter:string, matched:string|null, route?:{type:'a'|'aaaa'|'cname', value:string, ttl:number, at:string}}}
  */
 export function runQueryFilters(stores, settings, name) {
-  const { ruleStore, blocklist, keywordStore, tldStore } = stores;
+  const { ruleStore, blocklist, keywordStore, tldStore, routeStore } = stores;
+
+  // 0. response route — a fixed answer for this name and its subdomains
+  const route = routeStore && routeStore.match(name);
+  if (route) {
+    return {
+      status: 'route',
+      filter: 'route',
+      matched: route.at,
+      route: { type: route.type, value: route.value, ttl: route.ttl, at: route.at },
+    };
+  }
 
   // 1-2. custom allow / deny — allow wins across every parent level
   const custom = ruleStore.match(name);

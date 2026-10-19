@@ -4,6 +4,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../worker.js';
+import { summariseAnswers } from '../dns.js';
 import { buildQuery, buildResponse, v4rdata, FakeKV } from './helpers.js';
 
 // ---- fake Workers globals (must precede any query that triggers loads) -------
@@ -432,4 +433,146 @@ test('answer cache: a custom rule added via the API busts the cached answer', as
   const afterBody = new Uint8Array(await after.arrayBuffer());
   assert.equal(rcode(afterBody), 3, 'NXDOMAIN — epoch rotation killed the cached pass-through');
   globalThis.__answers = undefined;
+});
+
+// ---- response routes -------------------------------------------------------------
+
+/** @param {Uint8Array} buf @returns {string|null} first A/AAAA answer as text */
+const firstA = (buf) => summariseAnswers(buf)?.sample ?? null;
+
+/** @param {FakeKV} kv @param {string} blob */
+function seedRoutes(kv, blob) {
+  kv.data.set('routes:data', blob);
+  kv.data.set('data:version', String(Date.now()));
+}
+
+test('route: answered locally, upstream never asked, logged as route', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv, d1 });
+  seedRoutes(kv, 'printer.home.lan\ta\t192.168.1.9\t60');
+
+  let upstreamCalls = 0;
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    upstreamCalls++;
+    throw new Error('upstream must not be asked for a routed name');
+  });
+
+  try {
+    const res = await dohGet(env, buildQuery('printer.home.lan', { id: 0x4242 }));
+    assert.equal(res.status, 200);
+    const body = new Uint8Array(await res.arrayBuffer());
+    assert.equal(rcode(body), 0, 'NOERROR');
+    assert.equal(ancount(body), 1);
+    assert.equal(firstA(body), '192.168.1.9');
+    assert.equal((body[0] << 8) | body[1], 0x4242, 'transaction ID preserved');
+    assert.equal(res.headers.get('cache-control'), 'max-age=60', 'route TTL is the answer TTL');
+    assert.equal(upstreamCalls, 0);
+
+    assert.equal(d1.rows.length, 1);
+    assert.deepEqual(
+      { domain: d1.rows[0].domain, status: d1.rows[0].status, filter: d1.rows[0].filter },
+      { domain: 'printer.home.lan', status: 'route', filter: 'route' },
+    );
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('route: a subdomain is covered, other types are NODATA', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const env = mkEnv({ kv });
+  seedRoutes(kv, 'home.lan\ta\t10.0.0.5\t120');
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    throw new Error('unexpected upstream call');
+  });
+
+  try {
+    const a = new Uint8Array(await (await dohGet(env, buildQuery('printer.home.lan'))).arrayBuffer());
+    assert.equal(rcode(a), 0);
+    assert.equal(firstA(a), '10.0.0.5');
+
+    const aaaa = new Uint8Array(await (await dohGet(env, buildQuery('printer.home.lan', { qtype: 28 }))).arrayBuffer());
+    assert.equal(rcode(aaaa), 0, 'NOERROR');
+    assert.equal(ancount(aaaa), 0, 'NODATA rather than an upstream lookup');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('route: outranks an explicit deny rule for the same name', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const env = mkEnv({ kv });
+  kv.data.set('rules:data', 'deny\tmedia.example.com');
+  seedRoutes(kv, 'media.example.com\tcname\tnas.home.lan\t300');
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    throw new Error('unexpected upstream call');
+  });
+
+  try {
+    const body = new Uint8Array(await (await dohGet(env, buildQuery('media.example.com'))).arrayBuffer());
+    assert.equal(rcode(body), 0, 'the route answers instead of NXDOMAIN');
+    assert.equal(ancount(body), 1);
+    assert.equal((body[6] << 8) | body[7], 1);
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('upstream: choosing a provider in settings changes where queries go', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv, d1 });
+
+  const savedFetch = globalThis.fetch;
+  /** @type {string[]} */
+  const upstreamHits = [];
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input, /** @type {any} */ init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    upstreamHits.push(url);
+    const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
+    const ip = url === 'https://dns.google/dns-query' ? '5.6.7.8' : '1.2.3.4';
+    return new Response(buildResponse(q, [{ type: 1, rdata: v4rdata(ip) }]));
+  });
+
+  try {
+    const first = new Uint8Array(await (await dohGet(env, buildQuery('switch.foo.net'))).arrayBuffer());
+    assert.equal(upstreamHits[0], UPSTREAM_URL, 'deploy variable is the fallback');
+    assert.equal(firstA(first), '1.2.3.4');
+
+    const login = await worker.fetch(new Request('https://worker.test/api/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'pw' }),
+    }), env);
+    const cookie = (login.headers.get('set-cookie') || '').split(';')[0];
+    const saved = await worker.fetch(new Request('https://worker.test/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ upstreamPreset: 'google' }),
+    }), env);
+    assert.equal(saved.status, 200);
+
+    const second = new Uint8Array(await (await dohGet(env, buildQuery('switch.foo.net'))).arrayBuffer());
+    assert.equal(upstreamHits[1], 'https://dns.google/dns-query', 'settings win over the variable');
+    assert.equal(firstA(second), '5.6.7.8', 'cached answer from the previous provider was not reused');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 });

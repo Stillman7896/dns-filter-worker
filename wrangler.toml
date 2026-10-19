@@ -2,9 +2,14 @@ name = "dns-filter-worker"
 main = "worker.js"
 compatibility_date = "2024-09-23"
 
-# Runtime-configurable URLs (read on every request, no code change needed).
-# Override per-deploy with `wrangler deploy --var BLOCKLIST_URL:https://...`
-# or by editing [vars] below.
+# Runtime-configurable values (read on every request, no code change needed).
+# BLOCKLIST_URL is still a deploy-time variable; override per-deploy with
+# `wrangler deploy --var BLOCKLIST_URL:https://...` or by editing [vars].
+#
+# UPSTREAM_URL is only a FALLBACK: the resolver is chosen from the dashboard
+# (Settings -> Upstream resolver, stored in KV) and that choice wins. The
+# variable is used when no provider has been picked, which keeps a
+# dashboard-less deployment working exactly as before.
 [vars]
 BLOCKLIST_URL = "https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/pro-plus/domains"
 UPSTREAM_URL = "https://dns.quad9.net/dns-query"

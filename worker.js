@@ -1,30 +1,34 @@
 // worker.js — DoH filter
-// Query path: qclass guard -> answer cache -> custom allowlist -> denylist ->
-//           blocklist -> blocked TLD -> blocked keyword -> rebinding -> IDN ->
-//           upstream -> answer-level rebinding check
+// Query path: qclass guard -> response route -> answer cache -> custom
+//           allowlist -> denylist -> blocklist -> blocked TLD -> blocked
+//           keyword -> rebinding -> IDN -> upstream -> answer-level rebinding
 // Response path: answers cached under a normalized key (config epoch + name +
 //           type + DO bit), transaction ID patched per client on hits.
 //
-// Runtime-configurable: env.BLOCKLIST_URL / env.UPSTREAM_URL (wrangler [vars])
-// with defaults from blocklist.js / DEFAULT_UPSTREAM_URL below.
+// Runtime selection: the upstream provider and the per-domain response routes
+// come from dashboard settings in KV. `env.UPSTREAM_URL` is the fallback for a
+// deployment with no provider picked; `env.BLOCKLIST_URL` is still a var.
 
 import { Blocklist, DEFAULT_BLOCKLIST_URL } from './blocklist.js';
 import { RuleStore } from './rules.js';
 import { SettingsStore } from './settings.js';
+import { RouteStore, routeRecords } from './routing.js';
 import { TextSetStore } from './lists.js';
 import { runQueryFilters, privateAnswerIP, BLOCKED_QUERY_STATUSES } from './filters.js';
+import { resolveUpstream } from './upstream.js';
+import { odohForward } from './odoh.js';
 import { handleApi } from './dashboard.js';
 import {
   Buf,
   parseQuestion,
   buildNxdomainResponse,
   buildRefusedResponse,
+  buildAnswerResponse,
   minTtl,
   base64urlDecode,
   ednsDo,
 } from './dns.js';
 
-const DEFAULT_UPSTREAM_URL = 'https://dns.quad9.net/dns-query';
 const DNS_MEDIA_TYPE = 'application/dns-message';
 const BLOCKLIST_STALE_MS = 24 * 60 * 60 * 1000; // 24h fresh window
 const BLOCKLIST_FETCH_TTL = Math.floor(BLOCKLIST_STALE_MS / 1000);
@@ -39,9 +43,10 @@ const PRUNE_EVERY = 500; // opportunistic D1 retention batch size
 const blocklist = new Blocklist();
 const ruleStore = new RuleStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
 const settingsStore = new SettingsStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
+const routeStore = new RouteStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
 const keywordStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'keywords:data');
 const tldStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'tlds:data');
-const stores = { ruleStore, blocklist, keywordStore, tldStore };
+const stores = { ruleStore, blocklist, keywordStore, tldStore, routeStore };
 
 /** @type {KVLike|null} */
 let boundKv = null;
@@ -58,6 +63,7 @@ function ensureKv(env) {
   // rules/settings.
   ruleStore.bind(/** @type {KVLike} */ (kv));
   settingsStore.bind(/** @type {KVLike} */ (kv));
+  routeStore.bind(/** @type {KVLike} */ (kv));
   keywordStore.bind(/** @type {KVLike} */ (kv));
   tldStore.bind(/** @type {KVLike} */ (kv));
 }
@@ -162,10 +168,10 @@ async function ensureBlocklist(env, ctx) {
   }
 }
 
-/** @param {Uint8Array} queryBuf @param {Env} env */
-async function forwardToUpstream(queryBuf, env) {
-  const upstream = env.UPSTREAM_URL || DEFAULT_UPSTREAM_URL;
-  const res = await fetch(upstream, {
+/** @param {Uint8Array} queryBuf @param {ReturnType<typeof resolveUpstream>} upstream */
+async function forwardToUpstream(queryBuf, upstream) {
+  if (upstream.kind === 'odoh') return odohForward(upstream.url, upstream.relay, queryBuf);
+  const res = await fetch(upstream.url, {
     method: 'POST',
     headers: { 'Content-Type': DNS_MEDIA_TYPE, Accept: DNS_MEDIA_TYPE },
     body: queryBuf,
@@ -180,6 +186,7 @@ async function refreshStores() {
   await Promise.all([
     settingsStore.refresh(),
     ruleStore.refresh(),
+    routeStore.refresh(),
     keywordStore.refresh(),
     tldStore.refresh(),
   ]);
@@ -276,13 +283,15 @@ function answerCacheKey(epoch, name, qtype, dnssec) {
 }
 
 /** Epoch covering every setting that can change a verdict (rules share data:version). */
-/** @param {FilterSettings} settings @returns {string} */
-function configEpoch(settings) {
+/** @param {FilterSettings} settings @param {ReturnType<typeof resolveUpstream>} upstream @returns {string} */
+function configEpoch(settings, upstream) {
   return (ruleStore.version || '0') +
     '.' + (settings.rebindProtection ? 1 : 0) +
     (settings.idnBlock ? 1 : 0) +
     (settings.tldBlock ? 1 : 0) +
-    (settings.keywordBlock ? 1 : 0);
+    (settings.keywordBlock ? 1 : 0) +
+    // Changing provider must never serve answers cached from the old one.
+    '|' + upstream.kind + '|' + upstream.url + '|' + upstream.relay;
 }
 
 /**
@@ -381,8 +390,9 @@ async function handleQuery(queryBuf, env, ctx) {
   const settings = settingsStore.get();
   const retention = settings.logRetentionDays;
   const logPassed = settings.logPassed !== false; // tolerate pre-toggle blobs
+  const upstream = resolveUpstream(settings, env);
 
-  const key = answerCacheKey(configEpoch(settings), q.name, q.qtype, ednsDo(queryBuf));
+  const key = answerCacheKey(configEpoch(settings, upstream), q.name, q.qtype, ednsDo(queryBuf));
   const qid = (queryBuf[0] << 8) | queryBuf[1];
   const hit = await cachedAnswer(key, qid);
   if (hit) {
@@ -397,6 +407,14 @@ async function handleQuery(queryBuf, env, ctx) {
 
   const verdict = runQueryFilters(stores, settings, q.name);
 
+  // A response route is a direct answer: no upstream, no cache miss, and it
+  // outranks every block layer (that is why the user set it).
+  if (verdict.route) {
+    await bg(ctx, logQuery(env, q.name, 'route', 'route', q.qtype, retention));
+    const records = routeRecords(verdict.route, q.name, q.qtype);
+    return respond(buildAnswerResponse(queryBuf, records), key, verdict.route.ttl, ctx);
+  }
+
   if (BLOCKED_QUERY_STATUSES.has(verdict.status)) {
     await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
     const maxAge = verdict.filter === 'denylist' ? RULE_MAX_AGE : BLOCKED_MAX_AGE;
@@ -405,10 +423,10 @@ async function handleQuery(queryBuf, env, ctx) {
 
   // allow | none -> forward upstream
   try {
-    const upstream = await forwardToUpstream(queryBuf, env);
+    const answer = await forwardToUpstream(queryBuf, upstream);
 
     if (verdict.status === 'none' && settings.rebindProtection) {
-      const priv = privateAnswerIP(upstream);
+      const priv = privateAnswerIP(answer);
       if (priv) {
         await bg(ctx, logQuery(env, q.name, 'rebind', 'rebind', q.qtype, retention));
         // Every answer can differ here; never cache the verdict (TTL only
@@ -419,7 +437,7 @@ async function handleQuery(queryBuf, env, ctx) {
     if (logPassed) {
       await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
     }
-    return respond(upstream, key, minTtl(upstream), ctx);
+    return respond(answer, key, minTtl(answer), ctx);
   } catch {
     // Upstream unavailable — never break DNS.
   }
@@ -445,10 +463,13 @@ async function testDomain(domain, env, ctx) {
     filter: verdict.filter,
     matched: verdict.matched,
     blocklistSize: blocklist.size,
+    route: verdict.route || null,
     note:
-      verdict.status === 'none' && settings.rebindProtection
-        ? 'answer-level rebinding check applies after upstream resolves'
-        : null,
+      verdict.route
+        ? 'answered locally from a response route — the upstream is never asked'
+        : verdict.status === 'none' && settings.rebindProtection
+          ? 'answer-level rebinding check applies after upstream resolves'
+          : null,
   };
 }
 
@@ -480,6 +501,7 @@ export default {
     if (url.pathname.startsWith('/api/')) {
       return handleApi(request, env, url, {
         rules: ruleStore,
+        routes: routeStore,
         keywords: keywordStore,
         tlds: tldStore,
         blocklist,
@@ -491,16 +513,19 @@ export default {
     // ---- health ----
     if (url.pathname === '/healthz') {
       await Promise.all([ensureBlocklist(env, ctx), refreshStores()]);
+      const upstream = resolveUpstream(settingsStore.get(), env);
       return Response.json({
         ok: true,
         blocklistSize: blocklist.size,
         blocklistLoadedAt: blocklist.loadedAt,
         customRules: ruleStore.rules.size,
+        routes: routeStore.routes.size,
         keywords: keywordStore.get().size,
         blockedTlds: tldStore.get().size,
         settings: settingsStore.get(),
         blocklistUrl: env.BLOCKLIST_URL || DEFAULT_BLOCKLIST_URL,
-        upstreamUrl: env.UPSTREAM_URL || DEFAULT_UPSTREAM_URL,
+        upstream,
+        upstreamUrl: upstream.url,
         dashboardConfigured:
           typeof env.DASHBOARD_PASSWORD === 'string' && env.DASHBOARD_PASSWORD.length > 0,
       });

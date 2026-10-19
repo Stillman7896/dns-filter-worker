@@ -20,6 +20,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
   keywordBlock: false,    // block queries containing any Blocked-keyword
   logPassed: true,        // write allow/none rows to dns_logs; false = blocks only
   logRetentionDays: 30,   // delete dns_logs rows older than this; 0 = keep forever
+  upstreamPreset: '',     // provider id from upstream.js; '' = deploy variable, else built-in default
+  upstreamUrl: '',        // DoH URL for the 'custom' provider
+  upstreamRelay: '',      // relay URI template for an ODoH provider
 });
 
 /** Clamp a candidate retention value; returns 0..3650 or NaN if not a number.

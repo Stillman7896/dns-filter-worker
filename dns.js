@@ -139,6 +139,215 @@ export function buildNxdomainResponse(queryBuf) {
   return out;
 }
 
+// ---- Synthesized answers (domain response routing, upstream probe) ----
+
+/** DNS RR type numbers this worker can synthesize. */
+export const RR = Object.freeze({ A: 1, CNAME: 5, AAAA: 28 });
+
+/** Concatenate byte arrays.
+ * @param {Uint8Array[]} parts @returns {Buf}
+ */
+export function joinBufs(parts) {
+  let n = 0;
+  for (const p of parts) n += p.length;
+  const out = new Buf(n);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
+
+/** Offset just past the question section (QNAME + QTYPE + QCLASS), or -1.
+ * @param {Uint8Array|null} buf @returns {number}
+ */
+export function questionEnd(buf) {
+  if (!buf || buf.length < 12) return -1;
+  const qd = (buf[4] << 8) | buf[5];
+  if (qd < 1) return -1;
+  let off = 12;
+  for (let i = 0; i < qd; i++) {
+    off = skipName(buf, off);
+    if (off < 0 || off + 4 > buf.length) return -1;
+    off += 4;
+  }
+  return off;
+}
+
+/** Wire-format QNAME for a dotted name (uncompressed).
+ * @param {string} name @returns {Buf}
+ */
+export function encodeName(name) {
+  const labels = name.split('.').filter(Boolean);
+  let len = 1;
+  for (const l of labels) len += 1 + l.length;
+  const out = new Buf(len);
+  let off = 0;
+  for (const l of labels) {
+    out[off++] = l.length;
+    for (let i = 0; i < l.length; i++) out[off++] = l.charCodeAt(i) & 0xff;
+  }
+  out[off] = 0; // root label
+  return out;
+}
+
+/** @param {unknown} raw @returns {Buf|null} */
+export function parseIpv4(raw) {
+  if (typeof raw !== 'string') return null;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(raw.trim());
+  if (!m) return null;
+  const out = new Buf(4);
+  for (let i = 0; i < 4; i++) {
+    const n = Number(m[i + 1]);
+    if (n > 255) return null;
+    out[i] = n;
+  }
+  return out;
+}
+
+/** Accepts `::`, v4-mapped and trailing-IPv4 forms.
+ * @param {unknown} raw @returns {Buf|null}
+ */
+export function parseIpv6(raw) {
+  if (typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
+  const zone = s.indexOf('%');
+  if (zone !== -1) s = s.slice(0, zone);
+  if (s.indexOf(':') === -1) return null;
+
+  const lastColon = s.lastIndexOf(':');
+  const v4 = parseIpv4(s.slice(lastColon + 1));
+  if (v4) {
+    const hi = ((v4[0] << 8) | v4[1]).toString(16);
+    const lo = ((v4[2] << 8) | v4[3]).toString(16);
+    s = s.slice(0, lastColon + 1) + hi + ':' + lo;
+  }
+
+  const chunks = s.split('::');
+  if (chunks.length > 2) return null;
+  /** @param {string} c @returns {number[]|null} */
+  const words = (c) => {
+    if (c === '') return [];
+    const out = [];
+    for (const g of c.split(':')) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+      out.push(parseInt(g, 16));
+    }
+    return out;
+  };
+  const head = words(chunks[0]);
+  const tail = chunks.length === 2 ? words(chunks[1]) : [];
+  if (!head || !tail) return null;
+
+  let groups;
+  if (chunks.length === 2) {
+    const fill = 8 - head.length - tail.length;
+    if (fill < 1) return null; // '::' must stand for at least one group
+    groups = [...head, ...new Array(fill).fill(0), ...tail];
+  } else {
+    if (head.length !== 8) return null;
+    groups = head;
+  }
+
+  const out = new Buf(16);
+  for (let i = 0; i < 8; i++) out.writeUInt16BE(groups[i], i * 2);
+  return out;
+}
+
+/**
+ * Synthesize a response: the question is echoed byte for byte and `answers`
+ * are appended with an explicit (uncompressed) owner name. An empty answer
+ * list is NODATA (NOERROR, ANCOUNT 0) — used for overridden names that have no
+ * record of the queried type.
+ * @param {Uint8Array} queryBuf
+ * @param {Array<{name: string, type: number, rdata: Uint8Array, ttl: number}>} answers
+ * @returns {Buf}
+ */
+export function buildAnswerResponse(queryBuf, answers) {
+  const end = questionEnd(queryBuf);
+  if (end < 0) return buildRefusedResponse(queryBuf);
+
+  const flags = (queryBuf[2] << 8) | queryBuf[3];
+  // QR | AA | RA, RD copied from the query.
+  const head = Buf.from(queryBuf.subarray(0, end));
+  head.writeUInt16BE(0x8000 | 0x0400 | 0x0080 | (flags & 0x0100), 2);
+  head.writeUInt16BE(1, 4);
+  head.writeUInt16BE(answers.length, 6);
+  head.writeUInt16BE(0, 8);
+  head.writeUInt16BE(0, 10);
+
+  const parts = [head];
+  for (const a of answers) {
+    const name = encodeName(a.name);
+    const rr = new Buf(name.length + 10 + a.rdata.length);
+    rr.set(name, 0);
+    rr.writeUInt16BE(a.type, name.length);
+    rr.writeUInt16BE(1, name.length + 2); // class IN
+    rr.writeUInt32BE(Math.max(0, Math.floor(a.ttl)) >>> 0, name.length + 4);
+    rr.writeUInt16BE(a.rdata.length, name.length + 8);
+    rr.set(a.rdata, name.length + 10);
+    parts.push(rr);
+  }
+  return joinBufs(parts);
+}
+
+/** Recursive query for the upstream probe (id 0: the answer's ID is unused).
+ * @param {string} name @param {number} [qtype] @returns {Buf}
+ */
+export function buildQueryMessage(name, qtype = RR.A) {
+  const qname = encodeName(name);
+  const out = new Buf(12 + qname.length + 4);
+  out.writeUInt16BE(0, 0);
+  out.writeUInt16BE(0x0100, 2); // RD
+  out.writeUInt16BE(1, 4);
+  out.set(qname, 12);
+  out.writeUInt16BE(qtype, 12 + qname.length);
+  out.writeUInt16BE(1, 14 + qname.length);
+  return out;
+}
+
+/**
+ * Fold a response message into what the probe and logs need: rcode, answer
+ * count, and the first A/AAAA record as text.
+ * @param {Uint8Array|null} buf
+ * @returns {{rcode: number, count: number, sample: string|null}|null}
+ */
+export function summariseAnswers(buf) {
+  if (!buf || buf.length < 12) return null;
+  const rcode = buf[3] & 0x0f;
+  const qd = (buf[4] << 8) | buf[5];
+  const an = (buf[6] << 8) | buf[7];
+
+  let off = 12;
+  for (let i = 0; i < qd; i++) {
+    off = skipName(buf, off);
+    if (off < 0) return { rcode, count: 0, sample: null };
+    off += 4;
+    if (off > buf.length) return { rcode, count: 0, sample: null };
+  }
+
+  let sample = null;
+  for (let i = 0; i < an; i++) {
+    off = skipName(buf, off);
+    if (off < 0 || off + 10 > buf.length) break;
+    const type = (buf[off] << 8) | buf[off + 1];
+    const rdlen = (buf[off + 8] << 8) | buf[off + 9];
+    const rd = off + 10;
+    if (rd + rdlen > buf.length) break;
+    if (sample === null && type === RR.A && rdlen === 4) {
+      sample = `${buf[rd]}.${buf[rd + 1]}.${buf[rd + 2]}.${buf[rd + 3]}`;
+    } else if (sample === null && type === RR.AAAA && rdlen === 16) {
+      const groups = [];
+      for (let g = 0; g < 8; g++) groups.push(((buf[rd + g * 2] << 8) | buf[rd + g * 2 + 1]).toString(16));
+      sample = groups.join(':');
+    }
+    off = rd + rdlen;
+  }
+  return { rcode, count: an, sample };
+}
+
 /** @param {Uint8Array} queryBuf @returns {Buf} */
 export function buildRefusedResponse(queryBuf) {
   const out = Buf.from(queryBuf);

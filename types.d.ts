@@ -59,12 +59,27 @@ interface FilterSettings {
   keywordBlock: boolean;
   logPassed: boolean;
   logRetentionDays: number;
+  /** Provider id from upstream.js; '' = deployment variable, else built-in default. */
+  upstreamPreset: string;
+  /** DoH URL used by the 'custom' provider. */
+  upstreamUrl: string;
+  /** Relay URI template used by an ODoH provider. */
+  upstreamRelay: string;
+}
+
+/** One response route: a fixed answer for a domain and its subdomains. */
+interface RouteRule {
+  domain: string;
+  type: 'a' | 'aaaa' | 'cname';
+  value: string;
+  ttl: number;
 }
 
 /** Everything the dashboard API handlers need, built by worker.js fetch(). */
 interface ApiCtx {
   rules: import('./rules.js').RuleStore;
   settings: import('./settings.js').SettingsStore;
+  routes: import('./routing.js').RouteStore;
   keywords: import('./lists.js').TextSetStore;
   tlds: import('./lists.js').TextSetStore;
   // not used by the API itself; carried for tests that mirror wiring
@@ -72,6 +87,9 @@ interface ApiCtx {
 
   testFn(domain: string, env?: Env): any;
 }
+
+/** WebCrypto — present in Workers and in Node >= 20 (X25519 included). */
+declare var crypto: Crypto;
 
 // Test doubles poke these onto globalThis (see test/worker.test.js).
 declare var caches: any;
