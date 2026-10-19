@@ -1,8 +1,9 @@
 <script setup>
 import { state, dismissToast } from '../store.js';
 
-// Sticky alert stack: pending alerts never auto-dismiss (they track a backend
-// operation), successes fade on their own, failures wait for the reader.
+// Sticky alert stack: pending alerts track a backend operation, successes and
+// failures fade out on their own ttl (a failure carries a close button too),
+// so the stack never fills with alerts the reader already dealt with.
 const TONE = {
   pending: { bar: 'bg-beacon', glyph: 'spinner', card: 'border-beacon/50' },
   success: { bar: 'bg-pass', glyph: 'check', card: 'border-pass/40' },
@@ -69,9 +70,10 @@ function tone(kind) {
 
         <div class="absolute inset-y-0 left-0 w-[3px]" :class="tone(t.kind).bar" aria-hidden="true" />
         <div
-          v-if="t.kind === 'success' && t.ttl"
+          v-if="t.ttl"
           class="absolute bottom-0 left-0 h-[2px] toast-progress"
           :class="tone(t.kind).bar"
+          :style="{ '--toast-ttl': `${t.ttl}ms` }"
           aria-hidden="true"
         />
       </article>

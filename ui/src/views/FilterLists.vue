@@ -3,6 +3,7 @@ import { ref } from 'vue';
 import { state, runOp, loadLists, setRoute } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
+import { normalizeTld, normalizeKeyword } from '../validate.js';
 
 const FORMS = [
   {
@@ -10,7 +11,9 @@ const FORMS = [
     key: 'tld',
     title: 'Blocked TLDs',
     hint: 'Stops any query whose last label matches — the whole zone is off limits.',
+    invalid: 'One label only, e.g. “zip”. Use a rule for “co.uk”.',
     placeholder: 'zip',
+    normalize: normalizeTld,
     on: () => state.settings?.tldBlock,
     kicker: 'TLD blocking is switched off in Settings.',
   },
@@ -19,7 +22,9 @@ const FORMS = [
     key: 'keyword',
     title: 'Blocked keywords',
     hint: 'Stops a query when any label contains this text.',
+    invalid: 'Letters, digits, dots and dashes only, e.g. “doubleclick”.',
     placeholder: 'doubleclick',
+    normalize: normalizeKeyword,
     on: () => state.settings?.keywordBlock,
     kicker: 'Keyword blocking is switched off in Settings.',
   },
@@ -28,24 +33,30 @@ const FORMS = [
 const draft = ref({ tld: '', keyword: '' });
 
 const items = (id) => (id === 'tlds' ? state.tlds : state.keywords);
+const typed = (form) => draft.value[form.key].trim();
+// Same normalizer the API validates with, so a valid entry is always submittable.
+const stored = (form) => form.normalize(typed(form));
+const problem = (form) => (typed(form) && !stored(form) ? form.invalid : '');
 
 async function add(form) {
-  const value = draft.value[form.key].trim();
+  const value = stored(form);
   if (!value) return;
-  await runOp(`lists.${form.key}.add`, {
-    verb: `Add ${form.key === 'tld' ? 'TLD' : 'keyword'}`,
-    ok: (r) => (r.added ? `${value} added` : `${value} was already on the list`),
-    undo: async (r) => {
-      await api.removeItem(form.id, value);
-      await loadLists();
-    },
-    fn: async () => {
-      const r = await api.addItem(form.id, value);
-      await loadLists();
-      return r;
-    },
-  }).catch(() => {});
-  draft.value[form.key] = '';
+  try {
+    await runOp(`lists.${form.key}.add`, {
+      verb: `Add ${form.key === 'tld' ? 'TLD' : 'keyword'}`,
+      ok: (r) => (r.added ? `${value} added` : `${value} was already on the list`),
+      undo: async () => {
+        await api.removeItem(form.id, value);
+        await loadLists();
+      },
+      fn: async () => {
+        const r = await api.addItem(form.id, value);
+        await loadLists();
+        return r;
+      },
+    });
+    draft.value[form.key] = ''; // kept for fixing when the worker refuses
+  } catch { /* the alert stack carries the reason */ }
 }
 
 async function remove(form, value) {
@@ -91,7 +102,7 @@ async function remove(form, value) {
       </div>
 
       <div class="px-5 py-4">
-        <form class="flex flex-wrap gap-2.5" @submit.prevent="add(form)">
+        <form class="flex flex-wrap items-center gap-2.5" @submit.prevent="add(form)">
           <input
             v-model="draft[form.key]"
             type="text"
@@ -100,16 +111,21 @@ async function remove(form, value) {
             :aria-label="`New ${form.title} entry`"
             autocapitalize="none"
             spellcheck="false"
+            :aria-invalid="Boolean(problem(form))"
           />
           <AppButton
             variant="solid"
             type="submit"
             :busy-key="`lists.${form.key}.add`"
-            :disabled="!draft[form.key].trim()"
+            :disabled="!stored(form)"
           >
             Add
           </AppButton>
         </form>
+
+        <p class="hint mt-2.5" :class="problem(form) && 'text-block'" aria-live="polite">
+          {{ problem(form) || form.hint }}
+        </p>
 
         <div v-if="items(form.id).length" class="mt-4 flex flex-wrap gap-2">
           <button

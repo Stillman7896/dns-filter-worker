@@ -1,10 +1,11 @@
 <script setup>
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { state, runOp, loadRules, filteredRules } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import ConfirmButton from '../components/ConfirmButton.vue';
 import Segmented from '../components/Segmented.vue';
+import { normalizeDomain } from '../validate.js';
 
 const domain = ref('');
 const kind = ref('deny');
@@ -13,28 +14,41 @@ const bulkKind = ref('deny');
 const bulkText = ref('');
 const showBulk = ref(false);
 
+// What the worker will store for the typed value, or '' when it would reject
+// it. Same function the API validates with, so the field can't disagree
+// (URLs, wildcards and trailing dots are accepted; a bare word is not).
+const normalized = computed(() => normalizeDomain(domain.value.trim()));
+const invalid = computed(() => Boolean(domain.value.trim()) && !normalized.value);
+const note = computed(() => {
+  if (invalid.value) return 'Needs a real domain, like ads.example.net.';
+  if (normalized.value && normalized.value !== domain.value.trim()) return `Saves as ${normalized.value}.`;
+  return 'A rule applies to the domain and every subdomain of it. Allow wins over the blocklist.';
+});
+
 async function addRule() {
-  const value = domain.value.trim();
+  const value = normalized.value;
   if (!value) return;
-  await runOp('rules.add', {
-    verb: 'Add rule',
-    ok: (r) => `${r.domain} ${r.kind === 'deny' ? 'now blocked' : 'now allowed'}`,
-    undo: async (r) => {
-      await api.deleteRule(r.domain);
-      await loadRules();
-    },
-    fn: async () => {
-      const r = await api.addRule(value, kind.value);
-      await loadRules();
-      return r;
-    },
-  }).catch(() => {});
-  domain.value = '';
+  try {
+    await runOp('rules.add', {
+      verb: 'Add rule',
+      ok: (r) => `${r.domain} ${r.kind === 'deny' ? 'now blocked' : 'now allowed'}`,
+      undo: async (r) => {
+        await api.deleteRule(r.domain);
+        await loadRules();
+      },
+      fn: async () => {
+        const r = await api.addRule(value, kind.value);
+        await loadRules();
+        return r;
+      },
+    });
+    domain.value = ''; // keep the text so it can be fixed and resent on failure
+  } catch { /* the alert stack carries the reason */ }
 }
 
 async function importBulk() {
+  if (!bulkReady.value) return;
   const text = bulkText.value.trim();
-  if (!text) return;
   await runOp('rules.bulk', {
     verb: 'Import rules',
     ok: (r) => (r.skipped.length
@@ -48,6 +62,11 @@ async function importBulk() {
     },
   }).catch(() => {});
 }
+
+// The worker splits on newlines/commas and drops whatever isn't a domain, so
+// count the same way and say up front how many lines will actually land.
+const bulkLines = computed(() => bulkText.value.split(/[\r\n,]+/).map((l) => l.trim()).filter(Boolean));
+const bulkReady = computed(() => bulkLines.value.filter((l) => normalizeDomain(l)).length);
 
 async function removeRule(r) {
   await runOp(`rules.del:${r.domain}`, {
@@ -89,30 +108,40 @@ function onFilter(e) {
     <!-- Add one -->
     <section class="panel p-5">
       <h2 class="text-[15px] font-medium">Add a rule</h2>
-      <form class="mt-3 flex flex-col sm:flex-row gap-2.5 sm:items-center" @submit.prevent="addRule">
-        <input
-          v-model="domain"
-          type="text"
-          class="field sm:flex-1 sm:w-auto w-full st"
-          placeholder="ads.example.net"
-          aria-label="Domain"
-          autocapitalize="none"
-          spellcheck="false"
-        />
-        <Segmented
-          v-model="kind"
-          :options="[
-            { value: 'deny', label: 'Block' },
-            { value: 'allow', label: 'Allow' },
-          ]"
-          label="Answer"
-        />
-        <AppButton variant="solid" type="submit" busy-key="rules.add" :disabled="!domain.trim()" class="sm:w-auto w-full">
+      <form class="mt-3 flex flex-col gap-2.5" @submit.prevent="addRule">
+        <div class="flex flex-wrap items-center gap-2.5">
+          <input
+            v-model="domain"
+            type="text"
+            class="field flex-1 min-w-[180px] st"
+            placeholder="ads.example.net"
+            aria-label="Domain"
+            autocapitalize="none"
+            spellcheck="false"
+            :aria-invalid="invalid"
+            aria-describedby="rule-note"
+          />
+          <Segmented
+            v-model="kind"
+            :options="[
+              { value: 'deny', label: 'Block' },
+              { value: 'allow', label: 'Allow' },
+            ]"
+            label="Answer"
+          />
+        </div>
+        <AppButton
+          variant="solid"
+          type="submit"
+          busy-key="rules.add"
+          :disabled="!normalized"
+          class="w-full sm:w-auto sm:self-start"
+        >
           Add rule
         </AppButton>
       </form>
-      <p class="hint mt-2.5">
-        A rule applies to the domain and every subdomain of it. Allow wins over the blocklist.
+      <p id="rule-note" class="hint mt-2.5" :class="invalid && 'text-block'" aria-live="polite">
+        {{ note }}
       </p>
     </section>
 
@@ -137,11 +166,12 @@ function onFilter(e) {
           ]"
           label="Kind"
         />
-        <AppButton variant="solid" busy-key="rules.bulk" :disabled="!bulkText.trim()" @click="importBulk">
+        <AppButton variant="solid" busy-key="rules.bulk" :disabled="!bulkReady" @click="importBulk">
           Import
         </AppButton>
         <span class="hint">
-          {{ bulkText.split(/\n+/).filter((l) => l.trim()).length || '0' }} lines ready
+          {{ bulkReady }} of {{ bulkLines.length }} lines ready
+          <template v-if="bulkLines.length && bulkReady < bulkLines.length">— the rest are not domains</template>
         </span>
       </div>
     </section>

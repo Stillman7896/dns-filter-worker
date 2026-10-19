@@ -1,12 +1,12 @@
 <script setup>
 import { ref, computed } from 'vue';
-import { state, runOp, loadRules, loadLists, pushToast } from '../store.js';
+import { state, runOp, loadRules, loadLists, pushError } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import ConfirmButton from '../components/ConfirmButton.vue';
 import Segmented from '../components/Segmented.vue';
 
-const file = ref(null);
+const fileInput = ref(null);
 const payload = ref(null);
 const mode = ref('merge');
 const fileName = ref('');
@@ -51,33 +51,33 @@ async function pickFile(e) {
   try {
     payload.value = JSON.parse(text);
   } catch {
-    pushToast({ kind: 'error', text: 'That file is not JSON', detail: 'Export a config from this page first, then pick that file.', ttl: null });
-    return;
+    pushError('That file is not JSON', 'Export a config from this page first, then pick that file.');
+    reset();
   }
 }
 
-async function importConfig() {
-  await runOp('backup.import', {
-    verb: 'Import config',
-    ok: (r) => `${mode.value === 'replace' ? 'Configuration replaced' : 'Configuration merged'}${
-      r.rules ? ` · ${r.rules.applied} rules` : '' }`,
-    fn: async () => {
-      const r = await api.importConfig({ ...payload.value, mode: mode.value });
-      await Promise.all([loadRules(), loadLists()]);
-      const s = (await api.getSettings()).settings;
-      state.settings = s;
-      return r;
-    },
-  }).catch(() => {});
-  file.value = null;
-  fileName.value = '';
-  setTimeout(() => (payload.value = null), 600);
-}
-
+/** Forget the picked file, and clear the input so the same file can be re-picked. */
 function reset() {
-  file.value = null;
   fileName.value = '';
   payload.value = null;
+  if (fileInput.value) fileInput.value.value = '';
+}
+
+async function importConfig() {
+  try {
+    await runOp('backup.import', {
+      verb: 'Import config',
+      ok: (r) => `${mode.value === 'replace' ? 'Configuration replaced' : 'Configuration merged'}${
+        r.rules ? ` · ${r.rules.applied} rules` : '' }`,
+      fn: async () => {
+        const r = await api.importConfig({ ...payload.value, mode: mode.value });
+        await Promise.all([loadRules(), loadLists()]);
+        state.settings = (await api.getSettings()).settings;
+        return r;
+      },
+    });
+  } catch { /* the file stays picked so it can be sent again */ return; }
+  reset();
 }
 </script>
 
@@ -103,7 +103,7 @@ function reset() {
       <div class="mt-4 flex flex-wrap items-center gap-3">
         <label class="btn btn-ghost cursor-pointer">
           <input
-            ref="file"
+            ref="fileInput"
             type="file"
             accept="application/json,.json"
             class="sr-only"

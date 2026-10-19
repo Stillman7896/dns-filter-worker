@@ -1,17 +1,23 @@
 <script setup>
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { runOp } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import StatusPill from '../components/StatusPill.vue';
 import { loadProbeHistory, rememberProbe, clearProbeHistory } from '../probeHistory.js';
+import { normalizeDomain } from '../validate.js';
 
 const domain = ref('');
 const result = ref(null);
 const history = ref(loadProbeHistory());
 
+// The API runs the same normalizer and answers 400 for anything else, so the
+// field refuses those values up front instead of spending a request on them.
+const normalized = computed(() => normalizeDomain(domain.value.trim()));
+const invalid = computed(() => Boolean(domain.value.trim()) && !normalized.value);
+
 async function probe() {
-  const value = domain.value.trim();
+  const value = normalized.value;
   if (!value) return;
   result.value = null;
   await runOp('probe.run', {
@@ -68,12 +74,18 @@ function ago(ts) {
           aria-label="Domain to test"
           autocapitalize="none"
           spellcheck="false"
+          :aria-invalid="invalid"
+          aria-describedby="probe-note"
         />
-        <AppButton variant="solid" type="submit" busy-key="probe.run" :disabled="!domain.trim()">
+        <AppButton variant="solid" type="submit" busy-key="probe.run" :disabled="!normalized">
           Test domain
         </AppButton>
       </form>
-      <p class="hint mt-2.5">Runs the full server-side pipeline: allow and deny rules first, then the blocklist and policies.</p>
+      <p id="probe-note" class="hint mt-2.5" :class="invalid && 'text-block'" aria-live="polite">
+        {{ invalid
+          ? 'Needs a real domain, like sub.example.com.'
+          : 'Runs the full server-side pipeline: allow and deny rules first, then the blocklist and policies.' }}
+      </p>
     </section>
 
     <!-- Verdict -->

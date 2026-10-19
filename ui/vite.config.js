@@ -48,6 +48,8 @@ export default defineConfig({
         label: 'block text-[13px] font-medium text-ink',
         hint: 'text-[12.5px] text-muted leading-snug',
         panel: 'rounded-lg border border-line bg-surface',
+        'menu-item':
+          'w-full flex items-center rounded px-2 h-8 text-[13px] text-left hover:bg-raised focus-visible:outline-2 focus-visible:outline-beacon transition-colors',
         st: 'font-mono font-medium tabular-nums',
         toster: 'text-[13px] leading-snug',
       },

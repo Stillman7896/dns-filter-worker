@@ -301,6 +301,11 @@ export async function handleApi(request, env, url, ctx) {
     const normalize = isKeywords ? normalizeKeyword : normalizeTld;
     if (!store) return json({ error: 'list not available' }, { status: 501 });
 
+    // Read from KV before answering: the DNS hot path is the only other place
+    // that refreshes these stores, so a fresh isolate would otherwise list
+    // nothing even though the entries are stored.
+    await store.refresh(true);
+
     if (request.method === 'GET') {
       return json({ items: store.list() });
     }

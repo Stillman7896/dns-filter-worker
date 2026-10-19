@@ -53,6 +53,11 @@ function syncHash() {
 // Timers follow the toast's current ttl (pending -> saved can set it later).
 const dismissTimers = new Map();
 
+// Failures fade on their own like successes: long enough to read the reason,
+// short enough that a run of dead alerts can't stack up. The close button and
+// the progress bar stay, so nothing disappears unannounced.
+export const ERROR_TTL = 10_000;
+
 function armDismissTimer(id, ttl) {
   cancelDismissTimer(id);
   dismissTimers.set(id, setTimeout(() => dismissToast(id), ttl));
@@ -79,6 +84,11 @@ export function pushToast({ kind, text, detail, action, ttl }) {
   }
   if (ttl) armDismissTimer(id, ttl);
   return id;
+}
+
+/** Failure alert outside runOp (e.g. a file the reader picked). */
+export function pushError(text, detail) {
+  return pushToast({ kind: 'error', text, detail, ttl: ERROR_TTL });
 }
 
 export function dismissToast(id) {
@@ -112,10 +122,10 @@ export async function runOp(key, spec) {
     const e = err instanceof ApiError ? err : new ApiError(String(err && err.message ? err.message : err));
     if (e.status === 401 && state.phase === 'ready') {
       state.phase = 'auth';
-      touch(pending, { kind: 'error', text: 'Session expired', detail: 'Sign in to keep working.', ttl: null });
+      touch(pending, { kind: 'error', text: 'Session expired', detail: 'Sign in to keep working.', ttl: ERROR_TTL });
     } else if (e.status === 503 && e.code === 'unconfigured') {
       state.phase = 'unconfigured';
-      touch(pending, { kind: 'error', text: 'No dashboard password set', detail: 'Set DASHBOARD_PASSWORD in the worker, then reload.', ttl: null });
+      touch(pending, { kind: 'error', text: 'No dashboard password set', detail: 'Set DASHBOARD_PASSWORD in the worker, then reload.', ttl: ERROR_TTL });
     } else {
       const detail = e.status === 500 ? `${e.message} — the worker logged the request; try again quietly later.` : e.message;
       touch(pending, {
@@ -123,6 +133,7 @@ export async function runOp(key, spec) {
         text: `${spec.verb} failed`,
         detail,
         action: { label: 'Try again', run: () => runOp(key, spec) },
+        ttl: ERROR_TTL,
       });
     }
     state.flash(key, 'fail');
@@ -141,7 +152,7 @@ export async function runOp(key, spec) {
             await spec.undo(result);
             touch(undoToast, { kind: 'success', text: 'Reverted', ttl: 3500 });
           } catch {
-            touch(undoToast, { kind: 'error', text: 'Revert failed', detail: 'The change stayed in place.', ttl: null });
+            touch(undoToast, { kind: 'error', text: 'Revert failed', detail: 'The change stayed in place.', ttl: ERROR_TTL });
           }
         },
       }
@@ -163,7 +174,7 @@ export async function boot() {
   state.phase = 'boot';
   state.bootError = null;
   try {
-    await api.getSettings(); // probe: 503 = unconfigured, 401 = needs sign-in
+    // One call doubles as the probe: 503 = unconfigured, 401 = needs sign-in.
     state.settings = (await api.getSettings()).settings;
     await Promise.all([loadRules(), loadLists()]);
     await Promise.all([loadLogs(), loadStats()]);
@@ -195,6 +206,8 @@ export async function signOut() {
   state.stats = null;
   state.statsError = null;
   state.logs = { rows: [], total: 0, search: '', status: '', limit: state.logs.limit, offset: 0 };
+  dismissTimers.forEach((t) => clearTimeout(t));
+  dismissTimers.clear();
   state.toasts = [];
   state.ops = {};
   state.flashes = {};

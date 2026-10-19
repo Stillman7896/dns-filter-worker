@@ -260,6 +260,27 @@ test('filters: tlds + keywords CRUD with validation', async () => {
   assert.deepEqual((await (await call(ctx, env, '/api/filters/tlds', { cookie })).json()).items, []);
 });
 
+test('filters: GET loads stored lists from KV on a cold isolate', async () => {
+  // A fresh isolate has an empty in-memory set; only the DNS hot path and
+  // writes used to refresh the stores, so the dashboard listed nothing.
+  const kv = new FakeKV({
+    'keywords:data': 'doubleclick\ntelemetry',
+    'tlds:data': 'zip',
+    'data:version': '42',
+  });
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  const kw = await (await call(ctx, env, '/api/filters/keywords', { cookie })).json();
+  assert.deepEqual(kw.items, ['doubleclick', 'telemetry']);
+
+  const tlds = await (await call(ctx, env, '/api/filters/tlds', { cookie })).json();
+  assert.deepEqual(tlds.items, ['zip']);
+});
+
 // ---- logs without D1 ------------------------------------------------------------
 
 test('logs: missing D1 binding -> 501 (not 503, not 404)', async () => {

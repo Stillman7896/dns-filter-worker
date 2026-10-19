@@ -1,9 +1,10 @@
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue';
-import { state, runOp, loadLogs, logPages, setRoute } from '../store.js';
+import { state, runOp, loadLogs, loadRules, logPages, setRoute } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import ConfirmButton from '../components/ConfirmButton.vue';
+import RowMenu from '../components/RowMenu.vue';
 import StatusPill from '../components/StatusPill.vue';
 import { qtypeLabel } from '../qtype.js';
 
@@ -84,6 +85,23 @@ async function removeRow(row) {
     fn: async () => {
       await api.deleteLog(row.id);
       await loadLogs();
+    },
+  }).catch(() => {});
+}
+
+/** Write a custom rule for the row's domain, so the next query is decided early. */
+async function setRule(row, kind) {
+  await runOp(`logs.${kind === 'deny' ? 'block' : 'allow'}:${row.domain}`, {
+    verb: kind === 'deny' ? 'Block domain' : 'Allow domain',
+    ok: `${row.domain} ${kind === 'deny' ? 'now blocked' : 'now allowed'}`,
+    undo: async () => {
+      await api.deleteRule(row.domain);
+      await loadRules();
+    },
+    fn: async () => {
+      const r = await api.addRule(row.domain, kind);
+      await loadRules();
+      return r;
     },
   }).catch(() => {});
 }
@@ -198,12 +216,12 @@ function timeOf(ts) {
               </td>
               <td class="px-3 py-3 whitespace-nowrap st text-[12.5px] text-muted">{{ qtypeLabel(r.qtype) }}</td>
               <td class="px-4 sm:px-5 py-3 text-right whitespace-nowrap">
-                <ConfirmButton
-                  small
-                  label="Remove"
-                  armed-label="Delete row?"
-                  :busy-key="`logs.del:${r.id}`"
-                  @confirm="removeRow(r)"
+                <RowMenu
+                  :label="`Quick actions for ${r.domain}`"
+                  :keys="[`logs.allow:${r.domain}`, `logs.block:${r.domain}`, `logs.del:${r.id}`]"
+                  @allow="setRule(r, 'allow')"
+                  @block="setRule(r, 'deny')"
+                  @remove="removeRow(r)"
                 />
               </td>
             </tr>

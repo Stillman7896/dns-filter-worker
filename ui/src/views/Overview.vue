@@ -29,6 +29,11 @@ const counts = computed(() => ({
   tlds: state.tlds.length,
 }));
 
+// Only the on/off switches count here; logRetentionDays is a number and would
+// otherwise sit in the denominator unmovable.
+const switches = computed(() => Object.values(state.settings || {}).filter((v) => typeof v === 'boolean'));
+const switchesOn = computed(() => switches.value.filter(Boolean).length);
+
 async function refresh() {
   await runOp('overview.refresh', { verb: 'Refresh overview', ok: 'Overview up to date', fn: loadStats });
 }
@@ -78,10 +83,8 @@ async function refresh() {
         </div>
         <div class="panel p-4">
           <p class="text-[12.5px] text-muted">Protections on</p>
-          <p class="st text-[26px] mt-1 leading-none">
-            {{ Object.values(state.settings || {}).filter((v) => v === true).length }}
-          </p>
-          <p class="hint mt-1">of {{ state.settings ? Object.keys(state.settings).length : 0 }} settings</p>
+          <p class="st text-[26px] mt-1 leading-none">{{ switchesOn }}</p>
+          <p class="hint mt-1">of {{ switches.length }} switches</p>
         </div>
       </div>
 

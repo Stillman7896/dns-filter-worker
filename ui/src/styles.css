@@ -114,7 +114,7 @@ button {
 }
 
 .toast-progress {
-  animation: erase 4.2s linear forwards;
+  animation: erase var(--toast-ttl, 4.2s) linear forwards;
   transform-origin: left;
 }
 
