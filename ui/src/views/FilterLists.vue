@@ -103,10 +103,15 @@ async function remove(form, value) {
 
       <div class="px-5 py-4">
         <form class="flex flex-wrap items-center gap-2.5" @submit.prevent="add(form)">
+          <!-- The plain @input mirror is deliberate: v-model's default handler
+               ignores input events while an IME marks the text as composing
+               (Gboard commits per word), so validity would not light up until
+               blur or a non-letter keystroke ended the composition. -->
           <input
             v-model="draft[form.key]"
+            @input="draft[form.key] = $event.target.value"
             type="text"
-            class="field flex-1 min-w-[180px] st"
+            class="field flex-1 min-w-[160px] st"
             :placeholder="form.placeholder"
             :aria-label="`New ${form.title} entry`"
             autocapitalize="none"

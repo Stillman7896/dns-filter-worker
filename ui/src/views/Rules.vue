@@ -112,6 +112,7 @@ function onFilter(e) {
         <div class="flex flex-wrap items-center gap-2.5">
           <input
             v-model="domain"
+            @input="domain = $event.target.value"
             type="text"
             class="field flex-1 min-w-[180px] st"
             placeholder="ads.example.net"
@@ -151,6 +152,7 @@ function onFilter(e) {
       <p class="hint mt-1">One per line, or separated by commas.</p>
       <textarea
         v-model="bulkText"
+        @input="bulkText = $event.target.value"
         rows="7"
         class="w-full mt-3 rounded-md bg-raised border border-line p-3 st text-[13px] focus:outline-none focus:border-beacon focus:ring-1 focus:ring-beacon/40"
         placeholder="ads.example.net&#10;beacon.partner.dev&#10;tracker.example.com"

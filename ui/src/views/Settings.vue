@@ -326,6 +326,7 @@ async function removeRoute(route) {
             <input
               id="custom-url"
               v-model="customUrl"
+              @input="customUrl = $event.target.value"
               type="url"
               class="field flex-1 min-w-[220px] st"
               placeholder="https://doh.example.com/dns-query"
@@ -348,6 +349,7 @@ async function removeRoute(route) {
             <input
               id="odoh-relay"
               v-model="relay"
+              @input="relay = $event.target.value"
               type="url"
               class="field flex-1 min-w-[220px] st"
               placeholder="https://relay.example/proxy{?targethost,targetpath}"
@@ -418,6 +420,7 @@ async function removeRoute(route) {
               <span class="label">Domain</span>
               <input
                 v-model="routeDomain"
+                @input="routeDomain = $event.target.value"
                 type="text"
                 class="field st"
                 placeholder="nas.home.lan"
@@ -430,6 +433,7 @@ async function removeRoute(route) {
               <span class="label">Answer</span>
               <input
                 v-model="routeValue"
+                @input="routeValue = $event.target.value"
                 type="text"
                 class="field st"
                 placeholder="192.168.1.20 or hostname"

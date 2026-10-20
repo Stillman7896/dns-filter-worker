@@ -70,6 +70,7 @@ function ago(ts) {
       <form class="flex flex-col sm:flex-row gap-2.5" @submit.prevent="probe">
         <input
           v-model="domain"
+          @input="domain = $event.target.value"
           type="text"
           class="field flex-1 st"
           placeholder="sub.example.com"
