@@ -46,9 +46,11 @@ Compares only the **last label** against a `Set` — a single hash lookup.
 Blocked example: `.zip`, `.mov` (look like file extensions), `.xyz`, `.tk`.
 
 ### Blocked keywords (`keywordBlock`, default OFF)
-Substring match of the query name against each entry. Entries must be
-specific (`doubleclick`, `adservice`) — a short entry like `ad` will break a
-large share of the web.
+Substring match of the query name against each entry. Entries are validated,
+never rewritten — lowercase letters, digits, dashes and dots only, 4–64
+characters, kept exactly as entered (`.zip`, `-ads` are distinct needles). The
+4-character minimum keeps over-eager entries out; still pick specific ones
+(`doubleclick`, `adservice`) — short entries break a large share of the web.
 
 #### How fast is keyword matching?
 

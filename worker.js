@@ -13,7 +13,7 @@ import { Blocklist, DEFAULT_BLOCKLIST_URL } from './blocklist.js';
 import { RuleStore } from './rules.js';
 import { SettingsStore } from './settings.js';
 import { RouteStore, routeRecords } from './routing.js';
-import { TextSetStore } from './lists.js';
+import { TextSetStore, normalizeKeyword } from './lists.js';
 import { runQueryFilters, privateAnswerIP, BLOCKED_QUERY_STATUSES } from './filters.js';
 import { resolveUpstream } from './upstream.js';
 import { odohForward } from './odoh.js';
@@ -44,7 +44,7 @@ const blocklist = new Blocklist();
 const ruleStore = new RuleStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
 const settingsStore = new SettingsStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
 const routeStore = new RouteStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
-const keywordStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'keywords:data');
+const keywordStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'keywords:data', normalizeKeyword);
 const tldStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'tlds:data');
 const stores = { ruleStore, blocklist, keywordStore, tldStore, routeStore };
 

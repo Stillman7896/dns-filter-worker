@@ -101,20 +101,29 @@ export function normalizeTld(raw) {
   return s;
 }
 
-/** Keyword normalization: substring match target, so keep it simple. */
-/** @param {unknown} raw @returns {string} */
+/**
+ * Keyword validation: the entry is stored and matched verbatim — no trimming,
+ * no wildcard/dot/dash stripping. Query names arrive lowercase (parseQuestion),
+ * so anything else could never match and is rejected instead: lowercase
+ * letters, digits, dash and dot, 4–64 characters.
+ * @param {unknown} raw @returns {string}
+ */
 export function normalizeKeyword(raw) {
-  const s = normalizeEntry(raw);
-  if (!s || s.length > 64) return '';
-  if (!/^[a-z0-9][a-z0-9.-]*$/.test(s)) return '';
-  return s;
+  if (typeof raw !== 'string') return '';
+  return /^[a-z0-9.-]{4,64}$/.test(raw) ? raw : '';
 }
 
 export class TextSetStore {
-  /** @param {KVLike} kv @param {string} key */
-  constructor(kv, key) {
+  /**
+   * `validate` normalizes/validates every entry (add, remove, blob load).
+   * Defaults to the permissive domain-entry normalizer; stricter callers pass
+   * e.g. normalizeKeyword.
+   * @param {KVLike} kv @param {string} key @param {(raw:unknown)=>string} [validate]
+   */
+  constructor(kv, key, validate = normalizeEntry) {
     this.kv = kv;
     this.key = key;
+    this.validate = validate;
     this.set = new Set();
     /** @type {string|null} */
     this.version = null;
@@ -166,7 +175,7 @@ export class TextSetStore {
     const set = new Set();
     if (raw) {
       for (const line of raw.split('\n')) {
-        const v = normalizeEntry(line);
+        const v = this.validate(line);
         if (v) set.add(v);
       }
     }
@@ -184,7 +193,7 @@ export class TextSetStore {
   /** @returns {Promise<boolean>} true if newly added */
   /** @param {unknown} value @returns {Promise<boolean>} true if newly added */
   async add(value) {
-    const v = normalizeEntry(value);
+    const v = this.validate(value);
     if (!v) throw new Error('invalid entry');
     await this.refresh(true); // read-modify-write from fresh state
     if (this.set.has(v)) return false;
@@ -196,7 +205,7 @@ export class TextSetStore {
   /** @returns {Promise<boolean>} true if it existed and was removed */
   /** @param {unknown} value @returns {Promise<boolean>} true if it existed and was removed */
   async remove(value) {
-    const v = normalizeEntry(value);
+    const v = this.validate(value);
     if (!v) return false;
     await this.refresh(true);
     if (!this.set.delete(v)) return false;
@@ -207,10 +216,10 @@ export class TextSetStore {
   /**
    * Add many entries in ONE read-modify-write (config import, merge mode).
    * @param {string[]} values
-   * @param {(raw:string)=>string} [validate] normalizer; invalid entries skipped
+   * @param {(raw:unknown)=>string} [validate] normalizer; invalid entries skipped
    * @returns {Promise<{applied:number, skipped:number}>}
    */
-  async addMany(values, validate = normalizeEntry) {
+  async addMany(values, validate = this.validate) {
     await this.refresh(true);
     let applied = 0, skipped = 0;
     for (const v of values) {
@@ -230,10 +239,10 @@ export class TextSetStore {
    */
   /**
    * @param {unknown[]} values
-   * @param {(raw:string)=>string} [validate]
+   * @param {(raw:unknown)=>string} [validate]
    * @returns {Promise<{applied:number, skipped:number}>}
    */
-  async replaceAll(values, validate = normalizeEntry) {
+  async replaceAll(values, validate = this.validate) {
     const next = new Set();
     let skipped = 0;
     for (const v of values) {

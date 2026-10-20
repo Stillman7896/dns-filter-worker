@@ -22,7 +22,7 @@ const FORMS = [
     key: 'keyword',
     title: 'Blocked keywords',
     hint: 'Stops a query when any label contains this text.',
-    invalid: 'Letters, digits, dots and dashes only, e.g. “doubleclick”.',
+    invalid: 'Lowercase letters, digits, dots and dashes only, at least 4 characters.',
     placeholder: 'doubleclick',
     normalize: normalizeKeyword,
     on: () => state.settings?.keywordBlock,

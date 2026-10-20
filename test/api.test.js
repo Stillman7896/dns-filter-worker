@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { handleApi } from '../dashboard.js';
 import { RuleStore } from '../rules.js';
 import { RouteStore } from '../routing.js';
-import { TextSetStore } from '../lists.js';
+import { TextSetStore, normalizeKeyword } from '../lists.js';
 import { SettingsStore } from '../settings.js';
 import { buildQuery, buildResponse, FakeKV, v4rdata } from './helpers.js';
 
@@ -18,7 +18,7 @@ function mkCtx(kv) {
     rules: new RuleStore(kv),
     settings: new SettingsStore(kv),
     routes: new RouteStore(kv),
-    keywords: new TextSetStore(kv, 'keywords:data'),
+    keywords: new TextSetStore(kv, 'keywords:data', normalizeKeyword),
     tlds: new TextSetStore(kv, 'tlds:data'),
     testFn: async (domain, env) => ({ domain, status: 'none', filter: 'upstream', matched: null }),
   };
@@ -314,10 +314,20 @@ test('filters: tlds + keywords CRUD with validation', async () => {
   });
   assert.equal(invalid.status, 400);
 
-  const kw = await call(ctx, env, '/api/filters/keywords', {
+  const kwBad = await call(ctx, env, '/api/filters/keywords', {
     method: 'POST', cookie, body: { value: 'DoubleClick' },
   });
+  assert.equal(kwBad.status, 400, 'uppercase can never match; rejected, not rewritten');
+
+  const kw = await call(ctx, env, '/api/filters/keywords', {
+    method: 'POST', cookie, body: { value: 'doubleclick' },
+  });
   assert.deepEqual((await kw.json()).items, ['doubleclick']);
+
+  const leadingDash = await call(ctx, env, '/api/filters/keywords', {
+    method: 'POST', cookie, body: { value: '-ads' },
+  });
+  assert.deepEqual((await leadingDash.json()).items, ['-ads', 'doubleclick'], 'stored verbatim');
 
   const rm = await call(ctx, env, '/api/filters/tlds?value=zip', { method: 'DELETE', cookie });
   assert.equal((await rm.json()).removed, true);

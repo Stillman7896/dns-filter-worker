@@ -197,10 +197,30 @@ test('normalizeTld / normalizeKeyword validation', () => {
   assert.equal(normalizeTld('co.uk'), '', 'single label only');
   assert.equal(normalizeTld('a'), '', 'too short');
   assert.equal(normalizeTld('ok-9'), 'ok-9');
-  assert.equal(normalizeKeyword('DoubleClick'), 'doubleclick');
+  assert.equal(normalizeKeyword('doubleclick'), 'doubleclick');
+  assert.equal(normalizeKeyword('ab-cd.ef'), 'ab-cd.ef');
+  assert.equal(normalizeKeyword('ads'), '', 'min 4 characters');
+  assert.equal(normalizeKeyword(' ads '), '', 'no trimming');
+  assert.equal(normalizeKeyword('.ads'), '.ads', 'kept verbatim — no dot stripping');
+  assert.equal(normalizeKeyword('-ads'), '-ads', 'kept verbatim — no dash stripping');
+  assert.equal(normalizeKeyword('*.ads'), '', 'no wildcard whitelist');
+  assert.equal(normalizeKeyword('Double.ads'), '', 'lowercase only: uppercase never matches a query name');
   assert.equal(normalizeKeyword('bad_keyword!'), '');
   assert.equal(normalizeKeyword(''), '');
+  assert.equal(normalizeKeyword(null), '');
+  assert.equal(normalizeKeyword('x'.repeat(64)), 'x'.repeat(64));
   assert.equal(normalizeKeyword('x'.repeat(65)), '');
+});
+
+test('TextSetStore: keyword validator stores entries verbatim', async () => {
+  const kv = new FakeKV();
+  const ks = new TextSetStore(kv, 'keywords:data', normalizeKeyword);
+  await assert.rejects(ks.add('ads'), /invalid entry/, 'below the 4-char minimum');
+  await assert.rejects(ks.add(' Double '), /invalid entry/, 'no trimming/casing');
+  assert.equal(await ks.add('-ads.x'), true);
+  assert.equal(await ks.add('-ads.x'), false);
+  assert.deepEqual(ks.list(), ['-ads.x']);
+  assert.equal(kv.data.get('keywords:data'), '-ads.x', 'blob holds the entry unsanitized');
 });
 
 test('TextSetStore: version cache + failure keeps stale set', async () => {

@@ -4,6 +4,7 @@
 
 import { UPSTREAM_PRESETS, findPreset, probeUpstream, resolveUpstream } from '../../upstream.js';
 import { normalizeRoute } from '../../routing.js';
+import { normalizeTld, normalizeKeyword } from '../../lists.js';
 
 const SESSION_COOKIE = 'dns_dash_session';
 const PASSWORD = 'demo';
@@ -326,7 +327,7 @@ export function mockApi(req, res, next) {
     const listMatch = p.match(/^\/api\/filters\/(keywords|tlds)$/);
     if (listMatch) {
       const set = listMatch[1] === 'keywords' ? fixtures.keywords : fixtures.tlds;
-      const norm = (v) => String(v).trim().toLowerCase();
+      const norm = listMatch[1] === 'keywords' ? normalizeKeyword : normalizeTld;
       if (req.method === 'GET') return json(res, 200, { items: [...set].sort() });
       if (req.method === 'POST') {
         const v = norm((body || {}).value);
