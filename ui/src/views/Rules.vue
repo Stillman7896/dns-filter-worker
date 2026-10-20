@@ -221,7 +221,7 @@ function onFilter(e) {
                 <ConfirmButton
                   small
                   label="Remove"
-                  :armed-label="`Remove ${r.domain}?`"
+                  armed-label="Confirm?"
                   :busy-key="`rules.del:${r.domain}`"
                   @confirm="removeRule(r)"
                 />

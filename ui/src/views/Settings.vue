@@ -491,7 +491,7 @@ async function removeRoute(route) {
                   <ConfirmButton
                     small
                     label="Remove"
-                    :armed-label="`Remove ${r.domain}?`"
+                    armed-label="Confirm?"
                     :busy-key="`routes.del:${r.domain}`"
                     @confirm="removeRoute(r)"
                   />
