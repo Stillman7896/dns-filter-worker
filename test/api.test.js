@@ -372,12 +372,16 @@ function statsD1() {
   const topBlocked = [
     { domain: 'ads.example', n: 3 }, { domain: 'tracker.io', n: 2 },
   ];
+  const topClients = [
+    { client: 'phone', n: 4 }, { client: 'laptop', n: 2 },
+  ];
   const hourRows = [{ hour: 10, n: 4 }, { hour: 11, n: 6 }];
   const totalRow = { n: 11 };
   /** @param {string} sql @returns {any} */
   const handlerFor = (sql) => {
     if (/GROUP BY status/i.test(sql)) return statusRows;
     if (/WHERE status IN/i.test(sql)) return topBlocked;
+    if (/GROUP BY client/i.test(sql)) return topClients;
     if (/GROUP BY hour/i.test(sql)) return hourRows;
     if (/^SELECT COUNT\(\*\) AS n FROM dns_logs$/i.test(sql.trim())) return totalRow;
     throw new Error('unexpected STATS sql: ' + sql);
@@ -414,6 +418,7 @@ test('logs/stats: aggregates status mix, top blocked, hourly buckets', async () 
   assert.equal(j.byStatus.total, 11);
   assert.equal(j.byStatus.rows.length, 4);
   assert.equal(j.topBlocked[0].domain, 'ads.example');
+  assert.deepEqual(j.topClients[0], { client: 'phone', n: 4 });
   assert.ok(Array.isArray(j.last24h) && j.last24h.length === 24);
   assert.equal(j.last24h[10], 4);
   assert.equal(j.last24h[11], 6);
@@ -429,6 +434,153 @@ test('logs/stats: requires D1 (501 when missing)', async () => {
   }));
   const res = await call(ctx, env, '/api/logs/stats', { cookie });
   assert.equal(res.status, 501);
+});
+
+// ---- logs list: client / untagged filters (D1) ----------------------------------
+
+// In-memory D1 for /api/logs: WHERE args are really applied, so the client
+// and untagged filters are verified end to end instead of just sniffed.
+const LOG_ROWS = [
+  { id: 1, domain: 'a.example', status: 'none', filter: 'upstream', ts: 5000, qtype: 1, client: 'laptop' },
+  { id: 2, domain: 'ads.example', status: 'deny', filter: 'denylist', ts: 4000, qtype: 1, client: 'phone' },
+  { id: 3, domain: 'b.example', status: 'none', filter: 'upstream', ts: 3000, qtype: 28, client: null },
+  { id: 4, domain: 'c.example', status: 'tld', filter: 'tld', ts: 2000, qtype: 1, client: 'laptop' },
+];
+
+/** @returns {D1Like & {rows: Array<Record<string, any>>}} */
+function logsD1() {
+  const rows = LOG_ROWS.slice();
+  /** @param {string} sql @param {any[]} args @returns {[any[], number]} filtered rows + how many args the WHERE consumed */
+  const conds = (sql, args) => {
+    const m = /WHERE ([^]*?)(?=\s+ORDER BY|\s+GROUP BY|\s+LIMIT|$)/i.exec(sql);
+    if (!m) return [rows, 0];
+    let i = 0;
+    let out = rows;
+    for (const raw of m[1].split(/\s+AND\s+/i)) {
+      const part = raw.trim();
+      if (/^domain LIKE \?/i.test(part)) {
+        const needle = String(args[i++]).replaceAll('%', '');
+        out = out.filter((r) => r.domain.includes(needle));
+      } else if (/^status = \?/i.test(part)) {
+        const v = String(args[i++]);
+        out = out.filter((r) => r.status === v);
+      } else if (/^client = \?/i.test(part)) {
+        const v = String(args[i++]);
+        out = out.filter((r) => r.client === v);
+      } else if (/^client IS NOT NULL/i.test(part)) {
+        out = out.filter((r) => r.client !== null && r.client !== undefined);
+      } else if (/^client IS NULL/i.test(part)) {
+        out = out.filter((r) => r.client === null || r.client === undefined);
+      } else if (/^status IN \(/i.test(part)) {
+        const allowed = [...part.matchAll(/'([^']+)'/g)].map((x) => x[1]);
+        out = out.filter((r) => allowed.includes(r.status));
+      } else if (/^ts >= \?/i.test(part)) {
+        const cutoff = Number(args[i++]);
+        out = out.filter((r) => r.ts >= cutoff);
+      } else {
+        throw new Error('unsupported cond: ' + part);
+      }
+    }
+    return [out, i];
+  };
+  /** @param {string} sql @param {any[]} args */
+  const stmt = (sql, args) => {
+    const [out, used] = conds(sql, args);
+    const limit = Number(args[used] ?? Infinity);
+    const offset = Number(args[used + 1] ?? 0);
+    let results = [];
+    let n = null;
+    if (/^SELECT COUNT\(\*\)/i.test(sql)) n = out.length;
+    else if (/GROUP BY status/i.test(sql)) {
+      const tally = new Map();
+      for (const r of out) tally.set(r.status, (tally.get(r.status) || 0) + 1);
+      results = [...tally].map(([status, c]) => ({ status, n: c }));
+    } else if (/GROUP BY domain/i.test(sql)) {
+      const tally = new Map();
+      for (const r of out) tally.set(r.domain, (tally.get(r.domain) || 0) + 1);
+      results = [...tally].map(([domain, c]) => ({ domain, n: c })).sort((a, b) => b.n - a.n);
+    } else if (/GROUP BY client/i.test(sql)) {
+      const tally = new Map();
+      for (const r of out) tally.set(r.client, (tally.get(r.client) || 0) + 1);
+      results = [...tally].map(([client, c]) => ({ client, n: c })).sort((a, b) => b.n - a.n);
+    } else if (/GROUP BY hour/i.test(sql)) {
+      const tally = new Map();
+      for (const r of out) {
+        const hour = Math.floor(r.ts / 3600000) % 24;
+        tally.set(hour, (tally.get(hour) || 0) + 1);
+      }
+      results = [...tally].map(([hour, c]) => ({ hour, n: c }));
+    } else if (/ORDER BY ts DESC/i.test(sql)) {
+      results = out.slice().sort((a, b) => b.ts - a.ts).slice(offset, offset + limit);
+    } else if (/^DELETE FROM dns_logs/i.test(sql)) {
+      for (let k = rows.length - 1; k >= 0; k--) if (out.includes(rows[k])) rows.splice(k, 1);
+    } else {
+      throw new Error('unexpected LOGS sql: ' + sql);
+    }
+    return {
+      all: async () => ({ results }),
+      first: async () => (n === null ? results[0] : { n }),
+      run: async () => ({ success: true }),
+    };
+  };
+  return {
+    rows,
+    prepare(sql) {
+      return {
+        bind: (...a) => stmt(sql, a),
+        all: () => stmt(sql, []).all(),
+        first: () => stmt(sql, []).first(),
+        run: () => stmt(sql, []).run(),
+      };
+    },
+  };
+}
+
+test('logs: client tag and untagged filters, rows carry the client', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD, LOGS: logsD1() };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  const laptop = await (await call(ctx, env, '/api/logs?client=laptop', { cookie })).json();
+  assert.equal(laptop.total, 2);
+  assert.deepEqual(laptop.logs.map((/** @type {{id: number}} */ r) => r.id), [1, 4], 'newest first');
+  assert.equal(laptop.logs[0].client, 'laptop', 'rows carry the client tag');
+
+  const untagged = await (await call(ctx, env, '/api/logs?untagged=1', { cookie })).json();
+  assert.equal(untagged.total, 1);
+  assert.equal(untagged.logs[0].id, 3);
+  assert.equal(untagged.logs[0].client, null);
+
+  const combined = await (await call(ctx, env, '/api/logs?search=example&client=phone', { cookie })).json();
+  assert.equal(combined.total, 1, 'client stacks with the domain search');
+  assert.equal(combined.logs[0].id, 2);
+});
+
+test('logs: delete filtered honours the client filter; stats tally clients', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const db = logsD1();
+  const env = { DASHBOARD_PASSWORD: PASSWORD, LOGS: db };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  const bare = await call(ctx, env, '/api/logs', { method: 'DELETE', cookie });
+  assert.equal(bare.status, 400, 'still needs ?clear=1 or a filter');
+
+  const untaggedDel = await call(ctx, env, '/api/logs?untagged=1', { method: 'DELETE', cookie });
+  assert.equal(untaggedDel.status, 200, 'untagged=1 counts as a filter on its own');
+  assert.deepEqual(db.rows.map((r) => r.id), [1, 2, 4]);
+
+  const byClient = await call(ctx, env, '/api/logs?client=phone', { method: 'DELETE', cookie });
+  assert.equal(byClient.status, 200);
+  assert.deepEqual(db.rows.map((r) => r.id), [1, 4], 'only the tagged rows are gone');
+
+  const stats = await (await call(ctx, env, '/api/logs/stats', { cookie })).json();
+  assert.deepEqual(stats.topClients, [{ client: 'laptop', n: 2 }], 'untagged rows never appear in the tally');
 });
 
 // ---- config backup: export / import --------------------------------------------

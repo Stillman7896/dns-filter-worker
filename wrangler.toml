@@ -27,7 +27,9 @@ binding = "ASSETS"
 #   "/api/*"   -> dashboard JSON API (glob `*` is required: "/api/" alone
 #                 matches only the literal path /api/, and API subpaths would
 #                 fall through to assets + SPA fallback -> HTML -> null JSON)
-run_worker_first = ["/api/*", "/dns-query", "/healthz", "/"]
+# A trailing client tag on the DoH endpoint (/dns-query/<tag>) must also reach
+# the script, so the suffix path needs its own glob: deep paths need `*`.
+run_worker_first = ["/api/*", "/dns-query", "/dns-query/*", "/healthz", "/"]
 not_found_handling = "single-page-application"
 html_handling = "auto-trailing-slash"
 

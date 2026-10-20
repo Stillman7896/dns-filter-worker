@@ -78,12 +78,14 @@ function seedLogs() {
                 : status === 'idn' ? 'idn'
                   : status === 'allow' ? 'custom allowlist'
                     : 'upstream';
+    const clients = ['laptop', 'phone', 'phone', 'tv', null, null, null];
     out.push({
       id: i + 1,
       domain: domains[Math.floor(rnd() * domains.length)],
       status,
       filter,
       qtype: [1, 1, 1, 28, 65, 99][Math.floor(rnd() * 6)],
+      client: clients[Math.floor(rnd() * clients.length)],
       ts: now - Math.floor(rnd() * 72 * 3600 * 1000),
       blocked: blockedish,
     });
@@ -111,6 +113,20 @@ function readBody(req) {
       try { resolve(raw ? JSON.parse(raw) : {}); } catch { resolve(null); }
     });
   });
+}
+
+// Same filter semantics as the worker: domain search, status, exact client tag
+// or untagged=1 for rows logged without a tag.
+function logMatcher(url) {
+  const search = (url.searchParams.get('search') || '').trim().toLowerCase();
+  const status = url.searchParams.get('status') || '';
+  const client = (url.searchParams.get('client') || '').trim().toLowerCase();
+  const untagged = url.searchParams.get('untagged') === '1';
+  return (r) =>
+    (!search || r.domain.includes(search)) &&
+    (!status || r.status === status) &&
+    (!client || r.client === client) &&
+    (!untagged || r.client === null || r.client === undefined);
 }
 
 function authed(req) {
@@ -332,8 +348,10 @@ export function mockApi(req, res, next) {
       const byStatus = new Map();
       for (const r of fixtures.logs) byStatus.set(r.status, (byStatus.get(r.status) || 0) + 1);
       const topMap = new Map();
+      const clientMap = new Map();
       for (const r of fixtures.logs) {
         if (r.blocked) topMap.set(r.domain, (topMap.get(r.domain) || 0) + 1);
+        if (r.client) clientMap.set(r.client, (clientMap.get(r.client) || 0) + 1);
       }
       const day = 24 * 3600 * 1000;
       const cutoff = Date.now() - 7 * day;
@@ -343,30 +361,26 @@ export function mockApi(req, res, next) {
         total: fixtures.logs.length,
         byStatus: { rows: [...byStatus].map(([status, n]) => ({ status, n })), total: fixtures.logs.length },
         topBlocked: [...topMap].map(([domain, n]) => ({ domain, n })).sort((a, b) => b.n - a.n).slice(0, 10),
+        topClients: [...clientMap].map(([client, n]) => ({ client, n })).sort((a, b) => b.n - a.n).slice(0, 10),
         last24h: buckets,
       });
     }
     if (p === '/api/logs' && req.method === 'GET') {
-      const search = (url.searchParams.get('search') || '').trim().toLowerCase();
-      const status = url.searchParams.get('status') || '';
       const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 500);
       const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0);
-      let rows = fixtures.logs
-        .filter((r) => (!search || r.domain.includes(search)) && (!status || r.status === status));
+      const matches = logMatcher(url);
+      let rows = fixtures.logs.filter(matches);
       const total = rows.length;
       rows = rows.slice(offset, offset + limit);
       return json(res, 200, { logs: rows.map(({ blocked, ...rest }) => rest), total });
     }
     if (p === '/api/logs' && req.method === 'DELETE') {
-      const search = (url.searchParams.get('search') || '').trim().toLowerCase();
-      const status = url.searchParams.get('status') || '';
-      const hasFilter = Boolean(search || status);
+      const hasFilter = Boolean(url.searchParams.get('search') || url.searchParams.get('status')
+        || url.searchParams.get('client') || url.searchParams.get('untagged') === '1');
       if (!hasFilter && url.searchParams.get('clear') !== '1') {
         return json(res, 400, { error: 'use ?clear=1 to delete all logs' });
       }
-      fixtures.logs = fixtures.logs.filter(
-        (r) => !((!search || r.domain.includes(search)) && (!status || r.status === status))
-      );
+      fixtures.logs = fixtures.logs.filter((r) => !logMatcher(url)(r));
       return json(res, 200, { ok: true });
     }
     const one = p.match(/^\/api\/logs\/(\d+)$/);

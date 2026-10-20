@@ -149,7 +149,7 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 
 | Path              | Description                                                            |
 |-------------------|------------------------------------------------------------------------|
-| `/dns-query`      | DoH endpoint (GET `?dns=` or POST `application/dns-message`)            |
+| `/dns-query`      | DoH endpoint (GET `?dns=` or POST `application/dns-message`); optional client tag via `/dns-query/<tag>` or `?tag=` |
 | `/`               | 302 → `/dashboard` when the client sends `Accept: text/html`           |
 | `/dashboard`      | Dashboard UI (static asset, SPA fallback)                               |
 | `/api/rules`      | List / add (POST `{domain,kind}`) / delete                              |
@@ -160,7 +160,7 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 | `/api/upstream/test` | Send one real query to a candidate provider: `{ok, ms, rcode, answers, sample}` or `{ok:false, error}` |
 | `/api/filters/tlds` | List (GET) / add (POST `{value}`) / remove (DELETE `?value=`) blocked TLDs |
 | `/api/filters/keywords` | Same, for blocked keywords                              |
-| `/api/logs`       | Search + paginate logs (GET); delete filtered/all (DELETE)             |
+| `/api/logs`       | Search + paginate logs (GET, `?client=` / `?untagged=1`); delete filtered/all (DELETE) |
 | `/api/logs/:id`   | Delete a single log row                                                |
 | `/api/session`    | Login (sets session cookie)                                             |
 | `/healthz`        | Stats, effective settings, resolved URLs                                |
@@ -280,7 +280,10 @@ Point a DoH client (e.g. Firefox, AdGuard Home, `curl`) at:
 
 The dashboard's Overview shows that URL with a copy button and a setup guide
 per client type — the endpoint is always this worker's own origin, so there is
-nothing to configure twice.
+nothing to configure twice. To attribute queries to a device, give that device
+its own tagged endpoint — `https://<worker>/dns-query/laptop`,
+`.../dns-query/tv`, or `?tag=laptop` — via the "Client tag" builder in
+Overview; tagged rows are then filterable per client in the Logs tab.
 
 ## Dashboard auth
 
@@ -326,6 +329,9 @@ isolates pick it up within ~30 s.
 Every resolved query is written to D1 (`dns_logs`) with:
 
 - `domain` — requested QNAME (lowercased)
+- `client` — device tag extracted from the request (`/dns-query/<tag>` path or
+  `?tag=` query), lowercased; `null` for untagged queries. Invalid tags are
+  rejected with `400` before anything is logged, so a typo fails loudly.
 - `status` — `route` | `allow` | `deny` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `none`
 - `filter` — which layer decided: `route` | `allowlist` | `denylist` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `upstream`
 - `ts` — unix epoch ms
@@ -333,10 +339,12 @@ Every resolved query is written to D1 (`dns_logs`) with:
   dashboard as the common mnemonic (`A`, `AAAA`, `HTTPS`, …), `other` for uncommon codes,
   and `—` for rows written before this column existed.
 
-`qtype` is added to pre-existing tables automatically on the first insert
-(`ALTER TABLE ... ADD COLUMN`, duplicate-column errors ignored), so no manual
-migration is needed.
+`qtype` and `client` are added to pre-existing tables automatically on the
+first insert (`ALTER TABLE ... ADD COLUMN`, duplicate-column errors ignored),
+so no manual migration is needed.
 
-The Logs tab supports search, status filter, paging (Prev/Next + rows-per-page),
-per-row delete, delete-filtered, and clear-all. `filter` is redundant with
-`status` in the UI, so the table shows `status` only.
+The Logs tab supports search, status filter, client-tag filter, paging
+(Prev/Next + rows-per-page), per-row delete, delete-filtered, and clear-all.
+`filter` is redundant with `status` in the UI, so the table shows `status`
+only. To tag a client, point that device at `/dns-query/<tag>` (or append
+`?tag=`) — the dashboard's Overview builds a ready-to-paste tagged URL.

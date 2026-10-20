@@ -13,16 +13,27 @@ const LIMITS = [25, 50, 100, 250];
 
 const search = ref(state.logs.search);
 const status = ref(state.logs.status);
+const client = ref(state.logs.client);
 const limit = ref(state.logs.limit);
 let debounce = null;
 
 const rows = computed(() => state.logs.rows);
 const total = computed(() => state.logs.total);
 const noD1 = computed(() => state.statsError === 'no_d1');
-const activeFilter = computed(() => Boolean(state.logs.search || state.logs.status));
+const activeFilter = computed(() => Boolean(state.logs.search || state.logs.status || state.logs.client));
+// Known tags from the stats call; entries newer than the last refresh still
+// show in the table and are clickable there.
+const clientOptions = computed(() => state.stats?.topClients || []);
 
 function currentQuery() {
-  return { search: state.logs.search, status: state.logs.status, limit: state.logs.limit, offset: state.logs.offset };
+  return {
+    search: state.logs.search,
+    status: state.logs.status,
+    client: state.logs.client && state.logs.client !== 'untagged' ? state.logs.client : '',
+    untagged: state.logs.client === 'untagged' ? 1 : '',
+    limit: state.logs.limit,
+    offset: state.logs.offset,
+  };
 }
 
 // Search narrows as you type; status/limit changes react immediately.
@@ -39,6 +50,13 @@ watch(status, async (v) => {
   state.logs.status = v;
   state.logs.offset = 0;
   await runOp('logs.filter', { verb: 'Apply status filter', ok: `Filtered to ${total.value} rows`, fn: loadLogs }).catch(() => {});
+});
+
+watch(client, async (v) => {
+  state.logs.client = v;
+  state.logs.offset = 0;
+  const label = v === 'untagged' ? 'untagged clients' : `client “${v}”`;
+  await runOp('logs.client', { verb: 'Apply client filter', ok: `Filtered to ${label}`, fn: loadLogs }).catch(() => {});
 });
 
 watch(limit, async (v) => {
@@ -155,12 +173,23 @@ function timeOf(ts) {
     <div class="panel flex flex-wrap items-center gap-2.5 p-3">
       <label class="flex-1 min-w-[180px]">
         <span class="sr-only">Search domain</span>
-        <input v-model="search" type="search" class="field w-full st" placeholder="Search domain…" spellcheck="false" />
+        <input
+          v-model="search"
+          @input="search = $event.target.value"
+          type="search" class="field w-full st" placeholder="Search domain…" spellcheck="false" />
       </label>
       <label class="flex items-center gap-2">
         <span class="text-[12.5px] text-muted hidden sm:inline">Status</span>
         <select v-model="status" class="field st">
           <option v-for="s in STATUSES" :key="s" :value="s">{{ s || 'any' }}</option>
+        </select>
+      </label>
+      <label class="flex items-center gap-2">
+        <span class="text-[12.5px] text-muted hidden sm:inline">Client</span>
+        <select v-model="client" class="field st" aria-label="Filter by client">
+          <option value="">any client</option>
+          <option value="untagged">untagged</option>
+          <option v-for="c in clientOptions" :key="c.client" :value="c.client">{{ c.client }} ({{ c.n }})</option>
         </select>
       </label>
       <label class="flex items-center gap-2">
@@ -173,7 +202,7 @@ function timeOf(ts) {
         v-if="activeFilter"
         type="button"
         class="text-[13px] text-muted hover:text-ink underline underline-offset-2 ml-auto"
-        @click="search = '', status = ''"
+        @click="search = '', status = '', client = ''"
       >
         Reset filter
       </button>
@@ -192,13 +221,14 @@ function timeOf(ts) {
     <!-- Rows: a real table, labels stay visible, narrow screens scroll it -->
     <section v-else class="panel overflow-hidden">
       <div v-if="rows.length" class="overflow-x-auto">
-        <table class="w-full min-w-[540px] border-collapse text-left">
+        <table class="w-full min-w-[620px] border-collapse text-left">
           <caption class="sr-only">Recent DNS queries</caption>
           <thead class="text-[12.5px] text-muted border-b border-line">
             <tr>
               <th scope="col" class="px-4 sm:px-5 py-2 font-medium whitespace-nowrap">When</th>
               <th scope="col" class="px-3 py-2 font-medium">Domain</th>
               <th scope="col" class="px-3 py-2 font-medium whitespace-nowrap">Outcome</th>
+              <th scope="col" class="px-3 py-2 font-medium whitespace-nowrap">Client</th>
               <th scope="col" class="px-3 py-2 font-medium whitespace-nowrap">Type</th>
               <th scope="col" class="px-4 sm:px-5 py-2 font-medium text-right"><span class="sr-only">Action</span></th>
             </tr>
@@ -213,6 +243,18 @@ function timeOf(ts) {
               </td>
               <td class="px-3 py-3 whitespace-nowrap">
                 <StatusPill :status="r.status" />
+              </td>
+              <td class="px-3 py-3 whitespace-nowrap">
+                <button
+                  v-if="r.client"
+                  type="button"
+                  class="st text-[12.5px] rounded border border-line px-1.5 py-0.5 text-muted hover:text-ink hover:bg-raised transition-colors"
+                  :title="`Show only queries from ${r.client}`"
+                  @click="client = r.client"
+                >
+                  {{ r.client }}
+                </button>
+                <span v-else class="st text-[12.5px] text-muted/60">—</span>
               </td>
               <td class="px-3 py-3 whitespace-nowrap st text-[12.5px] text-muted">{{ qtypeLabel(r.qtype) }}</td>
               <td class="px-4 sm:px-5 py-3 text-right whitespace-nowrap">

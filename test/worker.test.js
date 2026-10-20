@@ -64,8 +64,9 @@ class FakeD1 {
       if (/^INSERT/i.test(sql)) {
         self.rows.push({
           id: self.sn++, domain: args[0], status: args[1],
-          filter: args[2], ts: args[3], qtype: args[4],
+          filter: args[2], ts: args[3], qtype: args[4], client: args[5] ?? null,
         });
+      } else if (/^ALTER/i.test(sql)) { /* schema migration no-op in the fake */
       } else if (/^DELETE.*WHERE ts </i.test(sql)) {
         self.rows = self.rows.filter((r) => !(r.ts < args[0]));
       } else if (/^DELETE.*WHERE id =/i.test(sql)) {
@@ -109,12 +110,14 @@ function mkEnv(overrides = {}) {
 /**
  * @param {Env} env
  * @param {Uint8Array} query
- * @param {{headers?: Record<string, string>}} [extra]
+ * @param {{headers?: Record<string, string>, path?: string, tag?: string}} [extra]
  * @returns {Promise<Response>}
  */
 function dohGet(env, query, extra = {}) {
   const b64 = Buffer.from(query).toString('base64url');
-  const url = 'https://worker.test/dns-query?dns=' + b64;
+  const url = new URL('https://worker.test' + (extra.path || '/dns-query'));
+  url.searchParams.set('dns', b64);
+  if (extra.tag) url.searchParams.set('tag', extra.tag);
   const req = new Request(url, {
     method: 'GET',
     headers: { Accept: 'application/dns-message', ...(extra.headers || {}) },
@@ -126,10 +129,11 @@ function dohGet(env, query, extra = {}) {
 /**
  * @param {Env} env
  * @param {Uint8Array} query
+ * @param {{path?: string}} [extra]
  * @returns {Promise<Response>}
  */
-function dohPost(env, query) {
-  const req = new Request('https://worker.test/dns-query', {
+function dohPost(env, query, extra = {}) {
+  const req = new Request('https://worker.test' + (extra.path || '/dns-query'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/dns-message' },
     body: query,
@@ -361,6 +365,56 @@ test('logPassed=false: passed queries unlogged, blocked still logged', async () 
   assert.equal(inserts.length, 1, 'only the block was logged');
   assert.equal(d1.rows[0].domain, 'ads.blocklist.test');
   assert.equal(d1.rows[0].status, 'blocklist');
+});
+
+// ---- client tagging ------------------------------------------------------------
+
+test('client tag via ?tag= lands in the log row; untagged queries stay null', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ d1, kv: new FakeKV() });
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('9.9.9.9') }];
+
+  const tagged = await dohGet(env, buildQuery('tagged.example.net'), { tag: 'Phone' });
+  assert.equal(tagged.status, 200, 'a valid tag never breaks the query');
+  const plain = await dohGet(env, buildQuery('plain.example.net'));
+  assert.equal(plain.status, 200);
+
+  assert.equal(d1.rows.length, 2);
+  assert.equal(d1.rows[0].domain, 'tagged.example.net');
+  assert.equal(d1.rows[0].client, 'phone', 'tags are lowercased');
+  assert.equal(d1.rows[1].client, null, 'untagged queries log null');
+});
+
+test('client tag via /dns-query/<tag> path for GET and POST', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ d1, kv: new FakeKV() });
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('10.20.30.40') }];
+
+  const get = await dohGet(env, buildQuery('path-tagged.example.net'), { path: '/dns-query/laptop' });
+  assert.equal(get.status, 200);
+  const post = await dohPost(env, buildQuery('post-tagged.example.net'), { path: '/dns-query/tv' });
+  assert.equal(post.status, 200);
+
+  assert.deepEqual(d1.rows.map((r) => [r.domain, r.client]), [
+    ['path-tagged.example.net', 'laptop'],
+    ['post-tagged.example.net', 'tv'],
+  ]);
+});
+
+test('?tag= wins over the path suffix; an unusable tag is rejected before logging', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ d1, kv: new FakeKV() });
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('1.2.3.4') }];
+
+  const wins = await dohGet(env, buildQuery('precedence.example.net'), { path: '/dns-query/router', tag: 'modem' });
+  assert.equal(wins.status, 200);
+  assert.equal(d1.rows[0].client, 'modem');
+
+  const badParam = await dohGet(env, buildQuery('rejected.example.net'), { tag: 'bad tag!' });
+  assert.equal(badParam.status, 400, 'a typo fails loudly instead of logging untagged');
+  const badPath = await dohGet(env, buildQuery('rejected2.example.net'), { path: '/dns-query/na%2Fme' });
+  assert.equal(badPath.status, 400);
+  assert.equal(d1.rows.length, 1, 'rejected requests never reach the log');
 });
 
 // ---- answer cache ----------------------------------------------------------------

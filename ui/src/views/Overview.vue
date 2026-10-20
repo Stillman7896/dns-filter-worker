@@ -44,6 +44,18 @@ const endpoint = `${location.origin}/dns-query`;
 const setupOpen = ref(false);
 const guide = ref('browsers');
 
+// Optional client tag: `/dns-query/<tag>` labels the client in the query log.
+// Same rules the worker enforces (`?tag=` also works there).
+const tag = ref('');
+const TAG_RE = /^[a-z0-9](?:[a-z0-9_-]{0,62})$/;
+const tagOk = computed(() => TAG_RE.test(tag.value.trim().toLowerCase()));
+const tagProblem = computed(() =>
+  (tag.value.trim() && !tagOk.value) ? 'Letters, digits, dashes and underscores — e.g. “laptop”.' : ''
+);
+const taggedEndpoint = computed(() =>
+  `${location.origin}/dns-query/${encodeURIComponent(tag.value.trim().toLowerCase())}`
+);
+
 const GUIDES = [
   {
     id: 'browsers',
@@ -112,6 +124,30 @@ async function refresh() {
         <CopyField :value="endpoint" label="DNS over HTTPS endpoint" />
       </div>
 
+      <!-- Tag builder: one URL per device, so the log shows who asked -->
+      <div class="mt-3 flex flex-col gap-1.5">
+        <input
+          v-model="tag"
+          @input="tag = $event.target.value"
+          type="text"
+          class="field st sm:w-64"
+          placeholder="per-client tag, e.g. laptop"
+          aria-label="Client tag for the DoH URL"
+          autocapitalize="none"
+          spellcheck="false"
+          :aria-invalid="Boolean(tagProblem)"
+          maxlength="63"
+        />
+        <CopyField
+          v-if="tagOk"
+          :value="taggedEndpoint"
+          label="Tagged DoH endpoint"
+        />
+        <p class="hint" :class="tagProblem && 'text-block'" aria-live="polite">
+          {{ tagProblem || 'Optional: copy the tagged URL instead and every query from that device is labelled on the Logs page, where the Client filter can show it alone.' }}
+        </p>
+      </div>
+
       <div class="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1">
         <p class="hint">
           Upstream: <span class="st text-ink">{{ state.upstream?.label || '—' }}</span> ·
@@ -127,6 +163,16 @@ async function refresh() {
 
     <Modal :open="setupOpen" title="Point a client at this resolver" @close="setupOpen = false">
       <CopyField :value="endpoint" label="DNS over HTTPS endpoint" />
+      <CopyField
+        v-if="tagOk"
+        class="mt-2.5"
+        :value="taggedEndpoint"
+        label="Tagged DoH endpoint"
+      />
+      <p v-if="tagOk" class="hint mt-2">
+        The tagged URL works in every guide below; queries logged through it carry the
+        <span class="st">{{ tag.trim().toLowerCase() }}</span> client tag.
+      </p>
 
       <div class="mt-4">
         <Segmented

@@ -437,14 +437,17 @@ export async function handleApi(request, env, url, ctx) {
       return json({ error: 'D1 logging not configured', code: 'no_d1' }, { status: 501 });
     }
 
-    // GET /api/logs/stats -> aggregate overview (status mix, top blocked, volume)
+    // GET /api/logs/stats -> aggregate overview (status mix, top blocked, clients, volume)
     if (path === '/api/logs/stats' && request.method === 'GET') {
-      const [byStatus, topBlocked, last24h, total] = await Promise.all([
+      const [byStatus, topBlocked, topClients, last24h, total] = await Promise.all([
         logs.prepare('SELECT status, COUNT(*) AS n FROM dns_logs GROUP BY status').all(),
         logs.prepare(
           "SELECT domain, COUNT(*) AS n FROM dns_logs " +
           "WHERE status IN ('deny','blocklist','tld','keyword','rebind','idn') " +
           'GROUP BY domain ORDER BY n DESC LIMIT ?').bind(10).all(),
+        logs.prepare(
+          'SELECT client, COUNT(*) AS n FROM dns_logs ' +
+          'WHERE client IS NOT NULL GROUP BY client ORDER BY n DESC LIMIT ?').bind(10).all(),
         logs.prepare(
           'SELECT (ts / 3600000) % 24 AS hour, COUNT(*) AS n FROM dns_logs ' +
           'WHERE ts >= ? GROUP BY hour ORDER BY hour')
@@ -457,6 +460,7 @@ export async function handleApi(request, env, url, ctx) {
         total: total.n,
         byStatus: { rows: byStatus.results, total: total.n },
         topBlocked: topBlocked.results,
+        topClients: topClients.results,
         last24h: buckets,
       });
     }
@@ -470,26 +474,31 @@ export async function handleApi(request, env, url, ctx) {
     }
 
     if (path === '/api/logs') {
-      const search = (url.searchParams.get('search') || '').trim();
+      const search = (url.searchParams.get('search') || '').trim().toLowerCase();
       const status = url.searchParams.get('status') || '';
+      // Client filter: an exact tag, or untagged=1 for rows logged without one.
+      const client = (url.searchParams.get('client') || '').trim().toLowerCase();
+      const untagged = url.searchParams.get('untagged') === '1';
 
       const { where, args } = buildWhere([
         [search ? 'domain LIKE ?' : '', search ? `%${search}%` : ''],
         [status ? 'status = ?' : '', status],
+        [client ? 'client = ?' : '', client],
       ]);
+      const cond = untagged ? (where ? `${where} AND client IS NULL` : 'WHERE client IS NULL') : where;
 
-      // GET /api/logs?search=&status=&limit=&offset=
+      // GET /api/logs?search=&status=&client=&untagged=&limit=&offset=
       if (request.method === 'GET') {
         const limit = Math.min(parseInt(url.searchParams.get('limit') || '100', 10) || 100, 500);
         const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0);
 
         const total = (await logs
-          .prepare('SELECT COUNT(*) AS n FROM dns_logs' + where)
+          .prepare('SELECT COUNT(*) AS n FROM dns_logs' + cond)
           .bind(...args)
           .first()).n;
 
         const { results } = await logs
-          .prepare('SELECT id, domain, status, filter, qtype, ts FROM dns_logs' + where +
+          .prepare('SELECT id, domain, status, filter, qtype, ts, client FROM dns_logs' + cond +
                    ' ORDER BY ts DESC LIMIT ? OFFSET ?')
           .bind(...args, limit, offset)
           .all();
@@ -497,12 +506,13 @@ export async function handleApi(request, env, url, ctx) {
         return json({ logs: results, total });
       }
 
-      // DELETE /api/logs?search=&status=&clear=1  -> delete matching (or all with clear=1)
+      // DELETE /api/logs?search=&status=&client=&untagged=&clear=1
+      // -> delete matching (or all with clear=1)
       if (request.method === 'DELETE') {
-        if (!where && url.searchParams.get('clear') !== '1') {
+        if (!cond && url.searchParams.get('clear') !== '1') {
           return json({ error: 'use ?clear=1 to delete all logs' }, { status: 400 });
         }
-        await logs.prepare('DELETE FROM dns_logs' + where).bind(...args).run();
+        await logs.prepare('DELETE FROM dns_logs' + cond).bind(...args).run();
         return json({ ok: true });
       }
     }

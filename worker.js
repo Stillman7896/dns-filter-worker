@@ -205,7 +205,8 @@ const LOGS_CREATE =
   'status TEXT NOT NULL, ' +
   'filter TEXT NOT NULL, ' +
   'ts INTEGER NOT NULL, ' +
-  'qtype INTEGER)';
+  'qtype INTEGER, ' +
+  'client TEXT)';
 
 /** Never throws — logging must not break DNS responses. */
 /**
@@ -215,8 +216,9 @@ const LOGS_CREATE =
  * @param {string} filter
  * @param {string|number} qtype 'unknown' for nxdomain/refused paths
  * @param {number} retentionDays
+ * @param {string|null} client tag from the DoH URL, null when untagged
  */
-async function logQuery(env, domain, status, filter, qtype, retentionDays) {
+async function logQuery(env, domain, status, filter, qtype, retentionDays, client) {
   if (!env.LOGS) return;
   try {
     if (!logsReady) {
@@ -224,16 +226,18 @@ async function logQuery(env, domain, status, filter, qtype, retentionDays) {
       logsReady = true;
     }
     if (!logsMigrated) {
-      // Tables created before qtype existed lack the column. CREATE TABLE
-      // IF NOT EXISTS no-ops on them; a fresh table then errors with
-      // "duplicate column" here, which we swallow.
-      try { await env.LOGS.prepare('ALTER TABLE dns_logs ADD COLUMN qtype INTEGER').run(); }
-      catch { /* already present */ }
+      // Tables created before qtype/client existed lack the columns.
+      // CREATE TABLE IF NOT EXISTS no-ops on them; ALTER then errors with
+      // "duplicate column" on anything already present, which we swallow.
+      for (const col of ['qtype INTEGER', 'client TEXT']) {
+        try { await env.LOGS.prepare(`ALTER TABLE dns_logs ADD COLUMN ${col}`).run(); }
+        catch { /* column already present */ }
+      }
       logsMigrated = true;
     }
     await env.LOGS
-      .prepare('INSERT INTO dns_logs (domain, status, filter, ts, qtype) VALUES (?, ?, ?, ?, ?)')
-      .bind(domain, status, filter, Date.now(), qtype === null || qtype === undefined ? null : qtype)
+      .prepare('INSERT INTO dns_logs (domain, status, filter, ts, qtype, client) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(domain, status, filter, Date.now(), qtype === null || qtype === undefined ? null : qtype, client)
       .run();
 
     logCount++;
@@ -373,11 +377,32 @@ async function respond(bytes, key, maxAge, ctx) {
 
 // ---- Main query handler ----
 
+/** A tag is 1-63 chars of [a-z0-9_-], lowercased; the first char is a letter/digit. */
+const TAG_RE = /^[a-z0-9](?:[a-z0-9_-]{0,62})$/;
+
+/**
+ * Client tag next to the DoH URL: `?tag=` wins over a `/dns-query/<tag>`
+ * suffix. Returns the tag, null when the request is untagged, or undefined
+ * when whatever was sent cannot be a tag (caller replies 400).
+ * @param {URL} url @returns {string|null|undefined}
+ */
+function clientTag(url) {
+  const param = (url.searchParams.get('tag') || '').trim().toLowerCase();
+  if (param) return TAG_RE.test(param) ? param : undefined;
+  const m = url.pathname.match(/^\/dns-query\/([^/?]+)$/);
+  if (!m) return null;
+  let raw;
+  try { raw = decodeURIComponent(m[1]); } catch { return undefined; }
+  raw = raw.trim().toLowerCase();
+  return TAG_RE.test(raw) ? raw : undefined;
+}
+
 /**
  * @param {Uint8Array} queryBuf @param {Env} env @param {ExecutionContext} [ctx]
+ * @param {string|null} client
  * @returns {Promise<Response>}
  */
-async function handleQuery(queryBuf, env, ctx) {
+async function handleQuery(queryBuf, env, ctx, client = null) {
   const q = parseQuestion(queryBuf);
   if (!q) return new Response('malformed DNS message', { status: 400 });
 
@@ -400,7 +425,7 @@ async function handleQuery(queryBuf, env, ctx) {
     // identical whether an answer came from cache or upstream.
     const verdict = runQueryFilters(stores, settings, q.name);
     if (BLOCKED_QUERY_STATUSES.has(verdict.status) || logPassed) {
-      await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
+      await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention, client));
     }
     return hit;
   }
@@ -410,13 +435,13 @@ async function handleQuery(queryBuf, env, ctx) {
   // A response route is a direct answer: no upstream, no cache miss, and it
   // outranks every block layer (that is why the user set it).
   if (verdict.route) {
-    await bg(ctx, logQuery(env, q.name, 'route', 'route', q.qtype, retention));
+    await bg(ctx, logQuery(env, q.name, 'route', 'route', q.qtype, retention, client));
     const records = routeRecords(verdict.route, q.name, q.qtype);
     return respond(buildAnswerResponse(queryBuf, records), key, verdict.route.ttl, ctx);
   }
 
   if (BLOCKED_QUERY_STATUSES.has(verdict.status)) {
-    await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
+    await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention, client));
     const maxAge = verdict.filter === 'denylist' ? RULE_MAX_AGE : BLOCKED_MAX_AGE;
     return respond(buildNxdomainResponse(queryBuf), key, maxAge, ctx);
   }
@@ -428,14 +453,14 @@ async function handleQuery(queryBuf, env, ctx) {
     if (verdict.status === 'none' && settings.rebindProtection) {
       const priv = privateAnswerIP(answer);
       if (priv) {
-        await bg(ctx, logQuery(env, q.name, 'rebind', 'rebind', q.qtype, retention));
+        await bg(ctx, logQuery(env, q.name, 'rebind', 'rebind', q.qtype, retention, client));
         // Every answer can differ here; never cache the verdict (TTL only
         // tells the client not to re-ask before re-resolving).
         return respond(buildNxdomainResponse(queryBuf), '', RULE_MAX_AGE, ctx);
       }
     }
     if (logPassed) {
-      await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
+      await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention, client));
     }
     return respond(answer, key, minTtl(answer), ctx);
   } catch {
@@ -443,7 +468,7 @@ async function handleQuery(queryBuf, env, ctx) {
   }
 
   if (logPassed) {
-    await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention));
+    await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention, client));
   }
   return upstreamFailure(queryBuf);
 }
@@ -539,10 +564,17 @@ export default {
       }
     }
 
-    // ---- /dns-query ----
-    if (url.pathname !== '/dns-query') {
+    // ---- /dns-query, optionally suffixed with the client tag ----
+    const dnsPath = url.pathname.match(/^\/dns-query(?:\/([^/?]+))?$/);
+    if (!dnsPath) {
       if (env.ASSETS) return env.ASSETS.fetch(request);
       return new Response('Not Found', { status: 404 });
+    }
+    // `?tag=phone` or `/dns-query/phone` labels the client in the query log;
+    // an unusable tag fails fast so a typo never silently logs as untagged.
+    const tag = clientTag(url);
+    if (tag === undefined) {
+      return new Response('invalid client tag: use 1-63 chars of a-z 0-9 - _', { status: 400 });
     }
 
     if (request.method === 'GET') {
@@ -557,7 +589,7 @@ export default {
       // Validation first: malformed requests never pay for a blocklist load.
       const ready = await ensureReady(env, ctx);
       if (ready) return ready;
-      return handleQuery(buf, env, ctx);
+      return handleQuery(buf, env, ctx, tag);
     }
 
     if (request.method === 'POST') {
@@ -571,7 +603,7 @@ export default {
       }
       const ready = await ensureReady(env, ctx);
       if (ready) return ready;
-      return handleQuery(Buf.from(new Uint8Array(raw)), env, ctx);
+      return handleQuery(Buf.from(new Uint8Array(raw)), env, ctx, tag);
     }
 
     return new Response('Method Not Allowed', { status: 405 });

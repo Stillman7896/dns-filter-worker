@@ -28,7 +28,7 @@ export const state = reactive({
   upstream: null,
   upstreamPresets: [],
 
-  logs: { rows: [], total: 0, search: '', status: '', limit: 50, offset: 0 },
+  logs: { rows: [], total: 0, search: '', status: '', client: '', limit: 50, offset: 0 },
   stats: null,
   statsError: null,
 
@@ -214,7 +214,7 @@ export async function signOut() {
   state.upstreamPresets = [];
   state.stats = null;
   state.statsError = null;
-  state.logs = { rows: [], total: 0, search: '', status: '', limit: state.logs.limit, offset: 0 };
+  state.logs = { rows: [], total: 0, search: '', status: '', client: '', limit: state.logs.limit, offset: 0 };
   dismissTimers.forEach((t) => clearTimeout(t));
   dismissTimers.clear();
   state.toasts = [];
@@ -239,8 +239,16 @@ export async function loadLists() {
 }
 
 export async function loadLogs() {
-  const { search, status, limit, offset } = state.logs;
-  const data = await api.logs({ search, status, limit, offset });
+  const { search, status, client, limit, offset } = state.logs;
+  // 'untagged' is a UI-only pick of the client select meaning `client IS NULL`.
+  const data = await api.logs({
+    search,
+    status,
+    client: client && client !== 'untagged' ? client : '',
+    untagged: client === 'untagged' ? 1 : '',
+    limit,
+    offset,
+  });
   state.logs.rows = data.logs;
   state.logs.total = data.total;
 }
