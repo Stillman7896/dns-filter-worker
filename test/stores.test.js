@@ -177,6 +177,18 @@ test('normalizeDomain: schemes, wildcards, ports, trailing dots, junk', () => {
   assert.equal(normalizeDomain('x'.repeat(300) + '.com'), '');
 });
 
+test('normalizeDomain: internationalized names -> A-labels', () => {
+  assert.equal(normalizeDomain('Bücher.DE'), 'xn--bcher-kva.de');
+  assert.equal(normalizeDomain('https://例子.中国/路径?x=1'), 'xn--fsqu00a.xn--fiqs8s');
+  assert.equal(normalizeDomain('*.вася.рф'), 'xn--80ad0c0c.xn--p1ai', 'wildcard stripped first');
+  assert.equal(normalizeDomain('日本語.jp。'), 'xn--wgv71a119e.jp', 'U+3002 maps to a dot');
+  assert.equal(normalizeDomain('xn--bcher-kva.de'), 'xn--bcher-kva.de', 'already ASCII');
+  assert.equal(normalizeDomain('example.com.'), 'example.com');
+  assert.equal(normalizeDomain('аа'), '', 'no dot after conversion');
+  assert.equal(normalizeDomain('bad\ttab\u0000null'), '', 'control chars never pass');
+  assert.equal(normalizeDomain('a b.com'), '', 'space still rejected for ASCII input');
+});
+
 // ---- TextSetStore --------------------------------------------------------------
 
 test('TextSetStore: TLD normalization + add/remove', async () => {

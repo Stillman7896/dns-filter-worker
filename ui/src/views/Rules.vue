@@ -154,7 +154,7 @@ function onFilter(e) {
         v-model="bulkText"
         @input="bulkText = $event.target.value"
         rows="7"
-        class="w-full mt-3 rounded-md bg-raised border border-line p-3 st text-[13px] focus:outline-none focus:border-beacon focus:ring-1 focus:ring-beacon/40"
+        class="area w-full mt-3"
         placeholder="ads.example.net&#10;beacon.partner.dev&#10;tracker.example.com"
         spellcheck="false"
         aria-label="Domains to import"

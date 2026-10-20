@@ -7,6 +7,7 @@
 //   { rules, settings, keywords, tlds, testFn }
 
 import { normalizeDomain } from './rules.js';
+import { toUnicode } from './idn.js';
 import { normalizeRoute } from './routing.js';
 import { normalizeTld, normalizeKeyword } from './lists.js';
 import { clampRetention, DEFAULT_SETTINGS } from './settings.js';
@@ -249,7 +250,13 @@ export async function handleApi(request, env, url, ctx) {
     const domain = normalizeDomain(url.searchParams.get('domain') || '');
     if (!domain) return json({ error: 'invalid domain' }, { status: 400 });
     if (typeof testFn !== 'function') return json({ error: 'test not available' }, { status: 501 });
-    return json(await testFn(domain, env));
+
+    // The pipeline only ever sees ASCII labels, so an internationalized probe
+    // reports both spellings: `domain` is what was matched, `unicode` is the
+    // same name the human typed (null when they are identical).
+    const unicode = toUnicode(domain);
+    const result = await testFn(domain, env);
+    return json({ ...result, unicode: unicode === domain ? null : unicode });
   }
 
   // ---- settings (KV, persistent) ----

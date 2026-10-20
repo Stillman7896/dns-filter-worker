@@ -5,6 +5,8 @@
 import { UPSTREAM_PRESETS, findPreset, probeUpstream, resolveUpstream } from '../../upstream.js';
 import { normalizeRoute } from '../../routing.js';
 import { normalizeTld, normalizeKeyword } from '../../lists.js';
+import { normalizeDomain } from '../../rules.js';
+import { toUnicode } from '../../idn.js';
 
 const SESSION_COOKIE = 'dns_dash_session';
 const PASSWORD = 'demo';
@@ -201,7 +203,7 @@ export function mockApi(req, res, next) {
 
     // ---- probe ----
     if (p === '/api/test' && req.method === 'GET') {
-      const domain = (url.searchParams.get('domain') || '').trim().toLowerCase();
+      const domain = normalizeDomain(url.searchParams.get('domain') || '');
       if (!domain) return json(res, 400, { error: 'invalid domain' });
       const rule = fixtures.rules.find((r) => domain === r.domain || domain.endsWith('.' + r.domain));
       const keyword = fixtures.keywords.find((k) => domain.includes(k));
@@ -212,8 +214,10 @@ export function mockApi(req, res, next) {
       else if (fixtures.settings.tldBlock && fixtures.tlds.includes(tld)) { status = 'tld'; filter = 'blocked tlds'; matched = tld; }
       else if (fixtures.settings.keywordBlock && keyword) { status = 'keyword'; filter = 'blocked keywords'; matched = keyword; }
       else if (domain.includes('.local') || domain.endsWith('.internal')) { status = 'rebind'; filter = 'rebinding'; matched = 'internal'; }
+      const unicode = toUnicode(domain);
       return json(res, 200, {
-        domain, status, filter, matched, blocklistSize: 184392,
+        domain, unicode: unicode === domain ? null : unicode,
+        status, filter, matched, blocklistSize: 184392,
         note: status === 'none' && fixtures.settings.rebindProtection
           ? 'answer-level rebinding check applies after upstream resolves' : null,
       });

@@ -179,10 +179,32 @@ test('test endpoint: delegates to injected pipeline', async () => {
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), {
     domain: 'example.com', status: 'none', filter: 'upstream', matched: null,
+    unicode: null,
   });
 
   const bad = await call(ctx, env, '/api/test?domain=nodots', { cookie });
   assert.equal(bad.status, 400);
+});
+
+test('test endpoint: internationalized input probes the A-label and reports both spellings', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  const res = await call(ctx, env, `/api/test?domain=${encodeURIComponent('bücher.de')}`, { cookie });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.equal(j.domain, 'xn--bcher-kva.de', 'pipeline only ever sees the A-label');
+  assert.equal(j.unicode, 'bücher.de', 'translation rides along with the verdict');
+
+  const wire = await call(ctx, env, '/api/test?domain=xn--bcher-kva.de', { cookie });
+  assert.equal((await wire.json()).unicode, 'bücher.de', 'punycode input is translated too');
+
+  const noDot = await call(ctx, env, `/api/test?domain=${encodeURIComponent('вася')}`, { cookie });
+  assert.equal(noDot.status, 400, 'still validated as a domain');
 });
 
 // ---- settings -----------------------------------------------------------------

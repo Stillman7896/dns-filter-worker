@@ -43,8 +43,13 @@ export default defineConfig({
         'btn-ghost': 'bg-transparent text-ink border-line hover:border-muted hover:bg-raised',
         'btn-danger': 'bg-transparent text-block border-block/40 hover:bg-block hover:text-white hover:border-block',
         'btn-sm': 'h-8 px-2.5 text-[12.5px]',
+        // 16px on phones: below that Safari auto-zooms on focus, and the fixed
+        // box then clips the enlarged text. min-h keeps the control 36px tall
+        // on both ends while the padding carries the phone font size.
         field:
-          "h-9 rounded-md bg-raised border border-line px-2.5 text-[13px] text-ink placeholder-muted/70 focus:outline-none focus:border-beacon focus:ring-1 focus:ring-beacon/40",
+          "min-h-9 rounded-md bg-raised border border-line px-2.5 py-1.5 text-[16px] text-ink placeholder-muted/70 focus:outline-none focus:border-beacon focus:ring-1 focus:ring-beacon/40 sm:py-0 sm:text-[13px]",
+        area:
+          "rounded-md bg-raised border border-line p-3 st text-[16px] leading-snug placeholder-muted/70 focus:outline-none focus:border-beacon focus:ring-1 focus:ring-beacon/40 sm:text-[13px]",
         label: 'block text-[13px] font-medium text-ink',
         hint: 'text-[12.5px] text-muted leading-snug',
         panel: 'rounded-lg border border-line bg-surface',

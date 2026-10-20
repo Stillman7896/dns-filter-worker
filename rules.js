@@ -12,6 +12,7 @@
 // one-time cleanup command.
 
 import { DATA_VERSION_KEY, readSharedVersion, noteSharedVersion } from './lists.js';
+import { toAscii } from './idn.js';
 
 const RULES_KEY = 'rules:data';
 const LEGACY_PREFIX = 'rule:';
@@ -268,6 +269,9 @@ export function normalizeDomain(raw) {
   if (typeof raw !== 'string') return '';
   let s = raw.trim().toLowerCase();
   if (!s) return '';
+  // URL's parser silently deletes tabs and newlines — drop them first so an
+  // internationalized input cannot be rewritten into a different name.
+  if (/[\t\n\r]/.test(s)) return '';
 
   s = s.replace(/^[a-z]+:\/\//, '');
   const slash = s.indexOf('/');
@@ -278,6 +282,15 @@ export function normalizeDomain(raw) {
 
   if (s.startsWith('*.')) s = s.slice(2);
   else if (s.startsWith('.')) s = s.slice(1);
+
+  // IDN input ("bücher.de", "例子.中国") becomes the A-label the resolver
+  // would see on the wire. Only non-ASCII takes this path: URL's parser also
+  // repairs things (stray tabs, embedded spaces) that the ASCII rules below
+  // must keep rejecting.
+  if (/[^\p{ASCII}]/u.test(s)) {
+    s = toAscii(s);
+    if (!s) return '';
+  }
 
   if (s.endsWith('.')) s = s.slice(0, -1);
 

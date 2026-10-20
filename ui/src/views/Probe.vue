@@ -5,7 +5,10 @@ import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import StatusPill from '../components/StatusPill.vue';
 import { loadProbeHistory, rememberProbe, clearProbeHistory } from '../probeHistory.js';
-import { normalizeDomain } from '../validate.js';
+import { normalizeDomain, toUnicode } from '../validate.js';
+
+const DEFAULT_NOTE =
+  'Runs the full server-side pipeline: allow and deny rules first, then the blocklist and policies.';
 
 const domain = ref('');
 const result = ref(null);
@@ -15,6 +18,25 @@ const history = ref(loadProbeHistory());
 // field refuses those values up front instead of spending a request on them.
 const normalized = computed(() => normalizeDomain(domain.value.trim()));
 const invalid = computed(() => Boolean(domain.value.trim()) && !normalized.value);
+
+// Foreign input is legal, but DNS only ever carries ASCII labels: the probe
+// sends the punycode A-label and the note says so before the request goes out.
+const foreign = computed(() => /[^\p{ASCII}]/u.test(domain.value));
+const note = computed(() => {
+  if (invalid.value) return 'Needs a real domain, like sub.example.com.';
+  if (!normalized.value) return DEFAULT_NOTE;
+  if (foreign.value) return `DNS carries ASCII only — sending ${normalized.value}.`;
+  const readable = toUnicode(normalized.value);
+  if (readable !== normalized.value) return `${normalized.value} is punycode for ${readable}.`;
+  return DEFAULT_NOTE;
+});
+
+/** Readable spelling of an A-label, or '' when the name needs no translation.
+ * @param {string} name @returns {string} */
+function asUnicode(name) {
+  const u = toUnicode(name || '');
+  return u && u !== name ? u : '';
+}
 
 async function probe() {
   const value = normalized.value;
@@ -75,8 +97,12 @@ function ago(ts) {
           class="field flex-1 st"
           placeholder="sub.example.com"
           aria-label="Domain to test"
+          dir="auto"
+          autocomplete="off"
           autocapitalize="none"
+          autocorrect="off"
           spellcheck="false"
+          enterkeyhint="go"
           :aria-invalid="invalid"
           aria-describedby="probe-note"
         />
@@ -85,9 +111,7 @@ function ago(ts) {
         </AppButton>
       </form>
       <p id="probe-note" class="hint mt-2.5" :class="invalid && 'text-block'" aria-live="polite">
-        {{ invalid
-          ? 'Needs a real domain, like sub.example.com.'
-          : 'Runs the full server-side pipeline: allow and deny rules first, then the blocklist and policies.' }}
+        {{ note }}
       </p>
     </section>
 
@@ -103,13 +127,25 @@ function ago(ts) {
           {{ actionWord(result) }}
         </span>
         <StatusPill :status="result.status" />
-        <span class="st text-[13.5px] text-muted">{{ result.domain }}</span>
+        <span class="st text-[13.5px] text-muted break-all">{{ result.domain }}</span>
+        <span
+          v-if="result.unicode"
+          class="text-[13.5px] text-muted break-all"
+          title="Punycode above, readable spelling here"
+        >
+          · {{ result.unicode }}
+        </span>
       </div>
 
       <dl class="mt-4 grid sm:grid-cols-2 gap-x-6 gap-y-3">
         <div v-if="result.matched">
           <dt class="text-[12.5px] text-muted">Matched</dt>
-          <dd class="st text-[13.5px] mt-0.5 break-all">{{ result.matched }}</dd>
+          <dd class="st text-[13.5px] mt-0.5 break-all">
+            {{ result.matched }}
+            <span v-if="asUnicode(result.matched)" class="font-sans text-muted">
+              · {{ asUnicode(result.matched) }}
+            </span>
+          </dd>
         </div>
         <div v-if="result.filter">
           <dt class="text-[12.5px] text-muted">Decided by</dt>
@@ -153,7 +189,9 @@ function ago(ts) {
         @click="reuse(h.domain)"
       >
         <StatusPill :status="h.status" />
-        <span class="st text-[13px] truncate flex-1">{{ h.domain }}</span>
+        <span class="st text-[13px] truncate flex-1" :title="h.domain">
+          {{ asUnicode(h.domain) || h.domain }}
+        </span>
         <span class="text-[12px] text-muted whitespace-nowrap">{{ ago(h.ts) }}</span>
       </button>
     </section>
