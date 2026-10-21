@@ -11,6 +11,7 @@ const TOKENS = {
   blocklist: { text: 'blocklist', cls: 'text-block border-block/40' },
   tld: { text: 'TLD rule', cls: 'text-block border-block/40' },
   keyword: { text: 'keyword', cls: 'text-block border-block/40' },
+  regex: { text: 'regex', cls: 'text-block border-block/40' },
   rebind: { text: 'rebinding', cls: 'text-block border-block/40' },
   idn: { text: 'punycode', cls: 'text-block border-block/40' },
 };

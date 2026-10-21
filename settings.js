@@ -18,6 +18,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   idnBlock: false,        // block all punycode / non-ASCII labels (homograph defense)
   tldBlock: false,        // block queries whose TLD is in the Blocked-TLD list
   keywordBlock: false,    // block queries containing any Blocked-keyword
+  regexBlock: false,      // block queries matching any Blocked-regex pattern
   logPassed: true,        // write allow/none rows to dns_logs; false = blocks only
   logRetentionDays: 30,   // delete dns_logs rows older than this; 0 = keep forever
   upstreamPreset: '',     // provider id from upstream.js; '' = deploy variable, else built-in default
@@ -54,6 +55,9 @@ export class SettingsStore {
     this.cache = { ...DEFAULT_SETTINGS };
     this.loaded = false;
     this.cachedAt = 0;
+    // A load still in flight belongs to the PREVIOUS binding: let it settle on
+    // its own (drop the promise reference), refresh() below will start fresh.
+    this.loading = null;
   }
 
   /**
@@ -66,9 +70,11 @@ export class SettingsStore {
     if (this.cachedAt && !force && now - this.cachedAt < CACHE_TTL_MS) return;
 
     if (!this.loading) {
+      const kv = this.kv; // snapshot: a bind() mid-load must not receive these results
       this.loading = (async () => {
         try {
-          const raw = await this.kv.get(SETTINGS_KEY, 'text');
+          const raw = await kv.get(SETTINGS_KEY, 'text');
+          if (this.kv !== kv) return; // binding changed: a newer refresh owns the cache
           if (raw) {
             let parsed = {};
             try { parsed = JSON.parse(raw); } catch { /* fall back to defaults */ }
@@ -84,7 +90,7 @@ export class SettingsStore {
           // silently reset a user's toggles (e.g. turn idnBlock off).
           if (!this.loaded) this.cache = { ...DEFAULT_SETTINGS };
         } finally {
-          this.cachedAt = Date.now();
+          if (this.kv === kv) this.cachedAt = Date.now(); // only stamp our own binding
           this.loading = null;
         }
       })();

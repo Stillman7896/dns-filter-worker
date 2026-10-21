@@ -3,7 +3,7 @@
 // exact same rules the API validates with — no second opinion to drift.
 export { normalizeDomain } from '../../rules.js';
 export { toAscii, toUnicode } from '../../idn.js';
-export { normalizeTld, normalizeKeyword } from '../../lists.js';
+export { normalizeTld, normalizeKeyword, normalizeRegex } from '../../lists.js';
 export { normalizeRouteValue } from '../../routing.js';
 
 /** Same test the API applies to a custom provider URL.

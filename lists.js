@@ -113,6 +113,23 @@ export function normalizeKeyword(raw) {
   return /^[a-z0-9.-]{4,64}$/.test(raw) ? raw : '';
 }
 
+/**
+ * Regex validation: the pattern is stored verbatim and matched against the
+ * lowercase QNAME. Bounds exist because a pattern is a hot-path cost paid on
+ * every query: 4–128 chars, no whitespace, and it must compile. `new RegExp`
+ * in V8 is linear-time to construct; the length cap is the ReDoS guard
+ * (nested quantifiers need room to breathe).
+ * @param {unknown} raw @returns {string}
+ */
+export function normalizeRegex(raw) {
+  if (typeof raw !== 'string') return '';
+  const s = raw.trim();
+  if (s.length < 4 || s.length > 128) return '';
+  if (/\s/.test(s)) return '';
+  try { new RegExp(s, 'i'); } catch { return ''; }
+  return s;
+}
+
 export class TextSetStore {
   /**
    * `validate` normalizes/validates every entry (add, remove, blob load).

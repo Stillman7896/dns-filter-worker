@@ -1,7 +1,8 @@
 // worker.js — DoH filter
 // Query path: qclass guard -> response route -> answer cache -> custom
 //           allowlist -> denylist -> blocklist -> blocked TLD -> blocked
-//           keyword -> rebinding -> IDN -> upstream -> answer-level rebinding
+//           keyword -> regex -> rebinding -> IDN -> upstream -> answer-level
+//           rebinding
 // Response path: answers cached under a normalized key (config epoch + name +
 //           type + DO bit), transaction ID patched per client on hits.
 //
@@ -13,8 +14,8 @@ import { Blocklist, DEFAULT_BLOCKLIST_URL } from './blocklist.js';
 import { RuleStore } from './rules.js';
 import { SettingsStore } from './settings.js';
 import { RouteStore, routeRecords } from './routing.js';
-import { TextSetStore, normalizeKeyword } from './lists.js';
-import { runQueryFilters, privateAnswerIP, BLOCKED_QUERY_STATUSES } from './filters.js';
+import { TextSetStore, normalizeKeyword, normalizeRegex } from './lists.js';
+import { runQueryFilters, privateAnswerIP, BLOCKED_QUERY_STATUSES, RegexEngine } from './filters.js';
 import { resolveUpstream } from './upstream.js';
 import { odohForward } from './odoh.js';
 import { handleApi } from './dashboard.js';
@@ -45,8 +46,10 @@ const ruleStore = new RuleStore(/** @type {KVLike} */ (/** @type {unknown} */ (n
 const settingsStore = new SettingsStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
 const routeStore = new RouteStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)));
 const keywordStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'keywords:data', normalizeKeyword);
+const regexStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'regex:data', normalizeRegex);
+const regexEngine = new RegexEngine(regexStore);
 const tldStore = new TextSetStore(/** @type {KVLike} */ (/** @type {unknown} */ (null)), 'tlds:data');
-const stores = { ruleStore, blocklist, keywordStore, tldStore, routeStore };
+const stores = { ruleStore, blocklist, keywordStore, regex: regexEngine, tldStore, routeStore };
 
 /** @type {KVLike|null} */
 let boundKv = null;
@@ -65,6 +68,7 @@ function ensureKv(env) {
   settingsStore.bind(/** @type {KVLike} */ (kv));
   routeStore.bind(/** @type {KVLike} */ (kv));
   keywordStore.bind(/** @type {KVLike} */ (kv));
+  regexStore.bind(/** @type {KVLike} */ (kv));
   tldStore.bind(/** @type {KVLike} */ (kv));
 }
 
@@ -188,6 +192,7 @@ async function refreshStores() {
     ruleStore.refresh(),
     routeStore.refresh(),
     keywordStore.refresh(),
+    regexStore.refresh(),
     tldStore.refresh(),
   ]);
 }
@@ -294,6 +299,7 @@ function configEpoch(settings, upstream) {
     (settings.idnBlock ? 1 : 0) +
     (settings.tldBlock ? 1 : 0) +
     (settings.keywordBlock ? 1 : 0) +
+    (settings.regexBlock ? 1 : 0) +
     // Changing provider must never serve answers cached from the old one.
     '|' + upstream.kind + '|' + upstream.url + '|' + upstream.relay;
 }
@@ -528,6 +534,7 @@ export default {
         rules: ruleStore,
         routes: routeStore,
         keywords: keywordStore,
+        regex: regexStore,
         tlds: tldStore,
         blocklist,
         settings: settingsStore,
@@ -546,6 +553,7 @@ export default {
         customRules: ruleStore.rules.size,
         routes: routeStore.routes.size,
         keywords: keywordStore.get().size,
+        regexRules: regexStore.get().size,
         blockedTlds: tldStore.get().size,
         settings: settingsStore.get(),
         blocklistUrl: env.BLOCKLIST_URL || DEFAULT_BLOCKLIST_URL,

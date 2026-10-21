@@ -630,3 +630,29 @@ test('upstream: choosing a provider in settings changes where queries go', async
     globalThis.fetch = savedFetch;
   }
 });
+
+// ---- regex filter ----------------------------------------------------------------
+
+test('regex: regexBlock=true blocks a matching name, non-matching passes upstream', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV({ 'settings:main': JSON.stringify({ regexBlock: true }) });
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv, d1 });
+  kv.data.set('regex:data', '^ads\\d+\\.tracker\\.example\\.com$');
+  kv.data.set('data:version', String(Date.now()));
+
+  const blocked = new Uint8Array(await (await dohGet(env, buildQuery('ads42.tracker.example.com', { id: 0x4242 }))).arrayBuffer());
+  assert.equal(rcode(blocked), 3, 'NXDOMAIN before any upstream call');
+  assert.equal((blocked[0] << 8) | blocked[1], 0x4242, 'transaction ID preserved');
+
+  const passed = new Uint8Array(await (await dohGet(env, buildQuery('clean.tracker.example.com', { id: 0x4343 }))).arrayBuffer());
+  assert.equal(rcode(passed), 0, 'name the pattern does not match still resolves');
+  assert.equal(ancount(passed), 1);
+
+  assert.equal(d1.rows.length, 2);
+  assert.deepEqual(
+    { domain: d1.rows[0].domain, status: d1.rows[0].status, filter: d1.rows[0].filter },
+    { domain: 'ads42.tracker.example.com', status: 'regex', filter: 'regex' },
+  );
+  assert.equal(d1.rows[1].status, 'none', 'non-matching query logged as none');
+});

@@ -196,11 +196,12 @@ test('filters: a route outranks allow/deny rules and the blocklist', () => {
   });
   const blocklist = /** @type {any} */ ({ match: () => null });
   const keywordStore = /** @type {any} */ ({ get: () => new Set() });
+  const regex = /** @type {any} */ ({ test: () => null });
   const tldStore = /** @type {any} */ ({ get: () => new Set() });
 
   const verdict = runQueryFilters(
-    { routeStore, ruleStore, blocklist, keywordStore, tldStore },
-    { rebindProtection: true, idnBlock: false, tldBlock: false, keywordBlock: false },
+    { routeStore, ruleStore, blocklist, keywordStore, regex, tldStore },
+    { rebindProtection: true, idnBlock: false, tldBlock: false, keywordBlock: false, regexBlock: false },
     'img.media.example.com',
   );
   assert.equal(verdict.status, 'route');
@@ -209,8 +210,8 @@ test('filters: a route outranks allow/deny rules and the blocklist', () => {
 
   // Without the route store the deny rule decides, exactly as before.
   const denied = runQueryFilters(
-    { ruleStore, blocklist, keywordStore, tldStore },
-    { rebindProtection: true, idnBlock: false, tldBlock: false, keywordBlock: false },
+    { ruleStore, blocklist, keywordStore, regex, tldStore },
+    { rebindProtection: true, idnBlock: false, tldBlock: false, keywordBlock: false, regexBlock: false },
     'img.media.example.com',
   );
   assert.equal(denied.status, 'deny');

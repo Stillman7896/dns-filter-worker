@@ -8,7 +8,7 @@ export const VIEWS = [
   { id: 'rules', label: 'Rules', verb: 'Add allow or deny rules', group: 'traffic' },
   { id: 'probe', label: 'Probe', verb: 'Test one domain', group: 'traffic' },
   { id: 'logs', label: 'Logs', verb: 'Read the query log', group: 'traffic' },
-  { id: 'lists', label: 'Filter lists', verb: 'Manage blocked TLDs and keywords', group: 'config' },
+  { id: 'lists', label: 'Filter lists', verb: 'Manage blocked TLDs, keywords and regex', group: 'config' },
   { id: 'settings', label: 'Settings', verb: 'Change resolver, routes and logging', group: 'config' },
   { id: 'backup', label: 'Backup', verb: 'Export or import configuration', group: 'config' },
 ];
@@ -23,6 +23,7 @@ export const state = reactive({
   ruleFilter: '',
   routes: [],
   keywords: [],
+  regex: [],
   tlds: [],
   settings: null,
   upstream: null,
@@ -208,6 +209,7 @@ export async function signOut() {
   state.rules = [];
   state.routes = [];
   state.keywords = [];
+  state.regex = [];
   state.tlds = [];
   state.settings = null;
   state.upstream = null;
@@ -233,8 +235,9 @@ export async function loadRoutes() {
 }
 
 export async function loadLists() {
-  const [k, t] = await Promise.all([api.listItems('keywords'), api.listItems('tlds')]);
+  const [k, r, t] = await Promise.all([api.listItems('keywords'), api.listItems('regex'), api.listItems('tlds')]);
   state.keywords = k.items;
+  state.regex = r.items;
   state.tlds = t.items;
 }
 

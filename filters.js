@@ -12,7 +12,7 @@ export const INTERNAL_TLDS = new Set([
 
 /** Statuses answered with NXDOMAIN instead of forwarded. */
 export const BLOCKED_QUERY_STATUSES = new Set([
-  'deny', 'blocklist', 'tld', 'keyword', 'rebind', 'idn',
+  'deny', 'blocklist', 'tld', 'keyword', 'regex', 'rebind', 'idn',
 ]);
 
 /** Last label of a lowercased FQDN, or ''.
@@ -69,13 +69,13 @@ export function idnHit(name) {
  * A response route comes first: it is a direct answer for the name, so it
  * outranks even an explicit deny rule. The caller turns `verdict.route` into
  * answer records with routeRecords().
- * @param {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, tldStore: {get(): Set<string>}, routeStore?: {match(name: string): ({type:'a'|'aaaa'|'cname', value:string, ttl:number}&{at:string})|null}}} stores
- * @param {Pick<FilterSettings, 'rebindProtection'|'idnBlock'|'tldBlock'|'keywordBlock'>} settings
+ * @param {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, regex: {test(name: string): string|null}, tldStore: {get(): Set<string>}, routeStore?: {match(name: string): ({type:'a'|'aaaa'|'cname', value:string, ttl:number}&{at:string})|null}}} stores
+ * @param {Pick<FilterSettings, 'rebindProtection'|'idnBlock'|'tldBlock'|'keywordBlock'|'regexBlock'>} settings
  * @param {string} name lowercase QNAME
  * @returns {{status:string, filter:string, matched:string|null, route?:{type:'a'|'aaaa'|'cname', value:string, ttl:number, at:string}}}
  */
 export function runQueryFilters(stores, settings, name) {
-  const { ruleStore, blocklist, keywordStore, tldStore, routeStore } = stores;
+  const { ruleStore, blocklist, keywordStore, regex, tldStore, routeStore } = stores;
 
   // 0. response route — a fixed answer for this name and its subdomains
   const route = routeStore && routeStore.match(name);
@@ -117,6 +117,13 @@ export function runQueryFilters(stores, settings, name) {
         if (name.includes(kw)) return { status: 'keyword', filter: 'keyword', matched: kw };
       }
     }
+  }
+
+  // 5b. regex match — one test per compiled pattern; a set identity change
+  //     re-compiles, so a KV refresh is picked up on the next query.
+  if (settings.regexBlock) {
+    const hit = regex.test(name);
+    if (hit) return { status: 'regex', filter: 'regex', matched: hit };
   }
 
   // 6. DNS rebinding — internal / special-use names
@@ -218,4 +225,38 @@ export function privateAnswerIP(buf) {
     if (off > buf.length) return null;
   }
   return null;
+}
+/**
+ * Lazy regex matcher over a set of patterns. Compiles on first use and only
+ * re-compiles when the backing Set is replaced (a KV refresh), so the hot
+ * path is one `RegExp.test` per pattern — no allocation per query.
+ * Entries are [pattern, RegExp] pairs so a failed compile can never shift
+ * the pattern reported back.
+ */
+export class RegexEngine {
+  /** @param {{get(): Set<string>}} store */
+  constructor(store) {
+    this.store = store;
+    /** @type {Set<string>|null} */ this.compiledSet = null;
+    /** @type {Array<[string, RegExp]>} */ this.regexes = [];
+  }
+
+  /** @param {string} name @returns {string|null} the pattern that matched, or null */
+  test(name) {
+    const set = this.store.get();
+    if (set !== this.compiledSet) {
+      /** @type {Array<[string, RegExp]>} */
+      const compiled = [];
+      for (const p of set) {
+        try { compiled.push([p, new RegExp(p, 'i')]); } catch { /* validated at store; skip anyway */ }
+      }
+      this.regexes = compiled;
+      this.compiledSet = set;
+    }
+    const re = this.regexes;
+    for (let i = 0; i < re.length; i++) {
+      if (re[i][1].test(name)) return re[i][0];
+    }
+    return null;
+  }
 }

@@ -4,7 +4,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { RuleStore, normalizeDomain } from '../rules.js';
-import { TextSetStore, normalizeTld, normalizeKeyword, DATA_VERSION_KEY } from '../lists.js';
+import { TextSetStore, normalizeTld, normalizeKeyword, normalizeRegex, DATA_VERSION_KEY } from '../lists.js';
+import { RegexEngine } from '../filters.js';
 import { SettingsStore, DEFAULT_SETTINGS, clampRetention } from '../settings.js';
 import { FakeKV } from './helpers.js';
 
@@ -250,6 +251,40 @@ test('TextSetStore: version cache + failure keeps stale set', async () => {
   kv.fail.get = true;
   await ts.refresh(true);
   assert.deepEqual(ts.list(), ['one', 'two'], 'stale set survives failed read');
+});
+
+test('normalizeRegex validation: bounds, whitespace, compile check', () => {
+  assert.equal(normalizeRegex('^ads\\.'), '^ads\\.', 'stored verbatim after trim');
+  assert.equal(normalizeRegex('  ^ads\\.  '), '^ads\\.', 'outer whitespace trimmed');
+  assert.equal(normalizeRegex('abc'), '', 'min 4 characters');
+  assert.equal(normalizeRegex('^a b$'), '', 'no whitespace (hot-path cost, blob safety)');
+  assert.equal(normalizeRegex('(unclosed'), '', 'must compile');
+  assert.equal(normalizeRegex('a'.repeat(129)), '', 'max 128 characters');
+  assert.equal(normalizeRegex('a'.repeat(128)), 'a'.repeat(128), '128 characters is allowed');
+  assert.equal(normalizeRegex(''), '');
+  assert.equal(normalizeRegex(42), '');
+});
+
+test('RegexEngine: compile cache keyed on set identity, bad pattern does not shift pairing', async () => {
+  const kv = new FakeKV({ 'regex:data': '^ads\\.\n(tracker\\.net$' });
+  const store = new TextSetStore(kv, 'regex:data', normalizeRegex);
+  await store.refresh(true);
+  // inject an uncompilable pattern directly: the engine must skip it without
+  // reporting the wrong pattern for later matches
+  store.set.add('(never-compiles');
+  store.set.add('^a\\.[a-z]+\\.xyz$');
+
+  const eng = new RegexEngine(store);
+  assert.equal(eng.test('ads.foo.com'), '^ads\\.', 'first pattern');
+  assert.equal(eng.test('tracker.net'), null, 'invalid pattern is skipped, not thrown');
+  assert.equal(eng.test('a.b.xyz'), '^a\\.[a-z]+\\.xyz$', 'later pattern still pairs correctly');
+  const cached = eng.regexes;
+  assert.equal(eng.test('nothing.here'), null);
+  assert.equal(eng.regexes, cached, 'no recompile while the backing set is unchanged');
+
+  store.set = new Set(['^new\\..*\\.io$']);
+  assert.equal(eng.test('new.x.io'), '^new\\..*\\.io$', 'set swap recompiles');
+  assert.equal(eng.test('ads.foo.com'), null, 'dropped patterns no longer match');
 });
 
 // ---- SettingsStore -------------------------------------------------------------

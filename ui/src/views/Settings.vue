@@ -31,6 +31,12 @@ const TOGGLES = [
     route: 'lists',
   },
   {
+    key: 'regexBlock',
+    label: 'Regex blocking',
+    effect: 'Refuse any query name that matches a pattern from the Filter lists page.',
+    route: 'lists',
+  },
+  {
     key: 'logPassed',
     label: 'Record allowed queries',
     effect: 'Keep a log row for answers that went through. Switch off to log only what was stopped.',

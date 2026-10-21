@@ -8,7 +8,7 @@ import RowMenu from '../components/RowMenu.vue';
 import StatusPill from '../components/StatusPill.vue';
 import { qtypeLabel } from '../qtype.js';
 
-const STATUSES = ['', 'allow', 'deny', 'blocklist', 'tld', 'keyword', 'rebind', 'idn', 'none'];
+const STATUSES = ['', 'allow', 'deny', 'blocklist', 'tld', 'keyword', 'regex', 'rebind', 'idn', 'none'];
 const LIMITS = [25, 50, 100, 250];
 
 const search = ref(state.logs.search);

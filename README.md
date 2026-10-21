@@ -15,6 +15,7 @@ Response route — a fixed answer for the name + subdomains
   > Remote blocklist (Hagezi pro-plus)
   > Blocked TLD (last-label match)                       [if tldBlock]
   > Blocked keyword (substring match)                    [if keywordBlock]
+  > Regex rule (full-name pattern match)                 [if regexBlock]
   > DNS rebinding — internal/special-use names           [if rebindProtection]
   > IDN homograph block — xn-- / non-ASCII labels        [if idnBlock]
   > Upstream resolver (Settings, or UPSTREAM_URL)
@@ -81,6 +82,29 @@ Guardrails already in place:
 - Keywords are iterated in insertion order — put longer/more specific entries
   first so common domains match later entries less often.
 
+### Regex rules (`regexBlock`, default OFF)
+Each entry is a JavaScript regular expression tested against the **full
+lowercase query name** (anchored automatically — `ads` matches only a name
+that *is* ads-like; use `(^|\.)ads\.` for subdomain positions). Entries are
+validated on add: 4–128 characters, no whitespace, and must compile — a
+broken pattern is rejected at the API, never stored.
+
+Patterns are compiled **once per list change** and cached until the backing
+KV set is replaced (a refresh that changes nothing does not recompile), so
+the hot path is one `RegExp.test` per pattern — no allocation per query.
+Iteration stops at the first hit and reports the pattern that matched —
+the same shape as keyword blocking, so cost is `O(P·L)` worst case with P
+patterns.
+
+Keep patterns anchored-by-nature (`^` … `$` are added for you) and prefer
+them over keywords when the rule is positional or structured
+(`^track\.[a-z0-9]+\.net$`); prefer keywords for plain substring bans,
+which are ~10× cheaper per entry.
+
+Guardrails: skipped entirely unless the toggle is on or the list is empty;
+catastrophic-backtracking patterns are the operator's responsibility —
+the pattern list is yours, keep it small.
+
 ## Storage design (and why not one key per rule)
 
 **KV has *unlimited* keys per namespace**, so key count is never the limit.
@@ -101,6 +125,7 @@ So each list lives in **one KV value**:
 |---|---|
 | `rules:data` | newline `kind<TAB>domain` |
 | `keywords:data` | newline keywords |
+| `regex:data` | newline regex patterns (one per line) |
 | `tlds:data` | newline TLDs |
 | `routes:data` | newline `domain<TAB>type<TAB>value<TAB>ttl` |
 | `settings:main` | JSON of the toggles + the chosen provider |
@@ -137,7 +162,8 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 | `dns.js`            | DNS wire parsing + response builders (Workers/Node) |
 | `blocklist.js`      | Hagezi remote list loader + subdomain matcher       |
 | `rules.js`          | KV-backed allow/deny store (single blob) + subdomain matching |
-| `lists.js`          | Generic newline KV blob stores (keywords, TLDs) + normalizers |
+| `lists.js`          | Generic newline KV blob stores (keywords, TLDs, regex) + normalizers |
+| `filters.js`        | Query-path filter pipeline + `RegexEngine` (compiled-pattern cache)  |
 | `settings.js`       | KV-backed persistent filter settings (toggles, provider) |
 | `routing.js`        | KV-backed response routes + record synthesis        |
 | `upstream.js`       | Provider presets, resolution order, connection probe |
@@ -157,11 +183,12 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 | `/api/rules`      | List / add (POST `{domain,kind}`) / delete                              |
 | `/api/rules/bulk` | Bulk import `{kind, domains}`                                           |
 | `/api/test`       | Run full pipeline for a domain (mirrors live filtering)                |
-| `/api/settings`   | Get (GET: settings + resolved provider + preset list) / save (POST `{rebindProtection, idnBlock, tldBlock, keywordBlock, logPassed, logRetentionDays, upstreamPreset, upstreamUrl, upstreamRelay}`) |
+| `/api/settings`   | Get (GET: settings + resolved provider + preset list) / save (POST `{rebindProtection, idnBlock, tldBlock, keywordBlock, regexBlock, logPassed, logRetentionDays, upstreamPreset, upstreamUrl, upstreamRelay}`) |
 | `/api/routes`     | List / add (POST `{domain,value,ttl?}`) / delete (`?domain=`) response routes |
 | `/api/upstream/test` | Send one real query to a candidate provider: `{ok, ms, rcode, answers, sample}` or `{ok:false, error}` |
 | `/api/filters/tlds` | List (GET) / add (POST `{value}`) / remove (DELETE `?value=`) blocked TLDs |
 | `/api/filters/keywords` | Same, for blocked keywords                              |
+| `/api/filters/regex` | Same, for regex rules                                    |
 | `/api/logs`       | Search + paginate logs (GET, `?client=` / `?untagged=1`); delete filtered/all (DELETE) |
 | `/api/logs/:id`   | Delete a single log row                                                |
 | `/api/session`    | Login (sets session cookie)                                             |
@@ -312,6 +339,7 @@ parent wins over a `deny` at a more specific name.
 | `idnBlock`         | `false` | `settings:main` (JSON blob)  |
 | `tldBlock`         | `false` | `settings:main` (JSON blob)  |
 | `keywordBlock`     | `false` | `settings:main` (JSON blob)  |
+| `regexBlock`       | `false` | `settings:main` (JSON blob)  |
 | `logPassed`        | `true`  | `settings:main` (JSON blob)  |
 | `logRetentionDays` | `30`    | `settings:main` (JSON blob)  |
 | `upstreamPreset`   | `''` (deploy var, else Quad9) | `settings:main` |
@@ -334,8 +362,8 @@ Every resolved query is written to D1 (`dns_logs`) with:
 - `client` — device tag extracted from the request (`/dns-query/<tag>` path or
   `?tag=` query), lowercased; `null` for untagged queries. Invalid tags are
   rejected with `400` before anything is logged, so a typo fails loudly.
-- `status` — `route` | `allow` | `deny` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `none`
-- `filter` — which layer decided: `route` | `allowlist` | `denylist` | `blocklist` | `tld` | `keyword` | `rebind` | `idn` | `upstream`
+- `status` — `route` | `allow` | `deny` | `blocklist` | `tld` | `keyword` | `regex` | `rebind` | `idn` | `none`
+- `filter` — which layer decided: `route` | `allowlist` | `denylist` | `blocklist` | `tld` | `keyword` | `regex` | `rebind` | `idn` | `upstream`
 - `ts` — unix epoch ms
 - `qtype` — DNS RR type number (`1`=A, `28`=AAAA, `16`=TXT, `65`=HTTPS, …), shown in the
   dashboard as the common mnemonic (`A`, `AAAA`, `HTTPS`, …), `other` for uncommon codes,

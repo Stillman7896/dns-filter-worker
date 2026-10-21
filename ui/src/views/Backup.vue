@@ -19,6 +19,7 @@ const summary = computed(() => {
     rules: lines(p.rules),
     routes: lines(p.routes),
     keywords: lines(p.keywords),
+    regex: lines(p.regex),
     tlds: lines(p.tlds),
     settings: p.settings && typeof p.settings === 'object',
   };
@@ -28,7 +29,7 @@ const canImport = computed(() => Boolean(summary.value) && Object.values(summary
 async function exportConfig() {
   await runOp('backup.export', {
     verb: 'Export config',
-    ok: (p) => `${lines(p.rules)} rules, ${lines(p.routes)} routes, ${lines(p.keywords)} keywords, ${lines(p.tlds)} TLDs exported`,
+    ok: (p) => `${lines(p.rules)} rules, ${lines(p.routes)} routes, ${lines(p.keywords)} keywords, ${lines(p.regex)} regex, ${lines(p.tlds)} TLDs exported`,
     fn: async () => {
       const data = await api.exportConfig();
       const stamp = new Date().toISOString().slice(0, 10);
@@ -86,7 +87,7 @@ async function importConfig() {
   <div class="space-y-6">
     <div>
       <h1 class="text-[21px] font-semibold tracking-tight">Backup</h1>
-      <p class="hint mt-1">One JSON file holds every change you have made here: settings, rules, routes, keywords, TLDs.</p>
+      <p class="hint mt-1">One JSON file holds every change you have made here: settings, rules, routes, keywords, regex, TLDs.</p>
     </div>
 
     <section class="panel p-5">
@@ -128,6 +129,9 @@ async function importConfig() {
         </div>
         <div class="flex justify-between gap-4 text-[13px]">
           <span class="st">keywords</span><span class="st text-muted">{{ summary.keywords }}</span>
+        </div>
+        <div class="flex justify-between gap-4 text-[13px]">
+          <span class="st">regex</span><span class="st text-muted">{{ summary.regex }}</span>
         </div>
         <div class="flex justify-between gap-4 text-[13px]">
           <span class="st">tlds</span><span class="st text-muted">{{ summary.tlds }}</span>

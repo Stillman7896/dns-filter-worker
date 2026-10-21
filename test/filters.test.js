@@ -3,20 +3,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   runQueryFilters, rebindNameHit, idnHit, tldOf,
-  isPrivateV4, isPrivateV6, privateAnswerIP,
+  isPrivateV4, isPrivateV6, privateAnswerIP, RegexEngine,
 } from '../filters.js';
 import { buildQuery, buildResponse, v4rdata, v6rdata } from './helpers.js';
 
 // ---- fixtures ----------------------------------------------------------------
 
-const ON = { rebindProtection: true, idnBlock: true, tldBlock: true, keywordBlock: true };
-const OFF = { rebindProtection: false, idnBlock: false, tldBlock: false, keywordBlock: false };
+const ON = { rebindProtection: true, idnBlock: true, tldBlock: true, keywordBlock: true, regexBlock: true };
+const OFF = { rebindProtection: false, idnBlock: false, tldBlock: false, keywordBlock: false, regexBlock: false };
 
 /**
- * @param {{rules?: Array<[string, 'allow'|'deny']>, block?: string[], keywords?: string[], tlds?: string[]}} [o]
- * @returns {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, tldStore: {get(): Set<string>}}}
+ * @param {{rules?: Array<[string, 'allow'|'deny']>, block?: string[], keywords?: string[], tlds?: string[], regexes?: string[]}} [o]
+ * @returns {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, regex: RegexEngine, tldStore: {get(): Set<string>}}}
  */
-function mkStores({ rules = [], block = [], keywords = [], tlds = [] } = {}) {
+function mkStores({ rules = [], block = [], keywords = [], tlds = [], regexes = [] } = {}) {
   const ruleMap = new Map(rules);
   const blockSet = new Set(block);
   return {
@@ -48,6 +48,7 @@ function mkStores({ rules = [], block = [], keywords = [], tlds = [] } = {}) {
       },
     },
     keywordStore: { get: () => new Set(keywords) },
+    regex: new RegexEngine({ get: () => new Set(regexes) }),
     tldStore: { get: () => new Set(tlds) },
   };
 }
@@ -148,6 +149,47 @@ test('deny is reported with the matched parent rule', () => {
   const s = mkStores({ rules: [['example.com', 'deny']] });
   const v = runQueryFilters(s, ON, 'cdn.sub.example.com');
   assert.deepEqual(v, { status: 'deny', filter: 'denylist', matched: 'example.com' });
+});
+
+test('regex: full-name pattern match reports the matching pattern', () => {
+  const s = mkStores({ regexes: ['^ads\\.', '(^|\\.)telemetry\\.[a-z]+$', '^cdn[0-9]+\\.example\\.com$'] });
+  assert.deepEqual(
+    runQueryFilters(s, ON, 'ads.foo.com'),
+    { status: 'regex', filter: 'regex', matched: '^ads\\.' },
+  );
+  assert.equal(runQueryFilters(s, ON, 'x.telemetry.io').status, 'regex');
+  assert.equal(runQueryFilters(s, ON, 'cdn7.example.com').status, 'regex');
+  assert.equal(runQueryFilters(s, ON, 'plain.example.com').status, 'none', 'patterns anchor to the full name');
+});
+
+test('regex: inert when the toggle is off or the list is empty', () => {
+  const s = mkStores({ regexes: ['^ads\\.'] });
+  assert.equal(runQueryFilters(s, { ...ON, regexBlock: false }, 'ads.foo.com').status, 'none');
+  assert.equal(runQueryFilters(mkStores(), ON, 'anything.com').status, 'none');
+});
+
+test('precedence: keyword beats regex; regex beats rebinding and idn', () => {
+  const s = mkStores({ keywords: ['telemetry'], regexes: ['telemetry\\.io$'] });
+  assert.equal(runQueryFilters(s, ON, 'a.telemetry.io').status, 'keyword');
+  // layers below regex never get a say once a pattern matches
+  assert.equal(runQueryFilters(mkStores({ regexes: ['^track\\..*\\.local$'] }), ON, 'track.a.local').status, 'regex');
+  assert.equal(runQueryFilters(mkStores({ regexes: ['^xn--evil\\.com$'] }), ON, 'xn--evil.com').status, 'regex');
+});
+
+test('regex: allow/deny/blocklist/tld still run first', () => {
+  const patterns = ['^sub\\.example\\.com$'];
+  assert.equal(
+    runQueryFilters(mkStores({ rules: [['example.com', 'allow']], regexes: patterns }), ON, 'sub.example.com').status,
+    'allow',
+  );
+  assert.equal(
+    runQueryFilters(mkStores({ rules: [['example.com', 'deny']], regexes: patterns }), ON, 'sub.example.com').status,
+    'deny',
+  );
+  assert.equal(
+    runQueryFilters(mkStores({ tlds: ['zip'], regexes: ['^ads\\.zip$'] }), ON, 'ads.zip').status,
+    'tld',
+  );
 });
 
 // ---- private address classification ------------------------------------------

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { handleApi } from '../dashboard.js';
 import { RuleStore } from '../rules.js';
 import { RouteStore } from '../routing.js';
-import { TextSetStore, normalizeKeyword } from '../lists.js';
+import { TextSetStore, normalizeKeyword, normalizeRegex } from '../lists.js';
 import { SettingsStore } from '../settings.js';
 import { buildQuery, buildResponse, FakeKV, v4rdata } from './helpers.js';
 
@@ -20,6 +20,7 @@ function mkCtx(kv) {
     routes: new RouteStore(kv),
     keywords: new TextSetStore(kv, 'keywords:data', normalizeKeyword),
     tlds: new TextSetStore(kv, 'tlds:data'),
+    regex: new TextSetStore(kv, 'regex:data', normalizeRegex),
     testFn: async (domain, env) => ({ domain, status: 'none', filter: 'upstream', matched: null }),
   };
 }
@@ -356,6 +357,47 @@ test('filters: tlds + keywords CRUD with validation', async () => {
   assert.deepEqual((await (await call(ctx, env, '/api/filters/tlds', { cookie })).json()).items, []);
 });
 
+test('filters: regex CRUD with validation (compile + bounds)', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  const add = await call(ctx, env, '/api/filters/regex', {
+    method: 'POST', cookie, body: { value: '^ads\\.' },
+  });
+  assert.equal(add.status, 200);
+  assert.deepEqual((await add.json()).items, ['^ads\\.']);
+
+  const dup = await call(ctx, env, '/api/filters/regex', {
+    method: 'POST', cookie, body: { value: '^ads\\.' },
+  });
+  assert.equal((await dup.json()).added, false);
+
+  const broken = await call(ctx, env, '/api/filters/regex', {
+    method: 'POST', cookie, body: { value: '(unclosed' },
+  });
+  assert.equal(broken.status, 400, 'patterns that do not compile are rejected at the API');
+
+  const tooShort = await call(ctx, env, '/api/filters/regex', {
+    method: 'POST', cookie, body: { value: 'ab' },
+  });
+  assert.equal(tooShort.status, 400);
+
+  const spaced = await call(ctx, env, '/api/filters/regex', {
+    method: 'POST', cookie, body: { value: '^a b$' },
+  });
+  assert.equal(spaced.status, 400, 'no whitespace in patterns');
+
+  const rm = await call(ctx, env, '/api/filters/regex?value=' + encodeURIComponent('^ads\\.'), {
+    method: 'DELETE', cookie,
+  });
+  assert.equal((await rm.json()).removed, true);
+  assert.deepEqual((await (await call(ctx, env, '/api/filters/regex', { cookie })).json()).items, []);
+});
+
 test('filters: GET loads stored lists from KV on a cold isolate', async () => {
   // A fresh isolate has an empty in-memory set; only the DNS hot path and
   // writes used to refresh the stores, so the dashboard listed nothing.
@@ -633,6 +675,7 @@ test('backup: export returns full config snapshot', async () => {
   await call(ctx, env, '/api/rules', { method: 'POST', cookie, body: { domain: 'old.com', kind: 'deny' } });
   await call(ctx, env, '/api/filters/tlds', { method: 'POST', cookie, body: { value: '.ZIP' } });
   await ctx.keywords.add('doubleclick');
+  await ctx.regex.add('^telemetry\\.');
   await call(ctx, env, '/api/settings', { method: 'POST', cookie, body: { idnBlock: true } });
 
   const res = await call(ctx, env, '/api/export', { cookie });
@@ -644,6 +687,7 @@ test('backup: export returns full config snapshot', async () => {
   assert.deepEqual(payload.rules, [{ domain: 'old.com', kind: 'deny' }]);
   assert.deepEqual(payload.tlds, ['zip']);
   assert.ok(payload.keywords.includes('doubleclick'));
+  assert.deepEqual(payload.regex, ['^telemetry\\.'], 'regex list is part of the snapshot');
 });
 
 test('backup: import merge adds without clobbering existing state', async () => {

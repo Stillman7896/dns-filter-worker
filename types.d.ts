@@ -57,6 +57,7 @@ interface FilterSettings {
   idnBlock: boolean;
   tldBlock: boolean;
   keywordBlock: boolean;
+  regexBlock: boolean;
   logPassed: boolean;
   logRetentionDays: number;
   /** Provider id from upstream.js; '' = deployment variable, else built-in default. */
@@ -82,6 +83,7 @@ interface ApiCtx {
   routes: import('./routing.js').RouteStore;
   keywords: import('./lists.js').TextSetStore;
   tlds: import('./lists.js').TextSetStore;
+  regex: import('./lists.js').TextSetStore;
   // not used by the API itself; carried for tests that mirror wiring
   blocklist?: unknown;
 

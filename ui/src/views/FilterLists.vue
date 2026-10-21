@@ -3,7 +3,7 @@ import { ref } from 'vue';
 import { state, runOp, loadLists, setRoute } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
-import { normalizeTld, normalizeKeyword } from '../validate.js';
+import { normalizeTld, normalizeKeyword, normalizeRegex } from '../validate.js';
 
 const FORMS = [
   {
@@ -13,6 +13,8 @@ const FORMS = [
     hint: 'Stops any query whose last label matches — the whole zone is off limits.',
     invalid: 'One label only, e.g. “zip”. Use a rule for “co.uk”.',
     placeholder: 'zip',
+    empty: 'Add a suffix like “xyz” to start stopping queries.',
+    addLabel: 'TLD',
     normalize: normalizeTld,
     on: () => state.settings?.tldBlock,
     kicker: 'TLD blocking is switched off in Settings.',
@@ -24,15 +26,30 @@ const FORMS = [
     hint: 'Stops a query when any label contains this text.',
     invalid: 'Lowercase letters, digits, dots and dashes only, at least 4 characters.',
     placeholder: 'doubleclick',
+    empty: 'Add a fragment like “doubleclick” to start stopping queries.',
+    addLabel: 'keyword',
     normalize: normalizeKeyword,
     on: () => state.settings?.keywordBlock,
     kicker: 'Keyword blocking is switched off in Settings.',
   },
+  {
+    id: 'regex',
+    key: 'regex',
+    title: 'Regex rules',
+    hint: 'Stops any query whose name matches the pattern (matched against the full lowercase name).',
+    invalid: 'A compileable pattern, 4–128 characters, no whitespace.',
+    placeholder: 'cdn\\d+\\.example\\.com',
+    empty: 'Add a pattern like “cdn\\d+\\.example\\.com” to start stopping queries.',
+    addLabel: 'regex',
+    normalize: normalizeRegex,
+    on: () => state.settings?.regexBlock,
+    kicker: 'Regex blocking is switched off in Settings.',
+  },
 ];
 
-const draft = ref({ tld: '', keyword: '' });
+const draft = ref({ tld: '', keyword: '', regex: '' });
 
-const items = (id) => (id === 'tlds' ? state.tlds : state.keywords);
+const items = (id) => (id === 'tlds' ? state.tlds : id === 'regex' ? state.regex : state.keywords);
 const typed = (form) => draft.value[form.key].trim();
 // Same normalizer the API validates with, so a valid entry is always submittable.
 const stored = (form) => form.normalize(typed(form));
@@ -43,7 +60,7 @@ async function add(form) {
   if (!value) return;
   try {
     await runOp(`lists.${form.key}.add`, {
-      verb: `Add ${form.key === 'tld' ? 'TLD' : 'keyword'}`,
+      verb: `Add ${form.addLabel}`,
       ok: (r) => (r.added ? `${value} added` : `${value} was already on the list`),
       undo: async () => {
         await api.removeItem(form.id, value);
@@ -80,7 +97,7 @@ async function remove(form, value) {
   <div class="space-y-6">
     <div>
       <h1 class="text-[21px] font-semibold tracking-tight">Filter lists</h1>
-      <p class="hint mt-1">Two plain lists that decide on their own, independent of the shared blocklist.</p>
+      <p class="hint mt-1">Three plain lists that decide on their own, independent of the shared blocklist.</p>
     </div>
 
     <section
@@ -151,7 +168,7 @@ async function remove(form, value) {
         </div>
 
         <p v-else class="hint mt-3">
-          Empty. Add a {{ form.key === 'tld' ? 'suffix like “xyz”' : 'fragment like “doubleclick”' }} to start stopping queries.
+          Empty. {{ form.empty }}
         </p>
       </div>
     </section>

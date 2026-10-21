@@ -4,12 +4,12 @@
 // [assets] binding in wrangler.toml. This file only handles /api/* routes.
 //
 // `ctx` (built by worker.js) carries the KV-backed stores and the test fn:
-//   { rules, settings, keywords, tlds, testFn }
+//   { rules, settings, keywords, regex, tlds, testFn }
 
 import { normalizeDomain } from './rules.js';
 import { toUnicode } from './idn.js';
 import { normalizeRoute } from './routing.js';
-import { normalizeTld, normalizeKeyword } from './lists.js';
+import { normalizeTld, normalizeKeyword, normalizeRegex } from './lists.js';
 import { clampRetention, DEFAULT_SETTINGS } from './settings.js';
 import {
   UPSTREAM_PRESETS,
@@ -86,7 +86,7 @@ function buildWhere(entries) {
 function settingsPatch(source, current = {}) {
   /** @type {Partial<FilterSettings>} */
   const patch = {};
-  const BOOL_KEYS = /** @type {const} */ (['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock', 'logPassed']);
+  const BOOL_KEYS = /** @type {const} */ (['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock', 'regexBlock', 'logPassed']);
   for (const k of BOOL_KEYS) {
     if (typeof source[k] === 'boolean') patch[k] = source[k]; // k is a boolean key
   }
@@ -112,7 +112,7 @@ function settingsPatch(source, current = {}) {
 
 /** @param {Request} request @param {Env} env @param {URL} url @param {ApiCtx} ctx */
 export async function handleApi(request, env, url, ctx) {
-  const { rules, routes, settings, keywords, tlds, testFn } = ctx;
+  const { rules, routes, settings, keywords, regex, tlds, testFn } = ctx;
 
   // ---- Login: POST /api/session { password } or Authorization: Bearer <pw> ----
   if (url.pathname === '/api/session' && request.method === 'POST') {
@@ -329,6 +329,7 @@ export async function handleApi(request, env, url, ctx) {
       rules.refresh(true),
       routes && routes.refresh(true),
       keywords.refresh(true),
+      regex.refresh(true),
       tlds.refresh(true),
     ]);
     return json({
@@ -338,6 +339,7 @@ export async function handleApi(request, env, url, ctx) {
       rules: await rules.list(),
       routes: routes ? routes.list() : [],
       keywords: keywords.list(),
+      regex: regex.list(),
       tlds: tlds.list(),
     });
   }
@@ -353,14 +355,15 @@ export async function handleApi(request, env, url, ctx) {
     const rulesIn = arr(body.rules);
     const routesIn = arr(body.routes);
     const kwIn = arr(body.keywords);
+    const regexIn = arr(body.regex);
     const tldIn = arr(body.tlds);
 
-    if (!rulesIn && !routesIn && !kwIn && !tldIn && !body.settings) {
-      return json({ error: 'nothing to import: provide rules, routes, keywords, tlds, or settings' }, { status: 400 });
+    if (!rulesIn && !routesIn && !kwIn && !regexIn && !tldIn && !body.settings) {
+      return json({ error: 'nothing to import: provide rules, routes, keywords, regex, tlds, or settings' }, { status: 400 });
     }
 
-    /** @type {{mode:'merge'|'replace', rules: {applied:number, skipped:number}|null, routes: {applied:number, skipped:number}|null, keywords: {applied:number, skipped:number}|null, tlds: {applied:number, skipped:number}|null, settings: boolean}} */
-    const summary = { mode, rules: null, routes: null, keywords: null, tlds: null, settings: false };
+    /** @type {{mode:'merge'|'replace', rules: {applied:number, skipped:number}|null, routes: {applied:number, skipped:number}|null, keywords: {applied:number, skipped:number}|null, regex: {applied:number, skipped:number}|null, tlds: {applied:number, skipped:number}|null, settings: boolean}} */
+    const summary = { mode, rules: null, routes: null, keywords: null, regex: null, tlds: null, settings: false };
 
     if (rulesIn) {
       const valid = rulesIn.filter(
@@ -383,6 +386,11 @@ export async function handleApi(request, env, url, ctx) {
         ? await keywords.replaceAll(kwIn, normalizeKeyword)
         : await keywords.addMany(kwIn, normalizeKeyword);
     }
+    if (regexIn) {
+      summary.regex = mode === 'replace'
+        ? await regex.replaceAll(regexIn, normalizeRegex)
+        : await regex.addMany(regexIn, normalizeRegex);
+    }
     if (tldIn) {
       summary.tlds = mode === 'replace'
         ? await tlds.replaceAll(tldIn, normalizeTld)
@@ -401,12 +409,14 @@ export async function handleApi(request, env, url, ctx) {
     return json({ ok: true, ...summary });
   }
 
-  // ---- filter lists: blocked TLDs + blocked keywords ----
-  const listMatch = path.match(/^\/api\/filters\/(keywords|tlds)$/);
+  // ---- filter lists: blocked TLDs + blocked keywords + regex ----
+  const listMatch = path.match(/^\/api\/filters\/(keywords|tlds|regex)$/);
   if (listMatch) {
-    const isKeywords = listMatch[1] === 'keywords';
-    const store = isKeywords ? keywords : tlds;
-    const normalize = isKeywords ? normalizeKeyword : normalizeTld;
+    const which = listMatch[1];
+    const isKeywords = which === 'keywords';
+    const isRegex = which === 'regex';
+    const store = isRegex ? regex : isKeywords ? keywords : tlds;
+    const normalize = isRegex ? normalizeRegex : isKeywords ? normalizeKeyword : normalizeTld;
     if (!store) return json({ error: 'list not available' }, { status: 501 });
 
     // Read from KV before answering: the DNS hot path is the only other place
@@ -450,7 +460,7 @@ export async function handleApi(request, env, url, ctx) {
         logs.prepare('SELECT status, COUNT(*) AS n FROM dns_logs GROUP BY status').all(),
         logs.prepare(
           "SELECT domain, COUNT(*) AS n FROM dns_logs " +
-          "WHERE status IN ('deny','blocklist','tld','keyword','rebind','idn') " +
+          "WHERE status IN ('deny','blocklist','tld','keyword','regex','rebind','idn') " +
           'GROUP BY domain ORDER BY n DESC LIMIT ?').bind(10).all(),
         logs.prepare(
           'SELECT client, COUNT(*) AS n FROM dns_logs ' +

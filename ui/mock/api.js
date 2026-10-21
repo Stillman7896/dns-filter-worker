@@ -4,7 +4,7 @@
 
 import { UPSTREAM_PRESETS, findPreset, probeUpstream, resolveUpstream } from '../../upstream.js';
 import { normalizeRoute } from '../../routing.js';
-import { normalizeTld, normalizeKeyword } from '../../lists.js';
+import { normalizeTld, normalizeKeyword, normalizeRegex } from '../../lists.js';
 import { normalizeDomain } from '../../rules.js';
 import { toUnicode } from '../../idn.js';
 
@@ -30,12 +30,14 @@ const fixtures = {
     { domain: 'media.example.com', type: 'cname', value: 'nas.home.lan', ttl: 300 },
   ],
   keywords: ['doubleclick', 'metrics-gateway', 'telemetry'],
+  regex: ['cdn\\d+\\.example\\.com'],
   tlds: ['zip', 'mov', 'xyz'],
   settings: {
     rebindProtection: true,
     idnBlock: false,
     tldBlock: true,
     keywordBlock: true,
+    regexBlock: true,
     logPassed: true,
     logRetentionDays: 30,
     upstreamPreset: 'cloudflare',
@@ -71,16 +73,17 @@ function seedLogs() {
     for (const [s, w] of statusPool) {
       if ((r -= w) <= 0) { status = s; break; }
     }
-    const blockedish = ['deny', 'blocklist', 'tld', 'keyword', 'rebind', 'idn'].includes(status);
+    const blockedish = ['deny', 'blocklist', 'tld', 'keyword', 'regex', 'rebind', 'idn'].includes(status);
     const filter =
       status === 'deny' ? 'custom denylist'
         : status === 'blocklist' ? 'hagezi basic'
           : status === 'tld' ? 'blocked tlds'
             : status === 'keyword' ? 'blocked keywords'
-              : status === 'rebind' ? 'rebinding'
-                : status === 'idn' ? 'idn'
-                  : status === 'allow' ? 'custom allowlist'
-                    : 'upstream';
+              : status === 'regex' ? 'regex rules'
+                : status === 'rebind' ? 'rebinding'
+                  : status === 'idn' ? 'idn'
+                    : status === 'allow' ? 'custom allowlist'
+                      : 'upstream';
     const clients = ['laptop', 'phone', 'phone', 'tv', null, null, null];
     out.push({
       id: i + 1,
@@ -207,12 +210,14 @@ export function mockApi(req, res, next) {
       if (!domain) return json(res, 400, { error: 'invalid domain' });
       const rule = fixtures.rules.find((r) => domain === r.domain || domain.endsWith('.' + r.domain));
       const keyword = fixtures.keywords.find((k) => domain.includes(k));
+      const re = fixtures.regex.find((p) => { try { return new RegExp('^(?:' + p + ')$').test(domain); } catch { return false; } });
       const tld = domain.split('.').pop();
       let status = 'none', filter = null, matched = null;
       if (rule && rule.kind === 'deny') { status = 'deny'; filter = 'custom denylist'; matched = rule.domain; }
       else if (rule && rule.kind === 'allow') { status = 'allow'; filter = 'custom allowlist'; matched = rule.domain; }
       else if (fixtures.settings.tldBlock && fixtures.tlds.includes(tld)) { status = 'tld'; filter = 'blocked tlds'; matched = tld; }
       else if (fixtures.settings.keywordBlock && keyword) { status = 'keyword'; filter = 'blocked keywords'; matched = keyword; }
+      else if (fixtures.settings.regexBlock && re) { status = 'regex'; filter = 'regex rules'; matched = re; }
       else if (domain.includes('.local') || domain.endsWith('.internal')) { status = 'rebind'; filter = 'rebinding'; matched = 'internal'; }
       const unicode = toUnicode(domain);
       return json(res, 200, {
@@ -291,12 +296,13 @@ export function mockApi(req, res, next) {
         rules: fixtures.rules,
         routes: fixtures.routes,
         keywords: fixtures.keywords,
+        regex: fixtures.regex,
         tlds: fixtures.tlds,
       });
     }
     if (p === '/api/import' && req.method === 'POST') {
       const mode = body.mode === 'replace' ? 'replace' : 'merge';
-      const summary = { mode, rules: null, routes: null, keywords: null, tlds: null, settings: false };
+      const summary = { mode, rules: null, routes: null, keywords: null, regex: null, tlds: null, settings: false };
       if (Array.isArray(body.routes)) {
         const valid = body.routes.map(normalizeRoute).filter(Boolean);
         if (mode === 'replace') fixtures.routes = valid.slice();
@@ -318,6 +324,11 @@ export function mockApi(req, res, next) {
           ? (fixtures.keywords = body.keywords.slice(), body.keywords.length)
           : (body.keywords.forEach((k) => fixtures.keywords.includes(k) || fixtures.keywords.push(k)), body.keywords.length);
       }
+      if (Array.isArray(body.regex)) {
+        summary.regex = mode === 'replace'
+          ? (fixtures.regex = body.regex.slice(), body.regex.length)
+          : (body.regex.forEach((k) => fixtures.regex.includes(k) || fixtures.regex.push(k)), body.regex.length);
+      }
       if (Array.isArray(body.tlds)) {
         summary.tlds = mode === 'replace'
           ? (fixtures.tlds = body.tlds.slice(), body.tlds.length)
@@ -328,10 +339,11 @@ export function mockApi(req, res, next) {
     }
 
     // ---- filter lists ----
-    const listMatch = p.match(/^\/api\/filters\/(keywords|tlds)$/);
+    const listMatch = p.match(/^\/api\/filters\/(keywords|tlds|regex)$/);
     if (listMatch) {
-      const set = listMatch[1] === 'keywords' ? fixtures.keywords : fixtures.tlds;
-      const norm = listMatch[1] === 'keywords' ? normalizeKeyword : normalizeTld;
+      const which = listMatch[1];
+      const set = which === 'keywords' ? fixtures.keywords : which === 'regex' ? fixtures.regex : fixtures.tlds;
+      const norm = which === 'keywords' ? normalizeKeyword : which === 'regex' ? normalizeRegex : normalizeTld;
       if (req.method === 'GET') return json(res, 200, { items: [...set].sort() });
       if (req.method === 'POST') {
         const v = norm((body || {}).value);
