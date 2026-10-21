@@ -28,6 +28,10 @@ rule. Allow wins over deny everywhere else, so you can carve holes in the
 upstream Hagezi list — including letting an allowlisted name resolve to a
 private IP past the rebinding check.
 
+A `@@` exception in the blocklist file cancels only the **blocklist** step:
+the name falls through to the filters below it, and custom rules still
+outrank it either way (see *Blocklist file* below).
+
 ### DNS rebinding protection (`rebindProtection`, default ON)
 - **Name level**: blocks `localhost`, `*.local`, `*.lan`, `*.home`, `*.internal`,
   `*.intranet`, `*.corp`, `*.private`, `*.home.arpa`, `*.test`, `*.invalid`,
@@ -104,6 +108,29 @@ which are ~10× cheaper per entry.
 Guardrails: skipped entirely unless the toggle is on or the list is empty;
 catastrophic-backtracking patterns are the operator's responsibility —
 the pattern list is yours, keep it small.
+
+## Blocklist file
+
+The remote list is parsed into a domain set; any of the common formats can be
+mixed in one file:
+
+| Line                  | Meaning                                |
+|-----------------------|----------------------------------------|
+| `example.com`         | plain domain                           |
+| `\|\|example.com^`    | AdBlock (`$options` and paths stripped)|
+| `\|\|*.example.com^`  | AdBlock wildcard (`*.` prefix dropped) |
+| `0.0.0.0 example.com` | hosts row (any count of domains)       |
+| `@@example.com`       | **exception** — allow                  |
+| `@@\|\|example.com^`  | exception, AdBlock dialect             |
+
+Matching walks parent labels: an entry `example.com` also stops
+`ads.example.com`, and the entry that matched is what gets logged.
+
+`@@` exceptions cancel the blocklist verdict only — the name continues down
+the precedence chain (blocked TLD, keywords, regex, rebinding, upstream).
+They are surfaced in the dashboard under **Rules → Allow** as read-only rows
+tagged *blocklist*; deleting them there is refused by the API because the
+source of truth is the list file itself.
 
 ## Storage design (and why not one key per rule)
 
@@ -239,6 +266,43 @@ fail with SERVFAIL; the connection test is the quickest way to notice.
 The relay is only used for forwarding: no plaintext query is ever sent to it,
 and the relay URL is never shared with the target.
 
+### Upstream failover
+
+With `upstreamFailover` on (the default), a failed primary is retried **once**
+on a fallback DoH server before the client sees an error. Retried: network
+errors, HTTP 5xx, and SERVFAIL/REFUSED answers. Not retried: NXDOMAIN and
+NODATA — those are real answers, and retrying them would double every
+negative lookup.
+
+The fallback is picked in this order:
+
+```
+upstreamFallbackUrl (dashboard) > UPSTREAM_FALLBACK_URL (deploy var)
+  > a built-in preset from a different operator than the primary
+```
+
+The fallback is always plain DoH — an ODoH relay is a second moving part
+exactly when the first hop just failed. If the fallback also fails, the
+primary's answer (or error) stands. Turn the whole thing off with
+`upstreamFailover: false` and a dead primary returns SERVFAIL directly.
+
+`UPSTREAM_FALLBACK_URL` is an ordinary deploy var:
+
+```toml
+[vars]
+UPSTREAM_FALLBACK_URL = "https://dns.google/dns-query"
+```
+
+### Answer caching and negative caching
+
+Resolved answers are cached at the edge and in an isolate LRU, keyed by the
+query name, type, EDNS state, and the current upstream configuration — so
+switching provider or fallback never serves answers from the old resolver.
+Positive answers honour their record TTLs. **NXDOMAIN and NODATA**
+(NOERROR with zero answer records) are cached for **60 s**: long enough to
+collapse a burst of retries against the upstream, short enough that a record
+added at the authoritative server is visible again almost immediately.
+
 ## Domain response routing
 
 Settings → Domain response routing answers a domain, and every subdomain of it,
@@ -270,6 +334,10 @@ BLOCKLIST_URL = "https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main
 ```bash
 wrangler deploy --var BLOCKLIST_URL:https://example.com/mylist.txt
 ```
+
+`UPSTREAM_FALLBACK_URL` (optional) names the fallback DoH endpoint for
+failover; the dashboard's `upstreamFallbackUrl` setting outranks it.
+See *Upstream failover* above.
 
 Its edge cache key derives from `BLOCKLIST_URL`, so switching the URL never
 serves a stale cached copy. The default lives in `blocklist.js`
@@ -331,6 +399,11 @@ Rules are stored in KV under `rule:<domain>` = `allow` | `deny`. Adding a rule
 for `example.com` matches `*.example.com` too (subdomain walk). `allow` at any
 parent wins over a `deny` at a more specific name.
 
+The dashboard **Rules** page splits them into Block and Allow views, and every
+row carries a source badge: *custom* rows live in KV and can be deleted there;
+*blocklist* rows are `@@` exceptions from the remote list, shown read-only
+(the API answers 400 on a delete attempt).
+
 ## Filter settings
 
 | Setting            | Default | KV key                       |
@@ -345,6 +418,8 @@ parent wins over a `deny` at a more specific name.
 | `upstreamPreset`   | `''` (deploy var, else Quad9) | `settings:main` |
 | `upstreamUrl`      | `''`    | `settings:main` (custom provider) |
 | `upstreamRelay`    | `''`    | `settings:main` (ODoH relay) |
+| `upstreamFailover` | `true`  | `settings:main` (retry on fallback) |
+| `upstreamFallbackUrl` | `''` | `settings:main` (custom fallback provider) |
 
 Managed from the **Settings** tab. Persisted to KV (same namespace as rules),
 so they survive deploys and are shared across every colo.

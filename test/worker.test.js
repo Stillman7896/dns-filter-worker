@@ -35,7 +35,7 @@ globalThis.caches = { default: new MemCache() };
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   if (url === BLOCKLIST_URL) {
-    return new Response('# comment\nblocklist.test\nads.blocklist.test\n\n', { status: 200 });
+    return new Response('# comment\nblocklist.test\nads.blocklist.test\n||foo-block.com^\n@@sub.foo-block.com\n\n', { status: 200 });
   }
   if (url === UPSTREAM_URL) {
     const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
@@ -197,6 +197,24 @@ test('GET: blocklist match -> NXDOMAIN + logged blocklist', async () => {
   assert.equal(rcode(body), 3);
   assert.equal(d1.rows[0].status, 'blocklist');
   assert.equal(d1.rows[0].filter, 'blocklist');
+});
+
+test('GET: @@ exception cancels the blocklist hit and forwards upstream', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ d1 });
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('93.184.216.34') }];
+
+  const res = await dohGet(env, buildQuery('sub.foo-block.com'));
+  const body = new Uint8Array(await res.arrayBuffer());
+  assert.equal(rcode(body), 0, 'no NXDOMAIN');
+  assert.equal(ancount(body), 1, 'upstream answer passed through');
+  assert.deepEqual(
+    { status: d1.rows[0].status, filter: d1.rows[0].filter },
+    { status: 'none', filter: 'upstream' },
+  );
+
+  const blocked = await dohGet(env, buildQuery('tracker.blocklist.test'));
+  assert.equal(rcode(new Uint8Array(await blocked.arrayBuffer())), 3, 'unexcepted name still blocked');
 });
 
 test('answer-level rebinding: upstream private IP -> NXDOMAIN + logged rebind', async () => {
@@ -655,4 +673,180 @@ test('regex: regexBlock=true blocks a matching name, non-matching passes upstrea
     { domain: 'ads42.tracker.example.com', status: 'regex', filter: 'regex' },
   );
   assert.equal(d1.rows[1].status, 'none', 'non-matching query logged as none');
+});
+
+// ---- upstream failover -------------------------------------------------------------
+
+const FALLBACK_URL = 'https://cloudflare-dns.com/dns-query';
+
+test('failover: a dead primary is retried on the fallback server', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv, d1 });
+
+  const savedFetch = globalThis.fetch;
+  /** @type {string[]} */ const hits = [];
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input, /** @type {any} */ init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    hits.push(url);
+    if (url === UPSTREAM_URL) throw new Error('connect timeout');
+    const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
+    return new Response(buildResponse(q, [{ type: 1, rdata: v4rdata('104.16.1.1') }]));
+  });
+
+  try {
+    const body = new Uint8Array(await (await dohGet(env, buildQuery('failover.foo.net'))).arrayBuffer());
+    assert.equal(rcode(body), 0, 'the fallback answered');
+    assert.equal(firstA(body), '104.16.1.1');
+    assert.deepEqual(hits, [UPSTREAM_URL, FALLBACK_URL], 'primary first, then the fallback');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('failover: SERVFAIL from the primary triggers the fallback; NXDOMAIN does not', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const env = mkEnv({ kv });
+
+  const savedFetch = globalThis.fetch;
+  /** @type {string[]} */ const hits = [];
+  /** @type {string} */ let mode = 'servfail';
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input, /** @type {any} */ init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    hits.push(url);
+    const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
+    if (url === UPSTREAM_URL) {
+      return new Response(mode === 'servfail'
+        ? buildResponse(q, [], 2)
+        : buildResponse(q, [], 3));
+    }
+    return new Response(buildResponse(q, [{ type: 1, rdata: v4rdata('104.16.1.1') }]));
+  });
+
+  try {
+    const failed = new Uint8Array(await (await dohGet(env, buildQuery('retry.bar.net'))).arrayBuffer());
+    assert.equal(rcode(failed), 0, 'fallback replaced the SERVFAIL');
+    assert.equal(firstA(failed), '104.16.1.1');
+    assert.equal(hits.length, 2, 'two upstreams asked');
+
+    hits.length = 0;
+    mode = 'nxdomain';
+    const dead = new Uint8Array(await (await dohGet(env, buildQuery('gone.bar.net'))).arrayBuffer());
+    assert.equal(rcode(dead), 3, 'NXDOMAIN is a real answer, not a failure');
+    assert.equal(hits.length, 1, 'the fallback was not asked for NXDOMAIN');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('failover: upstreamFailover=false turns the fallback off', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV({ 'settings:main': JSON.stringify({ upstreamFailover: false }) });
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv, d1 });
+
+  const savedFetch = globalThis.fetch;
+  /** @type {string[]} */ const hits = [];
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    hits.push(url);
+    if (url === FALLBACK_URL) throw new Error('fallback must not be asked');
+    throw new Error('primary down');
+  });
+
+  try {
+    const res = await dohGet(env, buildQuery('off.baz.net'));
+    assert.equal(res.status, 502, 'upstream failure surfaces without a fallback');
+    assert.ok(!hits.includes(FALLBACK_URL), 'fallback never contacted');
+
+    const hz = await (await worker.fetch(new Request('https://worker.test/healthz'), env)).json();
+    assert.equal(hz.fallback, null, 'healthz states the fallback is off');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('failover: healthz states which fallback server is in play', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const env = mkEnv({ kv });
+  const hz = await (await worker.fetch(new Request('https://worker.test/healthz'), env)).json();
+  assert.equal(hz.fallback.url, FALLBACK_URL, 'built-in alternate provider');
+  assert.equal(hz.fallback.source, 'preset');
+  assert.equal(hz.settings.upstreamFailover, true, 'on by default');
+
+  // A fresh binding re-reads settings (the isolate cache is per KV namespace).
+  const kv2 = new KV({ 'settings:main': JSON.stringify({ upstreamFallbackUrl: 'https://dns.google/dns-query' }) });
+  const hz2 = await (await worker.fetch(new Request('https://worker.test/healthz'), mkEnv({ kv: kv2 }))).json();
+  assert.equal(hz2.fallback.url, 'https://dns.google/dns-query', 'custom fallback URL wins');
+  assert.equal(hz2.fallback.source, 'settings');
+});
+
+// ---- negative caching ---------------------------------------------------------------
+
+test('negative cache: NXDOMAIN is answered from cache for a short window', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv, d1 });
+
+  const savedFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input, /** @type {any} */ init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    upstreamCalls++;
+    const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
+    return new Response(buildResponse(q, [], 3));
+  });
+
+  try {
+    const first = await dohGet(env, buildQuery('nx.negator.com', { id: 0x1111 }));
+    assert.equal(rcode(new Uint8Array(await first.arrayBuffer())), 3);
+    assert.equal(first.headers.get('cache-control'), 'max-age=60', 'negatives cache briefly');
+    assert.equal(upstreamCalls, 1);
+
+    const second = await dohGet(env, buildQuery('nx.negator.com', { id: 0x2222 }));
+    const secondBytes = new Uint8Array(await second.arrayBuffer());
+    assert.equal(rcode(secondBytes), 3, 'still NXDOMAIN');
+    assert.equal((secondBytes[0] << 8) | secondBytes[1], 0x2222, 'transaction ID rewritten on a cache hit');
+    assert.equal(upstreamCalls, 1, 'served from cache, upstream not asked again');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+});
+
+test('negative cache: NODATA (NOERROR, zero answers) caches briefly too', async () => {
+  const { FakeKV: KV } = await import('./helpers.js');
+  const kv = new KV();
+  const env = mkEnv({ kv });
+
+  const savedFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = /** @type {any} */ (async (/** @type {any} */ input, /** @type {any} */ init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === BLOCKLIST_URL) return new Response('ok.test\n', { status: 200 });
+    upstreamCalls++;
+    const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
+    return new Response(buildResponse(q, []));
+  });
+
+  try {
+    const first = await dohGet(env, buildQuery('www.nodata-aaaa.com', { qtype: 28 }));
+    const f = new Uint8Array(await first.arrayBuffer());
+    assert.equal(rcode(f), 0, 'NOERROR');
+    assert.equal(ancount(f), 0, 'no records');
+    assert.equal(first.headers.get('cache-control'), 'max-age=60');
+    assert.equal(upstreamCalls, 1);
+
+    await dohGet(env, buildQuery('www.nodata-aaaa.com', { qtype: 28 }));
+    assert.equal(upstreamCalls, 1, 'NODATA served from cache');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 });

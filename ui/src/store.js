@@ -27,6 +27,7 @@ export const state = reactive({
   tlds: [],
   settings: null,
   upstream: null,
+  fallback: null,
   upstreamPresets: [],
 
   logs: { rows: [], total: 0, search: '', status: '', client: '', limit: 50, offset: 0 },
@@ -182,6 +183,7 @@ export async function boot() {
     const config = await api.getSettings();
     state.settings = config.settings;
     state.upstream = config.upstream;
+    state.fallback = config.fallback || null;
     state.upstreamPresets = config.upstreamPresets || [];
     await Promise.all([loadRules(), loadRoutes(), loadLists()]);
     await Promise.all([loadLogs(), loadStats()]);
@@ -213,6 +215,7 @@ export async function signOut() {
   state.tlds = [];
   state.settings = null;
   state.upstream = null;
+  state.fallback = null;
   state.upstreamPresets = [];
   state.stats = null;
   state.statsError = null;

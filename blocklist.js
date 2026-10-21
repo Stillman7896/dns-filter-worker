@@ -10,8 +10,11 @@ export const DEFAULT_BLOCKLIST_URL =
 export class Blocklist {
   constructor() {
     this.domains = new Set();
+    /** @type {Set<string>} `@@` exception entries from the same file. */
+    this.exceptions = new Set();
     this.loadedAt = 0;
     this.size = 0;
+    this.exceptionSize = 0;
   }
 
   /**
@@ -22,19 +25,29 @@ export class Blocklist {
    *   adblock wildcard  ||*.example.com^
    *   hosts row         0.0.0.0 example.com (also 127.0.0.1 / ::1; multiple
    *                      domains may follow the IP)
+   *   exception         @@example.com or @@||example.com^ — an allow entry that
+   *                      cancels a blocklist hit (blocklist scope only; custom
+   *                      rules and the other filters still apply)
    *
-   * Comments (`#`, `!`, `[Adblock ...]`) and `@@` exception rules are skipped —
-   * allow semantics live in the custom rule store, not here.
+   * Comments (`#`, `!`, `[Adblock ...]`) are skipped.
    * @param {string} text
    */
   load(text) {
     const set = new Set();
+    const exceptions = new Set();
     const lines = text.split('\n');
 
     for (let i = 0; i < lines.length; i++) {
       let line = lines[i].trim();
       if (!line || line[0] === '#' || line[0] === '!' || line[0] === '[') continue;
-      if (line.startsWith('@@')) continue; // adblock exception rules are not blocks
+      let isException = false;
+      if (line.startsWith('@@')) {
+        // Same grammar as blocking rows, minus the `@@`: both the plain and
+        // the `||domain^` dialects then parse through the normal branches.
+        isException = true;
+        line = line.slice(2).trim();
+        if (!line || line[0] === '#') continue;
+      }
 
       let domains;
       if (line[0] === '|') {
@@ -76,25 +89,26 @@ export class Blocklist {
         // malformed line (hosts-file rows, trailing commentary), never a domain
         if (d.length > 253 || d.indexOf(' ') !== -1 || d.indexOf('\t') !== -1) continue;
 
-        set.add(d);
+        (isException ? exceptions : set).add(d);
       }
     }
 
     this.domains = set;
     this.size = set.size;
+    this.exceptions = exceptions;
+    this.exceptionSize = exceptions.size;
     this.loadedAt = Date.now();
   }
 
   /**
-   * Returns the exact blocklist entry that matches `domain` (walking up
-   * parent labels), or null if not blocked.
+   * Returns the exact entry matching `domain` (walking up parent labels), or
+   * null. Shared by the block set and the exception set.
+   * @param {Set<string>} set
    * @param {string} domain
    * @returns {string|null}
    */
-  match(domain) {
-    const set = this.domains;
+  walk(set, domain) {
     let d = domain;
-
     if (d.charCodeAt(d.length - 1) === 46) d = d.slice(0, -1);
 
     for (;;) {
@@ -106,8 +120,40 @@ export class Blocklist {
     }
   }
 
+  /**
+   * Returns the exact blocklist entry that matches `domain` (walking up
+   * parent labels), or null if not blocked.
+   * @param {string} domain
+   * @returns {string|null}
+   */
+  match(domain) {
+    return this.walk(this.domains, domain);
+  }
+
+  /**
+   * Returns the `@@` exception entry that matches `domain`, or null.
+   * @param {string} domain
+   * @returns {string|null}
+   */
+  exception(domain) {
+    return this.exceptions.size ? this.walk(this.exceptions, domain) : null;
+  }
+
   /** @param {string} domain @returns {boolean} */
   isBlocked(domain) {
+    if (this.exception(domain)) return false;
     return this.match(domain) !== null;
+  }
+
+  /**
+   * Every `@@` exception entry, as allow-rule rows for the rules view.
+   * @returns {Array<{domain: string, kind: 'allow', src: 'blocklist'}>}
+   */
+  exceptionRules() {
+    /** @type {Array<{domain: string, kind: 'allow', src: 'blocklist'}>} */
+    const out = [];
+    for (const domain of this.exceptions) out.push({ domain, kind: 'allow', src: 'blocklist' });
+    out.sort((a, b) => a.domain.localeCompare(b.domain));
+    return out;
   }
 }

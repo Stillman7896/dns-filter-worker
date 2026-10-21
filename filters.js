@@ -69,7 +69,7 @@ export function idnHit(name) {
  * A response route comes first: it is a direct answer for the name, so it
  * outranks even an explicit deny rule. The caller turns `verdict.route` into
  * answer records with routeRecords().
- * @param {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, regex: {test(name: string): string|null}, tldStore: {get(): Set<string>}, routeStore?: {match(name: string): ({type:'a'|'aaaa'|'cname', value:string, ttl:number}&{at:string})|null}}} stores
+ * @param {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null, exception?: (name: string) => string|null}, keywordStore: {get(): Set<string>}, regex: {test(name: string): string|null}, tldStore: {get(): Set<string>}, routeStore?: {match(name: string): ({type:'a'|'aaaa'|'cname', value:string, ttl:number}&{at:string})|null}}} stores
  * @param {Pick<FilterSettings, 'rebindProtection'|'idnBlock'|'tldBlock'|'keywordBlock'|'regexBlock'>} settings
  * @param {string} name lowercase QNAME
  * @returns {{status:string, filter:string, matched:string|null, route?:{type:'a'|'aaaa'|'cname', value:string, ttl:number, at:string}}}
@@ -96,9 +96,11 @@ export function runQueryFilters(stores, settings, name) {
       : { status: 'deny', filter: 'denylist', matched: custom.at };
   }
 
-  // 3. remote blocklist (Hagezi pro-plus)
+  // 3. remote blocklist (Hagezi pro-plus); a `@@` exception in the same file
+  // cancels this verdict only — deny rules, TLD/keyword/regex still apply.
   const blockHit = blocklist.match(name);
-  if (blockHit) return { status: 'blocklist', filter: 'blocklist', matched: blockHit };
+  const blockExcept = blocklist.exception ? blocklist.exception(name) : null;
+  if (blockHit && !blockExcept) return { status: 'blocklist', filter: 'blocklist', matched: blockHit };
 
   // 4. TLD policy — one Set lookup on the last label
   if (settings.tldBlock) {

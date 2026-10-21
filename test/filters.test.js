@@ -13,12 +13,13 @@ const ON = { rebindProtection: true, idnBlock: true, tldBlock: true, keywordBloc
 const OFF = { rebindProtection: false, idnBlock: false, tldBlock: false, keywordBlock: false, regexBlock: false };
 
 /**
- * @param {{rules?: Array<[string, 'allow'|'deny']>, block?: string[], keywords?: string[], tlds?: string[], regexes?: string[]}} [o]
- * @returns {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null}, keywordStore: {get(): Set<string>}, regex: RegexEngine, tldStore: {get(): Set<string>}}}
+ * @param {{rules?: Array<[string, 'allow'|'deny']>, block?: string[], except?: string[], keywords?: string[], tlds?: string[], regexes?: string[]}} [o]
+ * @returns {{ruleStore: {match(name: string): {kind:'allow'|'deny', at:string}|null}, blocklist: {match(name: string): string|null, exception(name: string): string|null}, keywordStore: {get(): Set<string>}, regex: RegexEngine, tldStore: {get(): Set<string>}}}
  */
-function mkStores({ rules = [], block = [], keywords = [], tlds = [], regexes = [] } = {}) {
+function mkStores({ rules = [], block = [], except = [], keywords = [], tlds = [], regexes = [] } = {}) {
   const ruleMap = new Map(rules);
   const blockSet = new Set(block);
+  const exceptSet = new Set(except);
   return {
     ruleStore: {
       match(name) {
@@ -44,6 +45,17 @@ function mkStores({ rules = [], block = [], keywords = [], tlds = [], regexes = 
           if (dot === -1) return null;
           d = d.slice(dot + 1);
           if (d.indexOf('.') === -1) return blockSet.has(d) ? d : null;
+        }
+      },
+      /** @param {string} name */
+      exception(name) {
+        if (!exceptSet.size) return null;
+        for (let d = name; ;) {
+          if (exceptSet.has(d)) return d;
+          const dot = d.indexOf('.');
+          if (dot === -1) return null;
+          d = d.slice(dot + 1);
+          if (d.indexOf('.') === -1) return exceptSet.has(d) ? d : null;
         }
       },
     },
@@ -282,4 +294,26 @@ test('privateAnswerIP: degenerate buffers -> null', () => {
   const q = buildQuery('a.b');
   assert.equal(privateAnswerIP(q), null, 'query with no answers');
   assert.equal(privateAnswerIP(q.slice(0, 30)), null, 'truncated answer -> null');
+});
+
+// ---- blocklist @@ exceptions --------------------------------------------------
+
+test('exceptions: @@ cancels the blocklist hit, name resolves as none', () => {
+  const s = mkStores({ block: ['example.com'], except: ['sub.example.com'] });
+  assert.equal(runQueryFilters(s, OFF, 'sub.example.com').status, 'none');
+  assert.equal(runQueryFilters(s, OFF, 'a.sub.example.com').status, 'none', 'exception walks parents');
+  assert.equal(runQueryFilters(s, OFF, 'www.example.com').status, 'blocklist', 'unrelated subdomain still blocked');
+});
+
+test('exceptions: only the blocklist verdict is cancelled, later filters still run', () => {
+  const s = mkStores({ block: ['bad.zip'], except: ['bad.zip'], tlds: ['zip'], keywords: ['bad'] });
+  const v = runQueryFilters(s, ON, 'bad.zip');
+  assert.equal(v.status, 'tld', 'blocked TLD filter still applies after an @@ exception');
+});
+
+test('exceptions: a custom deny outranks an @@ exception', () => {
+  const s = mkStores({ rules: [['example.com', 'deny']], block: ['example.com'], except: ['www.example.com'] });
+  const v = runQueryFilters(s, OFF, 'www.example.com');
+  assert.equal(v.status, 'deny');
+  assert.equal(v.filter, 'denylist');
 });

@@ -48,6 +48,8 @@ interface Env {
   LOGS?: D1Like;
   BLOCKLIST_URL?: string;
   UPSTREAM_URL?: string;
+  /** Optional fallback DoH server used when the primary fails (see upstream.js). */
+  UPSTREAM_FALLBACK_URL?: string;
   DASHBOARD_PASSWORD?: string;
 }
 
@@ -66,6 +68,10 @@ interface FilterSettings {
   upstreamUrl: string;
   /** Relay URI template used by an ODoH provider. */
   upstreamRelay: string;
+  /** Retry a fallback DoH server when the primary fails (timeout, HTTP error, SERVFAIL/REFUSED). */
+  upstreamFailover: boolean;
+  /** Custom fallback DoH URL; '' uses a built-in alternate provider. */
+  upstreamFallbackUrl: string;
 }
 
 /** One response route: a fixed answer for a domain and its subdomains. */
@@ -84,8 +90,7 @@ interface ApiCtx {
   keywords: import('./lists.js').TextSetStore;
   tlds: import('./lists.js').TextSetStore;
   regex: import('./lists.js').TextSetStore;
-  // not used by the API itself; carried for tests that mirror wiring
-  blocklist?: unknown;
+  blocklist?: import('./blocklist.js').Blocklist;
 
   testFn(domain: string, env?: Env): any;
 }

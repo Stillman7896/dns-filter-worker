@@ -16,7 +16,7 @@ import { SettingsStore } from './settings.js';
 import { RouteStore, routeRecords } from './routing.js';
 import { TextSetStore, normalizeKeyword, normalizeRegex } from './lists.js';
 import { runQueryFilters, privateAnswerIP, BLOCKED_QUERY_STATUSES, RegexEngine } from './filters.js';
-import { resolveUpstream } from './upstream.js';
+import { resolveUpstream, resolveFallback } from './upstream.js';
 import { odohForward } from './odoh.js';
 import { handleApi } from './dashboard.js';
 import {
@@ -36,6 +36,7 @@ const BLOCKLIST_FETCH_TTL = Math.floor(BLOCKLIST_STALE_MS / 1000);
 const FETCHED_AT_HEADER = 'x-blocklist-fetched-at';
 const BLOCKED_MAX_AGE = 300; // filter-list / policy blocks: rarely unblocked
 const RULE_MAX_AGE = 30;     // custom allow/deny: user edits stay snappy
+const NEGATIVE_MAX_AGE = 60; // NXDOMAIN/NODATA from upstream: short, re-checks soon
 const RESP_CACHE_MAX = 2048; // isolate answer-cache cap (entries)
 const CACHE_ORIGIN = 'https://answer.cache/';
 const PRUNE_EVERY = 500; // opportunistic D1 retention batch size
@@ -172,9 +173,14 @@ async function ensureBlocklist(env, ctx) {
   }
 }
 
-/** @param {Uint8Array} queryBuf @param {ReturnType<typeof resolveUpstream>} upstream */
-async function forwardToUpstream(queryBuf, upstream) {
-  if (upstream.kind === 'odoh') return odohForward(upstream.url, upstream.relay, queryBuf);
+/**
+ * Forward a query to ONE upstream and return its answer bytes.
+ * @param {Uint8Array} queryBuf
+ * @param {{kind: 'doh'|'odoh', url: string, relay?: string}} upstream
+ * @returns {Promise<Uint8Array>}
+ */
+async function askUpstream(queryBuf, upstream) {
+  if (upstream.kind === 'odoh') return odohForward(upstream.url, upstream.relay || '', queryBuf);
   const res = await fetch(upstream.url, {
     method: 'POST',
     headers: { 'Content-Type': DNS_MEDIA_TYPE, Accept: DNS_MEDIA_TYPE },
@@ -182,6 +188,39 @@ async function forwardToUpstream(queryBuf, upstream) {
   });
   if (!res.ok) throw new Error(`upstream HTTP ${res.status}`);
   return Buf.from(await res.arrayBuffer());
+}
+
+// Rcodes that mean "this server couldn't answer", not "the name is bad":
+// SERVFAIL and REFUSED. NXDOMAIN and NOERROR/NODATA are real answers.
+const UPSTREAM_BAD_RC = new Set([2, 5]);
+
+/**
+ * Forward to the primary upstream, falling back to a secondary DoH server
+ * when the primary is unreachable, errors, or answers SERVFAIL/REFUSED.
+ * `fallback` is null when failover is switched off (settings or deployment).
+ * @param {Uint8Array} queryBuf
+ * @param {ReturnType<typeof resolveUpstream>} upstream
+ * @param {ReturnType<typeof resolveFallback>} fallback
+ * @returns {Promise<Uint8Array>}
+ */
+async function forwardToUpstream(queryBuf, upstream, fallback) {
+  /** @type {Uint8Array|null} */ let primary = null;
+  try {
+    primary = await askUpstream(queryBuf, upstream);
+  } catch { /* unreachable: the fallback below decides */ }
+
+  if (!fallback) {
+    if (primary) return primary;
+    throw new Error('upstream unreachable');
+  }
+  if (primary && !UPSTREAM_BAD_RC.has(primary[3] & 0x0f)) return primary;
+
+  try {
+    return await askUpstream(queryBuf, { kind: 'doh', url: fallback.url });
+  } catch {
+    if (primary) return primary; // the fallback is broken; the primary's answer stands
+    throw new Error('upstream and fallback unreachable');
+  }
 }
 
 /** Refresh every KV-backed store. All TTL-cached, so this is usually free. */
@@ -292,8 +331,8 @@ function answerCacheKey(epoch, name, qtype, dnssec) {
 }
 
 /** Epoch covering every setting that can change a verdict (rules share data:version). */
-/** @param {FilterSettings} settings @param {ReturnType<typeof resolveUpstream>} upstream @returns {string} */
-function configEpoch(settings, upstream) {
+/** @param {FilterSettings} settings @param {ReturnType<typeof resolveUpstream>} upstream @param {ReturnType<typeof resolveFallback>} fallback @returns {string} */
+function configEpoch(settings, upstream, fallback) {
   return (ruleStore.version || '0') +
     '.' + (settings.rebindProtection ? 1 : 0) +
     (settings.idnBlock ? 1 : 0) +
@@ -301,7 +340,23 @@ function configEpoch(settings, upstream) {
     (settings.keywordBlock ? 1 : 0) +
     (settings.regexBlock ? 1 : 0) +
     // Changing provider must never serve answers cached from the old one.
-    '|' + upstream.kind + '|' + upstream.url + '|' + upstream.relay;
+    '|' + upstream.kind + '|' + upstream.url + '|' + upstream.relay +
+    // Failover changes which server answers, so it rotates the epoch too.
+    '|' + (fallback ? fallback.url : 'off');
+}
+
+/**
+ * Cache TTL for an upstream answer: NXDOMAIN and NODATA (NOERROR with zero
+ * answer records) are cached briefly — long enough to cut upstream load,
+ * short enough to pick up a new record — anything else honours its own
+ * record TTLs via minTtl().
+ * @param {Uint8Array} answer @returns {number} seconds
+ */
+function answerTtl(answer) {
+  const rcode = answer[3] & 0x0f;
+  const answers = (answer[6] << 8) | answer[7];
+  if (rcode === 3 || (rcode === 0 && answers === 0)) return NEGATIVE_MAX_AGE;
+  return minTtl(answer);
 }
 
 /**
@@ -422,8 +477,9 @@ async function handleQuery(queryBuf, env, ctx, client = null) {
   const retention = settings.logRetentionDays;
   const logPassed = settings.logPassed !== false; // tolerate pre-toggle blobs
   const upstream = resolveUpstream(settings, env);
+  const fallback = resolveFallback(upstream, settings, env);
 
-  const key = answerCacheKey(configEpoch(settings, upstream), q.name, q.qtype, ednsDo(queryBuf));
+  const key = answerCacheKey(configEpoch(settings, upstream, fallback), q.name, q.qtype, ednsDo(queryBuf));
   const qid = (queryBuf[0] << 8) | queryBuf[1];
   const hit = await cachedAnswer(key, qid);
   if (hit) {
@@ -454,7 +510,7 @@ async function handleQuery(queryBuf, env, ctx, client = null) {
 
   // allow | none -> forward upstream
   try {
-    const answer = await forwardToUpstream(queryBuf, upstream);
+    const answer = await forwardToUpstream(queryBuf, upstream, fallback);
 
     if (verdict.status === 'none' && settings.rebindProtection) {
       const priv = privateAnswerIP(answer);
@@ -468,7 +524,7 @@ async function handleQuery(queryBuf, env, ctx, client = null) {
     if (logPassed) {
       await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention, client));
     }
-    return respond(answer, key, minTtl(answer), ctx);
+    return respond(answer, key, answerTtl(answer), ctx);
   } catch {
     // Upstream unavailable — never break DNS.
   }
@@ -545,7 +601,9 @@ export default {
     // ---- health ----
     if (url.pathname === '/healthz') {
       await Promise.all([ensureBlocklist(env, ctx), refreshStores()]);
-      const upstream = resolveUpstream(settingsStore.get(), env);
+      const settings = settingsStore.get();
+      const upstream = resolveUpstream(settings, env);
+      const fallback = resolveFallback(upstream, settings, env);
       return Response.json({
         ok: true,
         blocklistSize: blocklist.size,
@@ -555,10 +613,11 @@ export default {
         keywords: keywordStore.get().size,
         regexRules: regexStore.get().size,
         blockedTlds: tldStore.get().size,
-        settings: settingsStore.get(),
+        settings,
         blocklistUrl: env.BLOCKLIST_URL || DEFAULT_BLOCKLIST_URL,
         upstream,
         upstreamUrl: upstream.url,
+        fallback: fallback ? { label: fallback.label, url: fallback.url, source: fallback.source } : null,
         dashboardConfigured:
           typeof env.DASHBOARD_PASSWORD === 'string' && env.DASHBOARD_PASSWORD.length > 0,
       });

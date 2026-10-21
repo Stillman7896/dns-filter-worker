@@ -155,9 +155,50 @@ export function resolveUpstream(settings, env) {
 }
 
 /**
+ * The DoH server to try when the primary fails (network error, HTTP error,
+ * SERVFAIL/REFUSED). Returns null when failover is switched off.
+ *
+ * Precedence: `upstreamFailover === false` > `upstreamFallbackUrl` in the
+ * dashboard > `env.UPSTREAM_FALLBACK_URL` > a built-in preset from a different
+ * operator than the primary. The fallback is always plain DoH — ODoH relays
+ * add a second moving part exactly when the first one just failed.
+ * @param {{url: string, group?: string}|null} primary
+ * @param {{upstreamFailover?: boolean, upstreamFallbackUrl?: string}|null} settings
+ * @param {{UPSTREAM_FALLBACK_URL?: string}|null} [env]
+ * @returns {{id: string, label: string, url: string, source: 'settings'|'deploy'|'preset'}|null}
+ */
+export function resolveFallback(primary, settings, env) {
+  const s = settings || {};
+  if (s.upstreamFailover === false) return null;
+
+  const custom = typeof s.upstreamFallbackUrl === 'string' ? s.upstreamFallbackUrl : '';
+  if (isHttpsUrl(custom)) {
+    return { id: 'fallback-custom', label: 'Fallback DoH URL', url: custom.trim(), source: 'settings' };
+  }
+
+  const envUrl = env && typeof env.UPSTREAM_FALLBACK_URL === 'string' ? env.UPSTREAM_FALLBACK_URL : '';
+  if (isHttpsUrl(envUrl)) {
+    return { id: 'fallback-deploy', label: 'UPSTREAM_FALLBACK_URL variable', url: envUrl.trim(), source: 'deploy' };
+  }
+
+  const primaryUrl = primary && typeof primary.url === 'string' ? primary.url : '';
+  const primaryGroup = primary && primary.group ? primary.group : '';
+  // A different operator is a better safety net than the same one; if the
+  // primary's group owns every preset, any other endpoint will do.
+  const alt = UPSTREAM_PRESETS.find((p) => p.kind === 'doh' && p.url && !p.needsUrl && p.url !== primaryUrl)
+    || null;
+  const crossGroup = alt && primaryGroup
+    ? UPSTREAM_PRESETS.find((p) => p.kind === 'doh' && p.url && !p.needsUrl && p.url !== primaryUrl && p.group !== primaryGroup)
+    : null;
+  const chosen = crossGroup || alt;
+  if (!chosen) return null;
+  return { id: chosen.id, label: chosen.label, url: chosen.url, source: 'preset' };
+}
+
+/**
  * Is this stored combination usable? Checked before a save so the dashboard
  * can never leave the resolver without a working upstream.
- * @param {Pick<FilterSettings, 'upstreamPreset'|'upstreamUrl'|'upstreamRelay'>} settings
+ * @param {Pick<FilterSettings, 'upstreamPreset'|'upstreamUrl'|'upstreamRelay'> & {upstreamFallbackUrl?: string}} settings
  * @returns {string|null} error message, or null
  */
 export function validateUpstreamSettings(settings) {
@@ -165,7 +206,6 @@ export function validateUpstreamSettings(settings) {
   if (!preset) return null; // no explicit choice: the deploy variable / default applies
   if (preset.id === 'custom') {
     if (!isHttpsUrl(settings.upstreamUrl)) return 'a custom provider needs an https:// DoH URL';
-    return null;
   }
   if (preset.kind === 'odoh') {
     const relay = typeof settings.upstreamRelay === 'string' ? settings.upstreamRelay : '';
@@ -174,6 +214,8 @@ export function validateUpstreamSettings(settings) {
       return 'the relay must be an https:// template containing {?targethost,targetpath}';
     }
   }
+  const fallback = typeof settings.upstreamFallbackUrl === 'string' ? settings.upstreamFallbackUrl.trim() : '';
+  if (fallback && !isHttpsUrl(fallback)) return 'a fallback server needs an https:// DoH URL';
   return null;
 }
 
@@ -183,7 +225,7 @@ export function validateUpstreamSettings(settings) {
  * @returns {{patch: {upstreamPreset?: string, upstreamUrl?: string, upstreamRelay?: string}|null, error: string|null}}
  */
 export function upstreamPatch(source) {
-  /** @type {{upstreamPreset?: string, upstreamUrl?: string, upstreamRelay?: string}} */
+  /** @type {{upstreamPreset?: string, upstreamUrl?: string, upstreamRelay?: string, upstreamFallbackUrl?: string}} */
   const patch = {};
 
   if ('upstreamPreset' in source) {
@@ -202,6 +244,12 @@ export function upstreamPatch(source) {
     const relay = typeof source.upstreamRelay === 'string' ? source.upstreamRelay.trim() : null;
     if (relay === null) return { patch: null, error: 'upstreamRelay must be a string' };
     patch.upstreamRelay = relay;
+  }
+  if ('upstreamFallbackUrl' in source) {
+    const url = typeof source.upstreamFallbackUrl === 'string' ? source.upstreamFallbackUrl.trim() : null;
+    if (url === null) return { patch: null, error: 'upstreamFallbackUrl must be a string' };
+    if (url && !isHttpsUrl(url)) return { patch: null, error: 'a fallback server needs an https:// DoH URL' };
+    patch.upstreamFallbackUrl = url;
   }
 
   if (Object.keys(patch).length === 0) return { patch: null, error: null };

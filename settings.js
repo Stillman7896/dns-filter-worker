@@ -24,6 +24,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   upstreamPreset: '',     // provider id from upstream.js; '' = deploy variable, else built-in default
   upstreamUrl: '',        // DoH URL for the 'custom' provider
   upstreamRelay: '',      // relay URI template for an ODoH provider
+  upstreamFailover: true, // retry a fallback DoH server when the primary fails
+  upstreamFallbackUrl: '', // custom fallback DoH URL; '' = built-in alternate provider
 });
 
 /** Clamp a candidate retention value; returns 0..3650 or NaN if not a number.

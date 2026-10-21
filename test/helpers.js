@@ -79,17 +79,19 @@ export function buildQuery(name, opts = {}) {
 }
 
 /**
- * Append ANSWER records to a query, producing a full response message.
- * Names are compressed as a pointer to byte 12 (the question's QNAME start),
- * which is valid as long as `query` starts with the standard 12-byte header.
+ * Build a response message; names are compressed as a pointer to byte 12 (the
+ * question's QNAME start), valid while `query` starts with the standard
+ * 12-byte header. `rcode` lets a test answer SERVFAIL/NXDOMAIN.
  * @param {Uint8Array} query
  * @param {Array<{type:number, rdata:number[], ttl?:number}>} records
+ * @param {number} [rcode]
  * @returns {Uint8Array}
  */
-export function buildResponse(query, records) {
+export function buildResponse(query, records, rcode = 0) {
   const out = [...query];
-  // QR=1, keep RD, RCODE=0
+  // QR=1, keep RD, requested RCODE
   out[2] = out[2] | 0x80;
+  out[3] = (out[3] & 0xf0) | (rcode & 0x0f);
   out[6] = (records.length >> 8) & 0xff;
   out[7] = records.length & 0xff;
   for (const r of records) {

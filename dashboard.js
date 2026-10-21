@@ -16,12 +16,23 @@ import {
   findPreset,
   isHttpsUrl,
   probeUpstream,
+  resolveFallback,
   resolveUpstream,
   upstreamPatch,
   validateUpstreamSettings,
 } from './upstream.js';
 
 const SESSION_COOKIE = 'dns_dash_session';
+
+/**
+ * The fallback server the resolver would use for these settings (null when
+ * failover is off) — shown next to the primary so the dashboard states both.
+ * @param {FilterSettings} settings @param {Env} env
+ */
+function fallbackOf(settings, env) {
+  const f = resolveFallback(resolveUpstream(settings, env), settings, env);
+  return f ? { label: f.label, url: f.url, source: f.source } : null;
+}
 
 /** @param {Env} env @returns {boolean} */
 function isConfigured(env) {
@@ -86,7 +97,7 @@ function buildWhere(entries) {
 function settingsPatch(source, current = {}) {
   /** @type {Partial<FilterSettings>} */
   const patch = {};
-  const BOOL_KEYS = /** @type {const} */ (['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock', 'regexBlock', 'logPassed']);
+  const BOOL_KEYS = /** @type {const} */ (['rebindProtection', 'idnBlock', 'tldBlock', 'keywordBlock', 'regexBlock', 'logPassed', 'upstreamFailover']);
   for (const k of BOOL_KEYS) {
     if (typeof source[k] === 'boolean') patch[k] = source[k]; // k is a boolean key
   }
@@ -166,7 +177,10 @@ export async function handleApi(request, env, url, ctx) {
   // ---- custom rules ----
   if (path === '/api/rules' && request.method === 'GET') {
     await rules.refresh(true);
-    return json({ rules: await rules.list() });
+    const custom = (await rules.list()).map((r) => ({ ...r, src: 'custom' }));
+    // `@@` exceptions from the remote blocklist surface as read-only allow rows.
+    const exceptions = ctx.blocklist ? ctx.blocklist.exceptionRules() : [];
+    return json({ rules: [...custom, ...exceptions] });
   }
 
   if (path === '/api/rules' && request.method === 'POST') {
@@ -186,6 +200,9 @@ export async function handleApi(request, env, url, ctx) {
   if (path === '/api/rules' && request.method === 'DELETE') {
     const domain = normalizeDomain(url.searchParams.get('domain') || '');
     if (!domain) return json({ error: 'invalid domain' }, { status: 400 });
+    if (ctx.blocklist && ctx.blocklist.exception(domain)) {
+      return json({ error: 'this rule comes from the blocklist file (@@ exception) — edit the list, not this dashboard' }, { status: 400 });
+    }
     const existed = await rules.delete(domain);
     return json({ ok: true, existed });
   }
@@ -269,6 +286,7 @@ export async function handleApi(request, env, url, ctx) {
       return json({
         settings: current,
         upstream: resolveUpstream(current, env),
+        fallback: fallbackOf(current, env),
         upstreamPresets: UPSTREAM_PRESETS,
       });
     }
@@ -288,6 +306,7 @@ export async function handleApi(request, env, url, ctx) {
         ok: true,
         settings: settings.get(),
         upstream: resolveUpstream(settings.get(), env),
+        fallback: fallbackOf(settings.get(), env),
       });
     }
   }

@@ -150,6 +150,62 @@ const canProbe = computed(() => {
 function applyConfig(r) {
   state.settings = r.settings;
   if (r.upstream) state.upstream = r.upstream;
+  if ('fallback' in r) state.fallback = r.fallback;
+}
+
+// ---- fallback server ---------------------------------------------------------
+
+const fallbackUrl = ref(state.settings?.upstreamFallbackUrl || '');
+const fallbackOn = computed(() => state.settings?.upstreamFailover !== false);
+const fallbackInfo = computed(() => state.fallback);
+const fallbackProblem = computed(() => (fallbackUrl.value.trim() && !isHttpsUrl(fallbackUrl.value.trim())
+  ? 'Needs an https:// URL, like https://doh.example.com/dns-query.'
+  : ''));
+const fallbackDirty = computed(() => fallbackUrl.value.trim() !== (state.settings?.upstreamFallbackUrl || ''));
+
+const fallbackNote = computed(() => {
+  if (!fallbackOn.value) return 'Off — if the primary resolver fails, the query fails too.';
+  const info = fallbackInfo.value;
+  if (!info) return 'On, but no fallback server is available.';
+  if (info.source === 'settings') return `In use: ${info.url} (custom fallback URL).`;
+  if (info.source === 'deploy') return `In use: ${info.url} (UPSTREAM_FALLBACK_URL variable).`;
+  return `In use: ${info.url} — built-in alternate (${info.label}).`;
+});
+
+async function toggleFallback(value) {
+  const previous = state.settings.upstreamFailover;
+  state.settings.upstreamFailover = value; // optimistic; reverted if the worker refuses
+  try {
+    await runOp('set.upstreamFailover', {
+      verb: 'Save settings',
+      ok: `Fallback server ${value ? 'on' : 'off'}`,
+      fn: async () => {
+        const r = await api.saveSettings({ upstreamFailover: value });
+        applyConfig(r);
+        return r;
+      },
+    });
+  } catch {
+    state.settings.upstreamFailover = previous;
+  }
+}
+
+async function saveFallbackUrl() {
+  if (fallbackProblem.value || !fallbackDirty.value) return;
+  try {
+    await runOp('settings.fallback', {
+      verb: 'Save fallback',
+      ok: (r) => (r.fallback ? `Fallback: ${r.fallback.url}` : 'Fallback off'),
+      fn: async () => {
+        const r = await api.saveSettings({ upstreamFallbackUrl: fallbackUrl.value.trim() });
+        applyConfig(r);
+        fallbackUrl.value = r.settings.upstreamFallbackUrl || '';
+        return r;
+      },
+    });
+  } catch {
+    fallbackUrl.value = state.settings?.upstreamFallbackUrl || '';
+  }
 }
 
 async function saveProvider() {
@@ -386,6 +442,47 @@ async function removeRoute(route) {
             relay {{ effective.relay }}
           </p>
           <p class="hint mt-1.5">{{ sourceNote }}</p>
+        </div>
+
+        <!-- Fallback server -->
+        <div class="mt-3 rounded-md border border-line bg-raised px-3.5 py-3">
+          <ToggleSwitch
+            class="!py-0"
+            :model-value="fallbackOn"
+            label="Fallback DNS server"
+            :effect="'Retry a second server when this one is unreachable, errors, or answers SERVFAIL/REFUSED.'"
+            busy-key="set.upstreamFailover"
+            @update:model-value="toggleFallback"
+          />
+          <p class="hint mt-2.5" aria-live="polite">{{ fallbackNote }}</p>
+
+          <div v-if="fallbackOn" class="mt-3 flex flex-col gap-1.5">
+            <label class="label" for="fallback-url">Custom fallback URL (optional)</label>
+            <div class="flex flex-wrap gap-2.5">
+              <input
+                id="fallback-url"
+                v-model="fallbackUrl"
+                @input="fallbackUrl = $event.target.value"
+                type="url"
+                class="field flex-1 min-w-[220px] st"
+                placeholder="https://doh.example.com/dns-query"
+                autocapitalize="none"
+                spellcheck="false"
+                :aria-invalid="Boolean(fallbackProblem)"
+              />
+              <AppButton
+                variant="solid"
+                busy-key="settings.fallback"
+                :disabled="Boolean(fallbackProblem) || !fallbackDirty"
+                @click="saveFallbackUrl"
+              >
+                Save fallback
+              </AppButton>
+            </div>
+            <p class="hint" :class="fallbackProblem && 'text-block'" aria-live="polite">
+              {{ fallbackProblem || 'Leave empty to use the built-in alternate provider. The fallback answers in place of the primary only after the primary fails; NXDOMAIN from the primary is a real answer and is never retried.' }}
+            </p>
+          </div>
         </div>
 
         <!-- Probe result -->

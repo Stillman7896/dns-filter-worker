@@ -7,6 +7,7 @@ import { RuleStore } from '../rules.js';
 import { RouteStore } from '../routing.js';
 import { TextSetStore, normalizeKeyword, normalizeRegex } from '../lists.js';
 import { SettingsStore } from '../settings.js';
+import { Blocklist } from '../blocklist.js';
 import { buildQuery, buildResponse, FakeKV, v4rdata } from './helpers.js';
 
 /**
@@ -129,13 +130,44 @@ test('rules: add/get/delete with validation', async () => {
   assert.equal(badKind.status, 400);
 
   const listed = await call(ctx, env, '/api/rules', { cookie });
-  assert.deepEqual((await listed.json()).rules, [{ domain: 'evil.example.com', kind: 'deny' }]);
+  assert.deepEqual((await listed.json()).rules, [{ domain: 'evil.example.com', kind: 'deny', src: 'custom' }]);
 
   const del = await call(ctx, env, '/api/rules?domain=evil.example.com', { method: 'DELETE', cookie });
   assert.equal((await del.json()).existed, true);
 
   const listed2 = await call(ctx, env, '/api/rules', { cookie });
   assert.deepEqual((await listed2.json()).rules, []);
+});
+
+test('rules: blocklist @@ exceptions surface as read-only allow rows', async () => {
+  const kv = new FakeKV();
+  const ctx = mkCtx(kv);
+  const bl = new Blocklist();
+  bl.load(['||tracker.test^', '@@sub.tracker.test', '@@plain.blocklist.test'].join('\n'));
+  ctx.blocklist = bl;
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  await call(ctx, env, '/api/rules', {
+    method: 'POST', cookie, body: { domain: 'custom.test', kind: 'deny' },
+  });
+
+  const listed = await call(ctx, env, '/api/rules', { cookie });
+  assert.deepEqual((await listed.json()).rules, [
+    { domain: 'custom.test', kind: 'deny', src: 'custom' },
+    { domain: 'plain.blocklist.test', kind: 'allow', src: 'blocklist' },
+    { domain: 'sub.tracker.test', kind: 'allow', src: 'blocklist' },
+  ], 'custom rows first, blocklist rows sorted after');
+
+  const del = await call(ctx, env, '/api/rules?domain=sub.tracker.test', { method: 'DELETE', cookie });
+  assert.equal(del.status, 400, 'blocklist-sourced rows are read-only');
+  assert.match((await del.json()).error, /blocklist/);
+  assert.equal((await (await call(ctx, env, '/api/rules', { cookie })).json()).rules.length, 3, 'row unchanged');
+
+  const delCustom = await call(ctx, env, '/api/rules?domain=custom.test', { method: 'DELETE', cookie });
+  assert.equal(delCustom.status, 200, 'custom rows still deletable');
 });
 
 test('rules: bulk import reports applied and skipped', async () => {
@@ -744,7 +776,7 @@ test('backup: import replace clears each section before writing', async () => {
   assert.deepEqual(j.keywords, { applied: 0, skipped: 0 }, 'empty keywords clears the list');
 
   const rules = (await (await call(ctx, env, '/api/rules', { cookie })).json()).rules;
-  assert.deepEqual(rules, [{ domain: 'a.com', kind: 'allow' }]);
+  assert.deepEqual(rules, [{ domain: 'a.com', kind: 'allow', src: 'custom' }]);
   const tlds = (await (await call(ctx, env, '/api/filters/tlds', { cookie })).json()).items;
   assert.deepEqual(tlds, ['io']);
 });

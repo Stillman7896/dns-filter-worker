@@ -9,10 +9,21 @@ import { normalizeDomain } from '../validate.js';
 
 const domain = ref('');
 const kind = ref('deny');
+const view = ref('all'); // 'all' | 'deny' | 'allow'
 const ruleFilter = ref('');
 const bulkKind = ref('deny');
 const bulkText = ref('');
 const showBulk = ref(false);
+
+// One segmented view per verdict; the text filter narrows within the view.
+const visibleRules = computed(() =>
+  view.value === 'all' ? filteredRules.value : filteredRules.value.filter((r) => r.kind === view.value),
+);
+const customCount = computed(() => state.rules.filter((r) => r.src !== 'blocklist').length);
+const exceptionCount = computed(() => state.rules.length - customCount.value);
+const viewTitle = computed(() =>
+  view.value === 'deny' ? 'Block rules' : view.value === 'allow' ? 'Allow rules' : 'All rules',
+);
 
 // What the worker will store for the typed value, or '' when it would reject
 // it. Same function the API validates with, so the field can't disagree
@@ -96,8 +107,9 @@ function onFilter(e) {
       <div>
         <h1 class="text-[21px] font-semibold tracking-tight">Rules</h1>
         <p class="hint mt-1">
-          Custom answers run before the shared blocklist. {{ state.rules.length }}
-          {{ state.rules.length === 1 ? 'rule' : 'rules' }} on file.
+          Custom answers run before the shared blocklist. {{ customCount }}
+          {{ customCount === 1 ? 'custom rule' : 'custom rules' }}<template v-if="exceptionCount">
+          , {{ exceptionCount }} allow {{ exceptionCount === 1 ? 'exception' : 'exceptions' }} from the blocklist</template> on file.
         </p>
       </div>
       <AppButton @click="showBulk = !showBulk">
@@ -181,7 +193,16 @@ function onFilter(e) {
     <!-- Rows: one row per rule, labels always visible -->
     <section class="panel overflow-hidden">
       <div class="flex flex-wrap items-center gap-3 px-4 sm:px-5 py-3.5 border-b border-line">
-        <h2 class="text-[15px] font-medium">All rules</h2>
+        <h2 class="text-[15px] font-medium">{{ viewTitle }}</h2>
+        <Segmented
+          v-model="view"
+          :options="[
+            { value: 'all', label: 'All' },
+            { value: 'deny', label: 'Block' },
+            { value: 'allow', label: 'Allow' },
+          ]"
+          label="View"
+        />
         <label class="ml-auto flex items-center gap-2">
           <span class="sr-only">Filter rules</span>
           <input
@@ -194,18 +215,19 @@ function onFilter(e) {
         </label>
       </div>
 
-      <div v-if="filteredRules.length" class="overflow-x-auto">
+      <div v-if="visibleRules.length" class="overflow-x-auto">
         <table class="w-full min-w-[420px] border-collapse text-left">
           <caption class="sr-only">Custom allow and deny rules</caption>
           <thead class="text-[12.5px] text-muted border-b border-line">
             <tr>
               <th scope="col" class="px-5 py-2 font-medium">Domain</th>
               <th scope="col" class="px-3 py-2 font-medium whitespace-nowrap">Answer</th>
+              <th scope="col" class="px-3 py-2 font-medium whitespace-nowrap">Source</th>
               <th scope="col" class="px-5 py-2 font-medium text-right"><span class="sr-only">Action</span></th>
             </tr>
           </thead>
           <tbody class="divide-y divide-line/70">
-            <tr v-for="r in filteredRules" :key="r.domain" class="hover:bg-raised/60 transition-colors">
+            <tr v-for="r in visibleRules" :key="r.domain" class="hover:bg-raised/60 transition-colors">
               <td class="px-5 py-3 w-full min-w-0">
                 <span class="st text-[13.5px] truncate block" :title="r.domain">{{ r.domain }}</span>
               </td>
@@ -217,28 +239,49 @@ function onFilter(e) {
                   {{ r.kind === 'deny' ? 'blocked' : 'allowed' }}
                 </span>
               </td>
+              <td class="px-3 py-3 whitespace-nowrap">
+                <span
+                  class="text-[12px] st rounded border px-2 py-0.5"
+                  :class="r.src === 'blocklist' ? 'text-muted border-line' : 'text-ink border-line'"
+                  :title="r.src === 'blocklist'
+                    ? 'From the blocklist file (@@ exception) — edit the list, not this dashboard'
+                    : 'Set in this dashboard'"
+                >
+                  {{ r.src === 'blocklist' ? 'blocklist' : 'custom' }}
+                </span>
+              </td>
               <td class="px-5 py-3 text-right whitespace-nowrap">
                 <ConfirmButton
+                  v-if="r.src !== 'blocklist'"
                   small
                   label="Remove"
                   armed-label="Confirm?"
                   :busy-key="`rules.del:${r.domain}`"
                   @confirm="removeRule(r)"
                 />
+                <span v-else class="hint text-[12px]">read-only</span>
               </td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <div v-if="!filteredRules.length" class="px-5 py-10 text-center">
+      <div v-if="!visibleRules.length" class="px-5 py-10 text-center">
         <p class="text-[14px] font-medium">
-          {{ ruleFilter ? `No rule matches “${ruleFilter}”.` : 'No custom rules yet.' }}
+          {{ ruleFilter
+            ? `No rule matches “${ruleFilter}”.`
+            : view === 'deny' ? 'No block rules yet.'
+            : view === 'allow' ? 'No allow rules yet.'
+            : 'No custom rules yet.' }}
         </p>
         <p class="hint mt-1.5">
           {{ ruleFilter
             ? 'Try part of the domain, without the top-level suffix.'
-            : 'Add a domain above to force an answer, or force-allow one the shared blocklist stops.' }}
+            : view === 'deny'
+              ? 'Add a domain above to block it even when the shared list lets it through.'
+              : view === 'allow'
+                ? 'Allow rules force an answer. @@ exceptions in the blocklist file show up here too.'
+                : 'Add a domain above to force an answer, or force-allow one the shared blocklist stops.' }}
         </p>
       </div>
     </section>

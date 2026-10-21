@@ -2,7 +2,7 @@
 // Keeps the same routes, payload shapes and, importantly, the same auth flow:
 // everything is 401 until /api/session accepts a password.
 
-import { UPSTREAM_PRESETS, findPreset, probeUpstream, resolveUpstream } from '../../upstream.js';
+import { UPSTREAM_PRESETS, findPreset, probeUpstream, resolveFallback, resolveUpstream } from '../../upstream.js';
 import { normalizeRoute } from '../../routing.js';
 import { normalizeTld, normalizeKeyword, normalizeRegex } from '../../lists.js';
 import { normalizeDomain } from '../../rules.js';
@@ -18,12 +18,14 @@ const statusPool = [
 
 const fixtures = {
   rules: [
-    { domain: 'ads.example.net', kind: 'deny' },
-    { domain: 'cdn.internal.example.com', kind: 'deny' },
-    { domain: 'updates.acme.io', kind: 'allow' },
-    { domain: 'metrics.vendor.io', kind: 'deny' },
-    { domain: 'releases.example.com', kind: 'allow' },
-    { domain: 'beacon.partner.dev', kind: 'deny' },
+    { domain: 'ads.example.net', kind: 'deny', src: 'custom' },
+    { domain: 'cdn.internal.example.com', kind: 'deny', src: 'custom' },
+    { domain: 'updates.acme.io', kind: 'allow', src: 'custom' },
+    { domain: 'metrics.vendor.io', kind: 'deny', src: 'custom' },
+    { domain: 'releases.example.com', kind: 'allow', src: 'custom' },
+    { domain: 'beacon.partner.dev', kind: 'deny', src: 'custom' },
+    { domain: 'consent.partner.dev', kind: 'allow', src: 'blocklist' },
+    { domain: 'telemetry.vendor.io', kind: 'allow', src: 'blocklist' },
   ],
   routes: [
     { domain: 'nas.home.lan', type: 'a', value: '192.168.1.20', ttl: 300 },
@@ -43,9 +45,16 @@ const fixtures = {
     upstreamPreset: 'cloudflare',
     upstreamUrl: '',
     upstreamRelay: '',
+    upstreamFailover: true,
+    upstreamFallbackUrl: '',
   },
   logs: [],
 };
+
+function mockFallback() {
+  const f = resolveFallback(resolveUpstream(fixtures.settings, {}), fixtures.settings, {});
+  return f ? { label: f.label, url: f.url, source: f.source } : null;
+}
 
 // Deterministic PRNG so screenshots and manual testing stay stable.
 function mulberry(seed) {
@@ -180,7 +189,7 @@ export function mockApi(req, res, next) {
       if (!domain) return json(res, 400, { error: 'invalid domain' });
       if (kind !== 'allow' && kind !== 'deny') return json(res, 400, { error: 'kind must be allow|deny' });
       const i = fixtures.rules.findIndex((r) => r.domain === domain);
-      const entry = { domain, kind };
+      const entry = { domain, kind, src: 'custom' };
       if (i >= 0) fixtures.rules[i] = entry; else fixtures.rules.push(entry);
       fixtures.rules.sort((a, b) => a.domain.localeCompare(b.domain));
       return json(res, 200, { ok: true, domain, kind });
@@ -188,6 +197,9 @@ export function mockApi(req, res, next) {
     if (p === '/api/rules' && req.method === 'DELETE') {
       const domain = url.searchParams.get('domain');
       const i = fixtures.rules.findIndex((r) => r.domain === domain);
+      if (i >= 0 && fixtures.rules[i].src === 'blocklist') {
+        return json(res, 400, { error: 'this rule comes from the blocklist file (@@ exception) — edit the list, not this dashboard' });
+      }
       if (i >= 0) fixtures.rules.splice(i, 1);
       return json(res, 200, { ok: true, existed: i >= 0 });
     }
@@ -197,7 +209,7 @@ export function mockApi(req, res, next) {
       const valid = lines.map((l) => l.trim().toLowerCase()).filter(Boolean);
       for (const domain of valid) {
         const i = fixtures.rules.findIndex((r) => r.domain === domain);
-        const entry = { domain, kind };
+        const entry = { domain, kind, src: 'custom' };
         if (i >= 0) fixtures.rules[i] = entry; else fixtures.rules.push(entry);
       }
       fixtures.rules.sort((a, b) => a.domain.localeCompare(b.domain));
@@ -234,6 +246,7 @@ export function mockApi(req, res, next) {
         return json(res, 200, {
           settings: fixtures.settings,
           upstream: resolveUpstream(fixtures.settings, {}),
+          fallback: mockFallback(),
           upstreamPresets: UPSTREAM_PRESETS,
         });
       }
@@ -244,6 +257,7 @@ export function mockApi(req, res, next) {
           ok: true,
           settings: fixtures.settings,
           upstream: resolveUpstream(fixtures.settings, {}),
+          fallback: mockFallback(),
         });
       }
     }

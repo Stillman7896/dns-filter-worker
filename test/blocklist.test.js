@@ -71,3 +71,46 @@ test('match: walks parent labels, reports the entry that matched', () => {
   assert.equal(bl.isBlocked('good.example.org'), false);
   assert.equal(typeof DEFAULT_BLOCKLIST_URL, 'string', 'default source exported');
 });
+test('exceptions: @@ lines parse into a separate set, both dialects', () => {
+  const bl = new Blocklist();
+  bl.load([
+    '||example.com^',
+    'ads.example.com',
+    '@@clean.example.com',
+    '@@||allowed.example.com^',
+    '@@', // empty -> skipped
+    '! @@comment-like line stays a comment',
+  ].join('\n'));
+
+  assert.equal(bl.size, 2, 'blocking rows unchanged');
+  assert.equal(bl.exceptionSize, 2);
+  assert.ok(!bl.domains.has('clean.example.com'), 'exception never blocks');
+  assert.ok(!bl.domains.has('allowed.example.com'), 'adblock-dialect exception never blocks');
+  assert.ok(bl.exceptions.has('clean.example.com'));
+  assert.ok(bl.exceptions.has('allowed.example.com'));
+  assert.equal(bl.exception('clean.example.com'), 'clean.example.com');
+  assert.equal(bl.exception('x.y.allowed.example.com'), 'allowed.example.com', 'exceptions walk parents too');
+  assert.equal(bl.exception('other.test'), null);
+});
+
+test('exceptions: a hit cancels the blocklist verdict only', () => {
+  const bl = new Blocklist();
+  bl.load(['example.com', '@@sub.example.com'].join('\n'));
+
+  assert.equal(bl.isBlocked('sub.example.com'), false, 'exception wins over the block');
+  assert.equal(bl.isBlocked('deep.sub.example.com'), false, 'exception applies to subdomains');
+  assert.equal(bl.isBlocked('www.example.com'), true, 'sibling subdomain stays blocked');
+  assert.equal(bl.isBlocked('example.com'), true, 'the blocked apex itself is not exempted');
+});
+
+test('exceptionRules: sorted allow rows tagged with the blocklist source', () => {
+  const bl = new Blocklist();
+  bl.load(['zblock.test', '@@b.example.com', '@@a.example.com'].join('\n'));
+
+  assert.deepEqual(bl.exceptionRules(), [
+    { domain: 'a.example.com', kind: 'allow', src: 'blocklist' },
+    { domain: 'b.example.com', kind: 'allow', src: 'blocklist' },
+  ]);
+  bl.load('plain.test\n');
+  assert.deepEqual(bl.exceptionRules(), [], 'no @@ lines -> no rows');
+});
