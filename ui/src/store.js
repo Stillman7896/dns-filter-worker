@@ -29,6 +29,8 @@ export const state = reactive({
   upstream: null,
   fallback: null,
   upstreamPresets: [],
+  // Subscribed blocklists: { subscriptions, total, totalExceptions, entryLimit, maxUrls }
+  blocklist: null,
 
   logs: { rows: [], total: 0, search: '', status: '', client: '', limit: 50, offset: 0 },
   stats: null,
@@ -185,7 +187,7 @@ export async function boot() {
     state.upstream = config.upstream;
     state.fallback = config.fallback || null;
     state.upstreamPresets = config.upstreamPresets || [];
-    await Promise.all([loadRules(), loadRoutes(), loadLists()]);
+    await Promise.all([loadRules(), loadRoutes(), loadLists(), loadBlocklists()]);
     await Promise.all([loadLogs(), loadStats()]);
     state.phase = 'ready';
   } catch (e) {
@@ -217,6 +219,7 @@ export async function signOut() {
   state.upstream = null;
   state.fallback = null;
   state.upstreamPresets = [];
+  state.blocklist = null;
   state.stats = null;
   state.statsError = null;
   state.logs = { rows: [], total: 0, search: '', status: '', client: '', limit: state.logs.limit, offset: 0 };
@@ -242,6 +245,10 @@ export async function loadLists() {
   state.keywords = k.items;
   state.regex = r.items;
   state.tlds = t.items;
+}
+
+export async function loadBlocklists() {
+  state.blocklist = await api.blocklists();
 }
 
 export async function loadLogs() {

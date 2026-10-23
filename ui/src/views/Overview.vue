@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue';
 import { state, runOp, loadStats, setRoute } from '../store.js';
+import { BLOCKLIST_ENTRY_LIMIT } from '../validate.js';
 import AppButton from '../components/AppButton.vue';
 import CopyField from '../components/CopyField.vue';
 import Modal from '../components/Modal.vue';
@@ -34,10 +35,15 @@ const counts = computed(() => ({
   tlds: state.tlds.length,
 }));
 
-// Only the on/off switches count here; logRetentionDays is a number and would
-// otherwise be in the denominator unmovable.
-const switches = computed(() => Object.values(state.settings || {}).filter((v) => typeof v === 'boolean'));
-const switchesOn = computed(() => switches.value.filter(Boolean).length);
+// The blocklist is the only filter whose size is not a user-typed list: it is
+// what the worker actually holds in memory, which is the number worth showing
+// (and the one that can outgrow the free plan's memory).
+const blocklist = computed(() => state.blocklist);
+const blocklistEntries = computed(() => blocklist.value?.total ?? 0);
+const blocklistLists = computed(() => blocklist.value?.subscriptions.length ?? 0);
+const overEntryLimit = computed(
+  () => blocklistEntries.value > (blocklist.value?.entryLimit ?? BLOCKLIST_ENTRY_LIMIT)
+);
 
 // ---- endpoint + setup guide ---------------------------------------------------
 
@@ -238,10 +244,33 @@ async function refresh() {
           <p class="hint mt-1">{{ counts.routes }} routes · {{ counts.keywords }} keywords · {{ counts.tlds }} TLDs</p>
         </div>
         <div class="panel p-4">
-          <p class="text-[12.5px] text-muted">Protections on</p>
-          <p class="st text-[26px] mt-1 leading-none">{{ switchesOn }}</p>
-          <p class="hint mt-1">of {{ switches.length }} switches</p>
+          <p class="text-[12.5px] text-muted">Blocklist entries in memory</p>
+          <p class="st text-[26px] mt-1 leading-none" :class="overEntryLimit && 'text-block'">
+            {{ blocklistEntries.toLocaleString() }}
+          </p>
+          <p class="hint mt-1">
+            {{ blocklistLists }} {{ blocklistLists === 1 ? 'subscription' : 'subscriptions' }}
+            <template v-if="blocklist?.totalExceptions">
+              · {{ blocklist.totalExceptions.toLocaleString() }} exceptions
+            </template>
+          </p>
         </div>
+      </div>
+
+      <!-- Free-plan memory guard: the count above is what the isolate holds. -->
+      <div v-if="overEntryLimit" class="panel border-block/40 bg-block/5 p-4 rise-in" role="alert">
+        <p class="text-[13px] font-medium text-block">
+          More than {{ (blocklist?.entryLimit ?? BLOCKLIST_ENTRY_LIMIT).toLocaleString() }} entries held in memory
+        </p>
+        <p class="hint mt-1">
+          A Worker on the free plan gets 128 MB — a set this large can end the isolate with an
+          out-of-memory error, and every query fails while it does. Drop a subscription or switch to a
+          smaller list on the
+          <button type="button" class="text-ink underline underline-offset-2" @click="setRoute('lists')">
+            Filter lists
+          </button>
+          page.
+        </p>
       </div>
 
       <!-- Volume instrument -->

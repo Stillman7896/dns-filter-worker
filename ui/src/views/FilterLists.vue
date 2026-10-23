@@ -1,9 +1,18 @@
 <script setup>
-import { ref } from 'vue';
-import { state, runOp, loadLists, setRoute } from '../store.js';
+import { ref, computed } from 'vue';
+import { state, runOp, loadLists, loadBlocklists, setRoute } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
-import { normalizeTld, normalizeKeyword, normalizeRegex } from '../validate.js';
+import ConfirmButton from '../components/ConfirmButton.vue';
+import ToggleSwitch from '../components/ToggleSwitch.vue';
+import {
+  normalizeTld,
+  normalizeKeyword,
+  normalizeRegex,
+  isHttpsUrl,
+  MAX_BLOCKLIST_URLS,
+  BLOCKLIST_ENTRY_LIMIT,
+} from '../validate.js';
 
 const FORMS = [
   {
@@ -42,12 +51,12 @@ const FORMS = [
     empty: 'Add a pattern like “cdn\\d+\\.example\\.com” to start stopping queries.',
     addLabel: 'regex',
     normalize: normalizeRegex,
-    on: () => state.settings?.regexBlock,
-    kicker: 'Regex blocking is switched off in Settings.',
+    engine: true, // the section header carries the on/off switch itself
   },
 ];
 
 const draft = ref({ tld: '', keyword: '', regex: '' });
+const blDraft = ref('');
 
 const items = (id) => (id === 'tlds' ? state.tlds : id === 'regex' ? state.regex : state.keywords);
 const typed = (form) => draft.value[form.key].trim();
@@ -91,25 +100,219 @@ async function remove(form, value) {
     },
   }).catch(() => {});
 }
+
+// ---- blocklist subscriptions ------------------------------------------------
+
+const blocklist = computed(() => state.blocklist);
+const subs = computed(() => blocklist.value?.subscriptions ?? []);
+const blTotal = computed(() => blocklist.value?.total ?? 0);
+const blMax = computed(() => blocklist.value?.maxUrls ?? MAX_BLOCKLIST_URLS);
+const blLimit = computed(() => blocklist.value?.entryLimit ?? BLOCKLIST_ENTRY_LIMIT);
+const atMax = computed(() => subs.value.length >= blMax.value);
+const overLimit = computed(() => blTotal.value > blLimit.value);
+
+const blProblem = computed(() => {
+  const v = blDraft.value.trim();
+  if (!v) return '';
+  if (!isHttpsUrl(v)) return 'Needs an https:// URL — the worker fetches the list over https.';
+  if (subs.value.some((s) => s.url === v)) return 'That blocklist is already subscribed.';
+  return '';
+});
+const blCanAdd = computed(() => isHttpsUrl(blDraft.value.trim()) && !blProblem.value && !atMax.value);
+
+async function addBlocklist() {
+  const url = blDraft.value.trim();
+  if (!blCanAdd.value) return;
+  try {
+    await runOp('lists.blocklist.add', {
+      verb: 'Add blocklist',
+      ok: (r) => `${r.subscriptions.length} subscription${r.subscriptions.length === 1 ? '' : 's'}`,
+      undo: async () => {
+        await api.removeBlocklist(url);
+        await loadBlocklists();
+      },
+      fn: async () => {
+        const r = await api.addBlocklist(url);
+        await loadBlocklists();
+        return r;
+      },
+    });
+    blDraft.value = '';
+  } catch { /* the alert stack carries the reason */ }
+}
+
+async function removeBlocklist(url) {
+  await runOp(`lists.blocklist.del:${url}`, {
+    verb: 'Remove blocklist',
+    ok: 'Blocklist removed',
+    undo: async () => {
+      await api.addBlocklist(url);
+      await loadBlocklists();
+    },
+    fn: async () => {
+      await api.removeBlocklist(url);
+      await loadBlocklists();
+      return url;
+    },
+  }).catch(() => {});
+}
+
+async function reloadBlocklists() {
+  await runOp('lists.blocklist.reload', {
+    verb: 'Reload blocklists',
+    ok: 'Blocklists reloaded',
+    fn: async () => {
+      await api.reloadBlocklists();
+      await loadBlocklists();
+    },
+  }).catch(() => {});
+}
+
+// ---- regex engine toggle (mirrors Settings.toggle) -------------------------
+
+async function toggleRegex(value) {
+  const previous = state.settings.regexBlock;
+  state.settings.regexBlock = value; // optimistic; reverted if the worker refuses
+  try {
+    await runOp('set.regexBlock', {
+      verb: 'Save settings',
+      ok: `Regex blocking ${value ? 'on' : 'off'}`,
+      fn: () => api.saveSettings({ regexBlock: value }),
+    });
+  } catch {
+    state.settings.regexBlock = previous;
+  }
+}
 </script>
 
 <template>
   <div class="space-y-6">
     <div>
       <h1 class="text-[21px] font-semibold tracking-tight">Filter lists</h1>
-      <p class="hint mt-1">Three plain lists that decide on their own, independent of the shared blocklist.</p>
+      <p class="hint mt-1">Remote blocklist subscriptions and three plain lists that decide on their own.</p>
     </div>
+
+    <!-- Blocklist subscriptions: the worker holds these in memory -->
+    <section class="panel overflow-hidden">
+      <div class="px-5 py-4 border-b border-line flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <h2 class="text-[15px] font-medium">Blocklist subscriptions</h2>
+        <span class="st text-[12.5px] text-muted">
+          {{ subs.length }}/{{ blMax }} listed
+          <template v-if="blocklist?.totalExceptions">
+            · {{ blocklist.totalExceptions.toLocaleString() }} exceptions
+          </template>
+        </span>
+        <AppButton
+          v-if="subs.length"
+          small
+          busy-key="lists.blocklist.reload"
+          class="ml-auto"
+          @click="reloadBlocklists"
+        >
+          Reload
+        </AppButton>
+      </div>
+
+      <div class="px-5 py-4">
+        <form class="flex flex-wrap items-center gap-2.5" @submit.prevent="addBlocklist">
+          <input
+            v-model="blDraft"
+            @input="blDraft = $event.target.value"
+            type="url"
+            class="field flex-1 min-w-[220px] st"
+            placeholder="https://raw.githubusercontent.com/…/domains"
+            aria-label="Blocklist URL to subscribe"
+            autocapitalize="none"
+            spellcheck="false"
+            :aria-invalid="Boolean(blProblem)"
+          />
+          <AppButton
+            variant="solid"
+            type="submit"
+            busy-key="lists.blocklist.add"
+            :disabled="!blCanAdd"
+          >
+            Add blocklist
+          </AppButton>
+        </form>
+
+        <p class="hint mt-2.5" :class="blProblem && 'text-block'" aria-live="polite">
+          {{ blProblem || 'Each subscription is fetched over https and merged in memory; the union answers every query.' }}
+        </p>
+
+        <div v-if="subs.length" class="mt-4 divide-y divide-line/70">
+          <div
+            v-for="s in subs"
+            :key="s.url"
+            class="py-3 flex flex-wrap items-baseline gap-x-3 gap-y-1"
+          >
+            <div class="min-w-0 flex-1">
+              <span class="st text-[13px] break-all" :title="s.url">{{ s.url }}</span>
+              <span
+                v-if="s.source === 'deploy'"
+                class="ml-2 st text-[11px] rounded border border-beacon/40 text-beacon px-1.5 py-0.5 align-middle"
+                title="Comes from the BLOCKLIST_URL deployment variable — editable and deletable like any other."
+              >
+                default
+              </span>
+            </div>
+            <div class="flex items-baseline gap-3 text-[12.5px] text-muted st">
+              <span>{{ s.entries.toLocaleString() }} entries</span>
+              <span v-if="s.exceptions">· {{ s.exceptions.toLocaleString() }} except.</span>
+              <span
+                v-if="s.error"
+                class="text-block"
+                :title="s.error"
+              >
+                · {{ s.error }}
+              </span>
+            </div>
+            <ConfirmButton
+              small
+              label="Remove"
+              armed-label="Confirm?"
+              :busy-key="`lists.blocklist.del:${s.url}`"
+              @confirm="removeBlocklist(s.url)"
+            />
+          </div>
+        </div>
+
+        <p v-else class="hint mt-3">
+          No remote blocklist — every query goes to the upstream unless a rule or filter stops it.
+        </p>
+      </div>
+
+      <div class="px-5 py-3 border-t border-line flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <p class="hint st">
+          {{ blTotal.toLocaleString() }} entries held in memory
+        </p>
+        <p v-if="overLimit" class="st text-[12.5px] text-block" role="alert">
+          More than {{ blLimit.toLocaleString() }} entries — the free plan can run the isolate out of memory.
+        </p>
+      </div>
+    </section>
 
     <section
       v-for="form in FORMS"
       :key="form.id"
       class="panel overflow-hidden"
     >
-      <div class="px-5 py-4 border-b border-line flex flex-wrap items-baseline gap-x-3 gap-y-1">
+      <div class="px-5 py-4 border-b border-line flex flex-wrap items-center gap-x-3 gap-y-1">
         <h2 class="text-[15px] font-medium">{{ form.title }}</h2>
         <span class="st text-[12.5px] text-muted">{{ items(form.id).length }} listed</span>
+        <!-- Regex carries its own on/off switch in this header; the other two
+             still point at Settings while their toggles live there. -->
+        <ToggleSwitch
+          v-if="form.engine && state.settings"
+          class="ml-auto !py-0"
+          :model-value="Boolean(state.settings.regexBlock)"
+          label="Regex blocking"
+          effect="Apply the patterns below to live queries."
+          busy-key="set.regexBlock"
+          @update:model-value="toggleRegex"
+        />
         <button
-          v-if="!form.on()"
+          v-else-if="!form.on()"
           type="button"
           class="ml-auto text-[13px] text-beacon underline underline-offset-2"
           @click="setRoute('settings')"

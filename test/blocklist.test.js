@@ -2,7 +2,14 @@
 // The list format is one domain per line; comments/blank/malformed lines are skipped.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Blocklist, DEFAULT_BLOCKLIST_URL } from '../blocklist.js';
+import {
+  Blocklist,
+  DEFAULT_BLOCKLIST_URL,
+  MAX_BLOCKLIST_URLS,
+  effectiveBlocklistUrls,
+  normalizeBlocklistUrls,
+  parseBlocklist,
+} from '../blocklist.js';
 
 test('load: plaintext lines parse; comments, blanks and malformed rows are skipped', () => {
   const bl = new Blocklist();
@@ -113,4 +120,139 @@ test('exceptionRules: sorted allow rows tagged with the blocklist source', () =>
   ]);
   bl.load('plain.test\n');
   assert.deepEqual(bl.exceptionRules(), [], 'no @@ lines -> no rows');
+});
+
+// ---- parseBlocklist -----------------------------------------------------------
+
+test('parseBlocklist: returns blocking and exception sets without a Blocklist', () => {
+  const { domains, exceptions } = parseBlocklist([
+    '! comment',
+    '||ads.example.com^',
+    '0.0.0.0 tracker.example.net',
+    '@@||cdn.example.com^',
+    'not a domain line',
+  ].join('\n'));
+
+  assert.deepEqual([...domains].sort(), ['ads.example.com', 'tracker.example.net']);
+  assert.deepEqual([...exceptions], ['cdn.example.com']);
+  assert.deepEqual(parseBlocklist('').domains.size, 0, 'empty document is not an error');
+});
+
+// ---- multi-source subscriptions ------------------------------------------------
+
+test('multi-source: the union answers, one list can be dropped without the other', () => {
+  const bl = new Blocklist();
+  const A = 'https://a.test/list';
+  const B = 'https://b.test/list';
+
+  bl.setSources([A, B]);
+  bl.putSource(A, ['shared.test', 'only.a.test', '@@allow.a.test'].join('\n'));
+  bl.putSource(B, ['shared.test', 'only.b.test', '@@allow.b.test'].join('\n'));
+
+  assert.equal(bl.size, 3, 'union counts the shared domain once');
+  assert.equal(bl.exceptionSize, 2, 'exceptions merge too');
+  assert.equal(bl.match('x.only.a.test'), 'only.a.test');
+  assert.equal(bl.match('only.b.test'), 'only.b.test');
+  assert.equal(bl.isBlocked('allow.a.test'), false, 'a @@ row from any list exempts');
+
+  bl.setSources([A]);
+  assert.equal(bl.size, 2, 'dropping B frees its entries');
+  assert.equal(bl.match('only.b.test'), null, 'B no longer blocks');
+  assert.equal(bl.match('only.a.test'), 'only.a.test', 'A is untouched by the drop');
+  assert.equal(bl.exceptionSize, 1, 'B exceptions dropped with it');
+});
+
+test('setSources: adding a URL keeps every loaded document in place', () => {
+  const bl = new Blocklist();
+  const A = 'https://a.test/list';
+  bl.setSources([A]);
+  bl.putSource(A, 'one.test\n');
+
+  bl.setSources([A, 'https://c.test/list']);
+  assert.equal(bl.size, 1, 'the new URL starts empty, A keeps its entries');
+  assert.equal(bl.sourceLoaded('https://c.test/list'), false, 'not fetched yet');
+  assert.equal(bl.sourceFresh('https://c.test/list', 1), false, 'loadedAt 0 is never fresh');
+  assert.equal(bl.sourceFresh(A, 60_000), true, 'A still inside its window');
+});
+
+test('listSources: sorted per-subscription numbers, anonymous load excluded', () => {
+  const bl = new Blocklist();
+  bl.load('solo.test\n'); // anonymous '' source (back-compatible single document)
+
+  assert.deepEqual(bl.listSources(), [], 'the "" document is not a subscription');
+
+  bl.setSources(['https://z.test/list', 'https://a.test/list']);
+  bl.putSource('https://z.test/list', 'z1.test\nz2.test\n@@z-ex.test\n');
+  bl.putSource('https://a.test/list', 'a1.test\n');
+  bl.sourceError('https://a.test/list', 'blocklist HTTP 500 for https://a.test/list');
+
+  const sources = bl.listSources();
+  assert.deepEqual(
+    sources.map(({ url, entries, exceptions, error }) => ({ url, entries, exceptions, error })),
+    [
+      { url: 'https://a.test/list', entries: 1, exceptions: 0, error: 'blocklist HTTP 500 for https://a.test/list' },
+      { url: 'https://z.test/list', entries: 2, exceptions: 1, error: null },
+    ],
+    'sorted by URL with per-source numbers',
+  );
+  assert.ok(sources.every((s) => s.loadedAt > 0), 'every loaded source carries its fetch time');
+  assert.ok(bl.sourceLoaded('https://z.test/list'));
+  bl.sourceError('https://z.test/list', 'network is down');
+  assert.equal(bl.listSources()[1].error, 'network is down');
+  bl.touchSource('https://z.test/list');
+  assert.equal(bl.listSources()[1].error, null, 'a 304 clears the stale error');
+  assert.equal(bl.listSources()[0].error, 'blocklist HTTP 500 for https://a.test/list',
+    'touching one source never clears another');
+});
+
+// ---- normalizeBlocklistUrls ----------------------------------------------------
+
+test('normalizeBlocklistUrls: https only, trimmed, de-duplicated, capped', () => {
+  const a = 'https://a.test/list';
+  const b = 'http://insecure.test/list'; // plain http is refused
+  assert.deepEqual(normalizeBlocklistUrls([a, b]), [a], 'http rows are dropped, not fatal');
+  assert.deepEqual(normalizeBlocklistUrls([`  ${a}  `, a]), [a], 'trimmed and deduped');
+  assert.deepEqual(normalizeBlocklistUrls(['ftp://x.test/l', 42, null, 'not a url']), [], 'garbage rows dropped');
+  assert.deepEqual(normalizeBlocklistUrls('https://a.test'), [], 'not an array');
+
+  const many = Array.from({ length: 40 }, (_, i) => `https://l${i}.test/list`);
+  assert.equal(normalizeBlocklistUrls(many).length, MAX_BLOCKLIST_URLS, `capped at ${MAX_BLOCKLIST_URLS}`);
+});
+
+test('normalizeBlocklistUrls: credentials in the URL are refused', () => {
+  assert.deepEqual(normalizeBlocklistUrls(['https://user:pass@a.test/list']), [], 'no embedded credentials');
+  assert.deepEqual(normalizeBlocklistUrls(['https://a.test/list']), ['https://a.test/list']);
+});
+
+// ---- effectiveBlocklistUrls (tri-state) -----------------------------------------
+
+test('effectiveBlocklistUrls: null -> the deployment variable as its one entry', () => {
+  const env = { BLOCKLIST_URL: 'https://env.test/list' };
+  assert.deepEqual(effectiveBlocklistUrls({ blocklistUrls: null }, env), ['https://env.test/list']);
+  assert.deepEqual(effectiveBlocklistUrls({ blocklistUrls: null }, {}), [DEFAULT_BLOCKLIST_URL],
+    'no variable -> the built-in default');
+  assert.deepEqual(
+    effectiveBlocklistUrls({ blocklistUrls: null }, { BLOCKLIST_URL: '  https://spaced.test/list  ' }),
+    ['https://spaced.test/list'],
+    'the variable is trimmed',
+  );
+});
+
+test('effectiveBlocklistUrls: [] means the remote blocklist is off on purpose', () => {
+  assert.deepEqual(
+    effectiveBlocklistUrls({ blocklistUrls: [] }, { BLOCKLIST_URL: 'https://env.test/list' }),
+    [],
+    'an empty stored list never falls back to the variable',
+  );
+});
+
+test('effectiveBlocklistUrls: a saved list replaces the variable and is normalized', () => {
+  assert.deepEqual(
+    effectiveBlocklistUrls(
+      { blocklistUrls: ['https://s.test/list', 'http://bad.test/list', 'https://s.test/list'] },
+      { BLOCKLIST_URL: 'https://env.test/list' },
+    ),
+    ['https://s.test/list'],
+    'the variable is ignored once the user saved a list; bad rows dropped',
+  );
 });

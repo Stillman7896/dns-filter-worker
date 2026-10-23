@@ -10,6 +10,7 @@ import { buildQuery, buildResponse, v4rdata, FakeKV } from './helpers.js';
 // ---- fake Workers globals (must precede any query that triggers loads) -------
 
 const BLOCKLIST_URL = 'https://list.test/regression/domains';
+const SECOND_LIST_URL = 'https://second.test/lists/extra';
 const UPSTREAM_URL = 'https://upstream.test/dns-query';
 
 class MemCache {
@@ -36,6 +37,9 @@ globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   if (url === BLOCKLIST_URL) {
     return new Response('# comment\nblocklist.test\nads.blocklist.test\n||foo-block.com^\n@@sub.foo-block.com\n\n', { status: 200 });
+  }
+  if (url === SECOND_LIST_URL) {
+    return new Response('# second subscription\nsecond.only.com\nepoch.blocker.com\n', { status: 200 });
   }
   if (url === UPSTREAM_URL) {
     const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
@@ -849,4 +853,123 @@ test('negative cache: NODATA (NOERROR, zero answers) caches briefly too', async 
   } finally {
     globalThis.fetch = savedFetch;
   }
+});
+
+// ---- multi-subscription blocklists ---------------------------------------------
+
+/** Session cookie for the default test password.
+ * @param {Env} env
+ * @returns {Promise<string>} */
+async function loginCookie(env) {
+  const res = await worker.fetch(new Request('https://worker.test/api/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'pw' }),
+  }), env);
+  const sc = res.headers.get('set-cookie');
+  assert.ok(sc, 'session cookie expected');
+  return sc.split(';')[0];
+}
+
+/** @param {Env} env @param {string} cookie @param {unknown} body */
+async function saveSettings(env, cookie, body) {
+  return worker.fetch(new Request('https://worker.test/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify(body),
+  }), env);
+}
+
+test('two subscriptions: both documents are fetched and the union blocks', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv: new FakeKV(), d1 });
+  const cookie = await loginCookie(env);
+
+  const saved = await saveSettings(env, cookie, {
+    blocklistUrls: [BLOCKLIST_URL, SECOND_LIST_URL],
+  });
+  assert.equal(saved.status, 200);
+
+  const lists = await worker.fetch(new Request('https://worker.test/api/blocklists', {
+    headers: { Cookie: cookie },
+  }), env);
+  assert.equal(lists.status, 200);
+  const j = await lists.json();
+  assert.deepEqual(
+    j.subscriptions.map((/** @type {{url: string}} */ s) => s.url),
+    [BLOCKLIST_URL, SECOND_LIST_URL],
+  );
+  assert.ok(j.subscriptions.every((/** @type {{entries: number}} */ s) => s.entries > 0),
+    'each subscription reports the size of its own document');
+  const sum = j.subscriptions.reduce((/** @type {number} */ n, /** @type {{entries: number}} */ s) => n + s.entries, 0);
+  assert.ok(j.total > 0 && j.total <= sum, 'merged total counts shared domains once');
+
+  // Union on the wire: a name only the second document carries is now blocked…
+  const added = await dohGet(env, buildQuery('second.only.com'));
+  assert.equal(new Uint8Array(await added.arrayBuffer())[3] & 0x0f, 3, 'NXDOMAIN from list 2');
+
+  // …while the default document still answers.
+  const kept = await dohGet(env, buildQuery('ads.blocklist.test'));
+  assert.equal(new Uint8Array(await kept.arrayBuffer())[3] & 0x0f, 3, 'list 1 entries unchanged');
+  assert.deepEqual(
+    d1.rows.map((r) => `${r.status}`),
+    ['blocklist', 'blocklist'],
+  );
+
+  const hz = await (await worker.fetch(new Request('https://worker.test/healthz'), env)).json();
+  assert.deepEqual(hz.blocklistUrls, [BLOCKLIST_URL, SECOND_LIST_URL]);
+  assert.equal(hz.blocklistUrl, BLOCKLIST_URL, 'the first entry stays the headline URL');
+  assert.equal(hz.blocklistSources.length, 2, 'per-subscription numbers for the panel');
+  assert.deepEqual(
+    hz.blocklistSources.map((/** @type {{url: string}} */ s) => s.url),
+    [SECOND_LIST_URL, BLOCKLIST_URL].sort(),
+  );
+});
+
+test('blocklist URL change rotates the config epoch: no stale allow is served', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv: new FakeKV(), d1 });
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('93.184.216.34') }];
+
+  const before = await dohGet(env, buildQuery('epoch.blocker.com'));
+  const beforeBody = new Uint8Array(await before.arrayBuffer());
+  assert.equal(beforeBody[3] & 0x0f, 0, 'no subscription for it yet, so it resolves');
+  assert.equal(d1.rows.at(-1)?.status, 'none');
+
+  const cookie = await loginCookie(env);
+  const saved = await saveSettings(env, cookie, {
+    blocklistUrls: [BLOCKLIST_URL, SECOND_LIST_URL],
+  });
+  assert.equal(saved.status, 200);
+
+  const after = await dohGet(env, buildQuery('epoch.blocker.com'));
+  const afterBody = new Uint8Array(await after.arrayBuffer());
+  assert.equal(afterBody[3] & 0x0f, 3,
+    'the answer cached under the old epoch must never be replayed');
+  assert.equal(d1.rows.at(-1)?.status, 'blocklist');
+  assert.equal(d1.rows.at(-1)?.filter, 'blocklist');
+});
+
+test('deleting the last subscription turns the remote blocklist off for queries', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ kv: new FakeKV(), d1 });
+  const cookie = await loginCookie(env);
+
+  const dropped = await worker.fetch(new Request(
+    `https://worker.test/api/blocklists?url=${encodeURIComponent(BLOCKLIST_URL)}`,
+    { method: 'DELETE', headers: { Cookie: cookie } },
+  ), env);
+  assert.equal(dropped.status, 200);
+
+  // The deployment variable still names a list, but the saved [] wins.
+  const lists = await (await worker.fetch(new Request('https://worker.test/api/blocklists', {
+    headers: { Cookie: cookie },
+  }), env)).json();
+  assert.deepEqual(lists.subscriptions, []);
+
+  globalThis.__answers = [{ type: 1, rdata: v4rdata('93.184.216.34') }];
+  const res = await dohGet(env, buildQuery('foo-block.com'));
+  assert.equal(new Uint8Array(await res.arrayBuffer())[3] & 0x0f, 0,
+    'nothing to block with — the query is forwarded');
+  assert.equal(d1.rows.at(-1)?.status, 'none');
 });

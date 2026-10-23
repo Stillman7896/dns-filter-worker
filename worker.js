@@ -10,7 +10,7 @@
 // come from dashboard settings in KV. `env.UPSTREAM_URL` is the fallback for a
 // deployment with no provider picked; `env.BLOCKLIST_URL` is still a var.
 
-import { Blocklist, DEFAULT_BLOCKLIST_URL } from './blocklist.js';
+import { Blocklist, effectiveBlocklistUrls } from './blocklist.js';
 import { RuleStore } from './rules.js';
 import { SettingsStore } from './settings.js';
 import { RouteStore, routeRecords } from './routing.js';
@@ -54,8 +54,6 @@ const stores = { ruleStore, blocklist, keywordStore, regex: regexEngine, tldStor
 
 /** @type {KVLike|null} */
 let boundKv = null;
-/** @type {string|null} */
-let loadedBlocklistUrl = null;
 
 /** @param {Env} env */
 function ensureKv(env) {
@@ -103,27 +101,42 @@ async function matchCache(req) {
 }
 
 /**
- * Conditional fetch of the blocklist: revalidates on a stored ETag, refreshes
- * the edge copy with a new freshness marker, and loads a changed body.
- * @param {Request} cacheKey
+ * The subscriptions this deployment runs: the saved list, or the BLOCKLIST_URL
+ * variable as its single entry until the user saves one (see blocklist.js).
+ * @param {Env} env
+ * @returns {Promise<string[]>}
+ */
+async function blocklistUrls(env) {
+  await settingsStore.refresh(); // cheap: TTL-cached, shared data:version read
+  return effectiveBlocklistUrls(settingsStore.get(), env);
+}
+
+/**
+ * Conditional fetch of ONE blocklist document: revalidates on its stored ETag,
+ * refreshes the edge copy with a new freshness marker, and parses a changed
+ * body into that subscription's set.
  * @param {string} blUrl
- * @param {{etag: string|null, text: string|null}} prev
+ * @param {{etag: string|null, text: string|null}} prev `text` null = nothing to re-store
  * @param {ExecutionContext} [ctx]
  */
-async function fetchBlocklist(cacheKey, blUrl, prev, ctx) {
+async function fetchBlocklistSource(blUrl, prev, ctx) {
+  const cacheKey = new Request(blUrl);
   const headers = prev.etag ? { 'If-None-Match': prev.etag } : undefined;
   const res = await fetch(blUrl, { headers, cf: { cacheTtl: BLOCKLIST_FETCH_TTL } });
 
   let text = prev.text;
   if (res.status === 304) {
-    if (text === null) throw new Error('blocklist 304 without a cached body');
+    // Same document as the copy already held: a body-less revalidation only
+    // moves the freshness marker; a stale-while-revalidate one re-stores it.
+    blocklist.touchSource(blUrl);
   } else if (res.ok) {
     text = await res.text();
-    blocklist.load(text);
-    loadedBlocklistUrl = blUrl;
+    blocklist.putSource(blUrl, text);
   } else {
-    throw new Error(`blocklist HTTP ${res.status}`);
+    throw new Error(`blocklist HTTP ${res.status} for ${blUrl}`);
   }
+
+  if (text === null) return; // no body in hand to put back in the edge cache
 
   /** @type {Record<string, string>} */
   const putHeaders = {
@@ -137,40 +150,77 @@ async function fetchBlocklist(cacheKey, blUrl, prev, ctx) {
 }
 
 /**
- * Load the blocklist with zero blocking work when a usable copy exists:
- *   fresh in-memory -> return; edge copy -> serve it (past its 24h window it
- *   is revalidated in the background); cold colo -> blocking fetch that falls
- *   back to the in-memory copy on failure (stale-if-error).
- * @param {Env} env
+ * Load ONE subscription with zero blocking work when a usable copy exists:
+ * fresh source -> nothing; edge copy -> serve it (past its 24h window it is
+ * revalidated in the background); cold colo -> blocking fetch. A failed
+ * refresh leaves the last good copy in place (stale-if-error).
+ * @param {string} blUrl
+ * @param {boolean} force revalidate against the origin now, whatever the clock says
  * @param {ExecutionContext} [ctx]
+ * @returns {Promise<void>}
  */
-async function ensureBlocklist(env, ctx) {
-  const blUrl = env.BLOCKLIST_URL || DEFAULT_BLOCKLIST_URL;
-  const hasMemory = blocklist.size > 0 && loadedBlocklistUrl === blUrl;
-  if (hasMemory && Date.now() - blocklist.loadedAt < BLOCKLIST_STALE_MS) return;
-
+async function ensureBlocklistSource(blUrl, force, ctx) {
   const cacheKey = new Request(blUrl);
+
+  if (force) {
+    // Manual reload from the dashboard: conditional, so an unchanged list
+    // costs one 304 and keeps the copy already parsed.
+    const cached = await matchCache(cacheKey);
+    const etag = cached?.headers.get('etag') || null;
+    await fetchBlocklistSource(blUrl, { etag, text: null }, ctx);
+    if (!blocklist.sourceLoaded(blUrl) && cached) blocklist.putSource(blUrl, await cached.text());
+    return;
+  }
+
+  if (blocklist.sourceFresh(blUrl, BLOCKLIST_STALE_MS)) return;
+
   const cached = await matchCache(cacheKey);
   if (cached) {
     const text = await cached.text();
     const fetchedAt = Number(cached.headers.get(FETCHED_AT_HEADER)) || 0;
     const etag = cached.headers.get('etag');
-    blocklist.load(text);
-    loadedBlocklistUrl = blUrl;
-    // Stale-while-revalidate: serve the old copy now, fetch off the hot path.
+    blocklist.putSource(blUrl, text);
+    // Stale-while-revalidate: answer with the old copy while it refreshes.
     if (Date.now() - fetchedAt >= BLOCKLIST_STALE_MS && ctx) {
-      bg(ctx, fetchBlocklist(cacheKey, blUrl, { etag, text }, ctx));
+      bg(ctx, fetchBlocklistSource(blUrl, { etag, text }, ctx));
     }
     return;
   }
 
   // Cold colo: nothing cached anywhere -> the fetch must block this request.
-  try {
-    await fetchBlocklist(cacheKey, blUrl, { etag: null, text: null }, ctx);
-  } catch (e) {
-    if (!hasMemory) throw e;
-    console.error('[blocklist] refresh failed, keeping stale copy:', e instanceof Error ? e.message : e);
+  await fetchBlocklistSource(blUrl, { etag: null, text: null }, ctx);
+}
+
+/**
+ * Load every subscribed blocklist. A single failing document is recorded on
+ * its source (the dashboard shows it) and keeps its last good copy; only when
+ * NO document could be loaded at all does this throw, so one dead host never
+ * leaves the resolver without a list it used to have.
+ * @param {Env} env
+ * @param {ExecutionContext} [ctx]
+ * @param {boolean} [force] revalidate every subscription now
+ * @returns {Promise<void>}
+ */
+async function ensureBlocklist(env, ctx, force = false) {
+  const urls = await blocklistUrls(env);
+  blocklist.setSources(urls);
+  if (!urls.length) return; // the user deleted every subscription: no remote list
+
+  const pending = force ? urls : urls.filter((u) => !blocklist.sourceFresh(u, BLOCKLIST_STALE_MS));
+  if (!pending.length) return;
+
+  const settled = await Promise.allSettled(pending.map((u) => ensureBlocklistSource(u, force, ctx)));
+  /** @type {unknown} */ let firstError = null;
+  let failures = 0;
+  for (let i = 0; i < pending.length; i++) {
+    const result = settled[i];
+    if (result.status === 'fulfilled') continue;
+    failures++;
+    if (!firstError) firstError = result.reason;
+    const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+    blocklist.sourceError(pending[i], message);
   }
+  if (failures === pending.length && !blocklist.size) throw firstError || new Error('blocklist unavailable');
 }
 
 /**
@@ -342,7 +392,10 @@ function configEpoch(settings, upstream, fallback) {
     // Changing provider must never serve answers cached from the old one.
     '|' + upstream.kind + '|' + upstream.url + '|' + upstream.relay +
     // Failover changes which server answers, so it rotates the epoch too.
-    '|' + (fallback ? fallback.url : 'off');
+    '|' + (fallback ? fallback.url : 'off') +
+    // Subscribing, replacing or dropping a list changes what a name resolves
+    // to, so a verdict cached under the old set must never be served again.
+    '|bl:' + (Array.isArray(settings.blocklistUrls) ? settings.blocklistUrls.join(',') : 'default');
 }
 
 /**
@@ -594,6 +647,9 @@ export default {
         tlds: tldStore,
         blocklist,
         settings: settingsStore,
+        // The dashboard's blocklist panel: cheap while the lists are fresh,
+        // and `force` revalidates every subscription against its origin.
+        blocklistRefresh: (force) => ensureBlocklist(env, ctx, force === true),
         testFn: (domain, e) => testDomain(domain, /** @type {Env} */ (e || env), ctx),
       });
     }
@@ -604,9 +660,12 @@ export default {
       const settings = settingsStore.get();
       const upstream = resolveUpstream(settings, env);
       const fallback = resolveFallback(upstream, settings, env);
+      const urls = effectiveBlocklistUrls(settings, env);
       return Response.json({
         ok: true,
         blocklistSize: blocklist.size,
+        blocklistExceptions: blocklist.exceptionSize,
+        blocklistSources: blocklist.listSources(),
         blocklistLoadedAt: blocklist.loadedAt,
         customRules: ruleStore.rules.size,
         routes: routeStore.routes.size,
@@ -614,7 +673,8 @@ export default {
         regexRules: regexStore.get().size,
         blockedTlds: tldStore.get().size,
         settings,
-        blocklistUrl: env.BLOCKLIST_URL || DEFAULT_BLOCKLIST_URL,
+        blocklistUrl: urls[0] || '',
+        blocklistUrls: urls,
         upstream,
         upstreamUrl: upstream.url,
         fallback: fallback ? { label: fallback.label, url: fallback.url, source: fallback.source } : null,

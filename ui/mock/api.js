@@ -47,6 +47,25 @@ const fixtures = {
     upstreamRelay: '',
     upstreamFailover: true,
     upstreamFallbackUrl: '',
+    // null = the deployment BLOCKLIST_URL entry (mirrors the worker tri-state)
+    blocklistUrls: null,
+  },
+  // Same payload shape as dashboard.js blocklistPayload().
+  blocklist: {
+    subscriptions: [
+      {
+        url: 'https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/pro-plus/domains',
+        entries: 184392,
+        exceptions: 1240,
+        loadedAt: Date.now() - 12 * 60 * 1000,
+        error: null,
+        source: 'deploy',
+      },
+    ],
+    total: 184392,
+    totalExceptions: 1240,
+    maxUrls: 10,
+    entryLimit: 1_000_000,
   },
   logs: [],
 };
@@ -248,6 +267,7 @@ export function mockApi(req, res, next) {
           upstream: resolveUpstream(fixtures.settings, {}),
           fallback: mockFallback(),
           upstreamPresets: UPSTREAM_PRESETS,
+          blocklist: fixtures.blocklist,
         });
       }
       if (req.method === 'POST') {
@@ -350,6 +370,60 @@ export function mockApi(req, res, next) {
       }
       if (body.settings) { Object.assign(fixtures.settings, body.settings); summary.settings = true; }
       return json(res, 200, { ok: true, ...summary });
+    }
+
+    // ---- blocklist subscriptions (mirrors dashboard.js /api/blocklists) ----
+    if (p === '/api/blocklists' || p === '/api/blocklists/refresh') {
+      // Recompute the merged totals the warning label reads, then hand back
+      // the same shape the worker returns.
+      const payload = () => {
+        const b = fixtures.blocklist;
+        b.total = b.subscriptions.reduce((n, s) => n + s.entries, 0);
+        b.totalExceptions = b.subscriptions.reduce((n, s) => n + s.exceptions, 0);
+        return b;
+      };
+
+      if (req.method === 'GET') return json(res, 200, payload());
+
+      if (p === '/api/blocklists/refresh' && req.method === 'POST') {
+        const now = Date.now();
+        for (const s of fixtures.blocklist.subscriptions) {
+          s.loadedAt = now;
+          s.error = null;
+          s.entries += Math.floor((s.entries % 7) + 1); // a plausible re-parse drift
+        }
+        return json(res, 200, payload());
+      }
+
+      if (req.method === 'POST') {
+        const target = String((body || {}).url || '').trim();
+        const urls = fixtures.blocklist.subscriptions.map((s) => s.url);
+        if (!target || !target.startsWith('https://') || urls.includes(target)) {
+          return json(res, 400, { error: 'a blocklist URL must be an https:// link' });
+        }
+        if (urls.length >= fixtures.blocklist.maxUrls) {
+          return json(res, 400, { error: `at most ${fixtures.blocklist.maxUrls} blocklists can be subscribed` });
+        }
+        // Saving turns the deploy-var default into an ordinary entry.
+        for (const s of fixtures.blocklist.subscriptions) s.source = 'saved';
+        fixtures.blocklist.subscriptions.push({
+          url: target,
+          entries: 0,
+          exceptions: 0,
+          loadedAt: 0,
+          error: null,
+          source: 'saved',
+        });
+        return json(res, 200, payload());
+      }
+
+      if (req.method === 'DELETE') {
+        const target = String(url.searchParams.get('url') || '');
+        const i = fixtures.blocklist.subscriptions.findIndex((s) => s.url === target);
+        if (i < 0) return json(res, 404, { error: 'not subscribed' });
+        fixtures.blocklist.subscriptions.splice(i, 1);
+        return json(res, 200, payload());
+      }
     }
 
     // ---- filter lists ----

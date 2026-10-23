@@ -79,6 +79,12 @@ export const api = {
   addItem: (kind, value) => request(`/api/filters/${kind}`, { method: 'POST', body: { value } }),
   removeItem: (kind, value) => request(`/api/filters/${kind}`, { method: 'DELETE', query: { value } }),
 
+  // blocklist subscriptions
+  blocklists: () => request('/api/blocklists'),
+  addBlocklist: (url) => request('/api/blocklists', { method: 'POST', body: { url } }),
+  removeBlocklist: (url) => request('/api/blocklists', { method: 'DELETE', query: { url } }),
+  reloadBlocklists: () => request('/api/blocklists/refresh', { method: 'POST' }),
+
   // audit log
   logs: (query) => request('/api/logs', { query }),
   deleteLogs: (query) => request('/api/logs', { method: 'DELETE', query }),

@@ -72,6 +72,12 @@ interface FilterSettings {
   upstreamFailover: boolean;
   /** Custom fallback DoH URL; '' uses a built-in alternate provider. */
   upstreamFallbackUrl: string;
+  /**
+   * Subscribed blocklist URLs. null = not chosen yet (the BLOCKLIST_URL
+   * variable decides), [] = every remote list was deleted, [urls] = the list
+   * the dashboard maintains.
+   */
+  blocklistUrls: string[] | null;
 }
 
 /** One response route: a fixed answer for a domain and its subdomains. */
@@ -91,6 +97,8 @@ interface ApiCtx {
   tlds: import('./lists.js').TextSetStore;
   regex: import('./lists.js').TextSetStore;
   blocklist?: import('./blocklist.js').Blocklist;
+  /** Load the subscribed lists; force=true revalidates them against their origins. */
+  blocklistRefresh?: (force?: boolean) => Promise<void>;
 
   testFn(domain: string, env?: Env): any;
 }

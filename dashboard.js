@@ -10,6 +10,12 @@ import { normalizeDomain } from './rules.js';
 import { toUnicode } from './idn.js';
 import { normalizeRoute } from './routing.js';
 import { normalizeTld, normalizeKeyword, normalizeRegex } from './lists.js';
+import {
+  effectiveBlocklistUrls,
+  normalizeBlocklistUrls,
+  MAX_BLOCKLIST_URLS,
+  BLOCKLIST_ENTRY_LIMIT,
+} from './blocklist.js';
 import { clampRetention, DEFAULT_SETTINGS } from './settings.js';
 import {
   UPSTREAM_PRESETS,
@@ -32,6 +38,50 @@ const SESSION_COOKIE = 'dns_dash_session';
 function fallbackOf(settings, env) {
   const f = resolveFallback(resolveUpstream(settings, env), settings, env);
   return f ? { label: f.label, url: f.url, source: f.source } : null;
+}
+
+/**
+ * The blocklist panel payload: every subscribed URL (with its own entry count
+ * and last fetch error) plus the merged totals the warning label reads.
+ * `deploy` marks the entries still coming from the BLOCKLIST_URL variable —
+ * they are ordinary entries: editable and deletable like any other.
+ * @param {FilterSettings} settings
+ * @param {Env} env
+ * @param {ApiCtx} ctx
+ */
+function blocklistPayload(settings, env, ctx) {
+  const urls = effectiveBlocklistUrls(settings, env);
+  const stored = Array.isArray(settings.blocklistUrls);
+  const loaded = new Map((ctx.blocklist ? ctx.blocklist.listSources() : []).map((s) => [s.url, s]));
+
+  return {
+    subscriptions: urls.map((url) => {
+      const s = loaded.get(url);
+      return {
+        url,
+        entries: s ? s.entries : 0,
+        exceptions: s ? s.exceptions : 0,
+        loadedAt: s ? s.loadedAt : 0,
+        error: s ? s.error : null,
+        source: stored ? 'saved' : 'deploy',
+      };
+    }),
+    total: ctx.blocklist ? ctx.blocklist.size : 0,
+    totalExceptions: ctx.blocklist ? ctx.blocklist.exceptionSize : 0,
+    maxUrls: MAX_BLOCKLIST_URLS,
+    entryLimit: BLOCKLIST_ENTRY_LIMIT,
+  };
+}
+
+/**
+ * Load the lists behind `blocklistPayload` when the worker supplied a refresh
+ * hook. Best effort: a dead list host must not fail the dashboard request —
+ * the per-source `error` field reports it instead.
+ * @param {Env} env @param {ApiCtx} ctx
+ */
+async function warmBlocklists(env, ctx) {
+  if (typeof ctx.blocklistRefresh !== 'function') return;
+  await ctx.blocklistRefresh(false).catch(() => {});
 }
 
 /** @param {Env} env @returns {boolean} */
@@ -105,6 +155,21 @@ function settingsPatch(source, current = {}) {
     const days = clampRetention(source.logRetentionDays);
     if (Number.isNaN(days)) return { error: 'logRetentionDays must be a number (0-3650)' };
     patch.logRetentionDays = days;
+  }
+
+  if ('blocklistUrls' in source) {
+    const urls = source.blocklistUrls;
+    // null = hand control back to the deployment variable; an array is the
+    // dashboard's own subscription list (an empty one turns the remote
+    // blocklist off on purpose).
+    if (urls !== null && !Array.isArray(urls)) {
+      return { error: 'blocklistUrls must be an array of https:// URLs' };
+    }
+    const clean = normalizeBlocklistUrls(urls);
+    if (Array.isArray(urls) && clean.length !== urls.length) {
+      return { error: `blocklist URLs must be unique https:// links (max ${MAX_BLOCKLIST_URLS})` };
+    }
+    patch.blocklistUrls = urls === null ? null : clean;
   }
 
   const upstream = upstreamPatch(source);
@@ -282,12 +347,14 @@ export async function handleApi(request, env, url, ctx) {
 
     if (request.method === 'GET') {
       await settings.refresh(true);
+      await warmBlocklists(env, ctx);
       const current = settings.get();
       return json({
         settings: current,
         upstream: resolveUpstream(current, env),
         fallback: fallbackOf(current, env),
         upstreamPresets: UPSTREAM_PRESETS,
+        blocklist: blocklistPayload(current, env, ctx),
       });
     }
 
@@ -339,6 +406,57 @@ export async function handleApi(request, env, url, ctx) {
     }
 
     return json(await probeUpstream(candidate));
+  }
+
+  // ---- blocklist subscriptions: several remote lists, merged in memory ----
+  if (path === '/api/blocklists' || path === '/api/blocklists/refresh') {
+    if (!settings) return json({ error: 'settings not available' }, { status: 501 });
+
+    if (request.method === 'GET') {
+      await warmBlocklists(env, ctx);
+      return json(blocklistPayload(settings.get(), env, ctx));
+    }
+
+    // POST /api/blocklists/refresh -> revalidate every list against its origin
+    if (path === '/api/blocklists/refresh' && request.method === 'POST') {
+      if (typeof ctx.blocklistRefresh !== 'function') {
+        return json({ error: 'blocklist refresh not available' }, { status: 501 });
+      }
+      // A dead host is reported per source in the payload, not as a failed
+      // request: the lists that did answer keep working.
+      await ctx.blocklistRefresh(true)
+        .catch((e) => console.error('[blocklists] reload failed:', e instanceof Error ? e.message : e));
+      return json(blocklistPayload(settings.get(), env, ctx));
+    }
+
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
+      const target = typeof body.url === 'string' ? body.url.trim() : '';
+      const current = effectiveBlocklistUrls(settings.get(), env);
+      if (!isHttpsUrl(target)) return json({ error: 'a blocklist URL must be an https:// link' }, { status: 400 });
+      if (current.includes(target)) return json({ error: 'that blocklist is already subscribed' }, { status: 400 });
+      if (current.length >= MAX_BLOCKLIST_URLS) {
+        return json({ error: `at most ${MAX_BLOCKLIST_URLS} blocklists can be subscribed` }, { status: 400 });
+      }
+
+      // Saving the list turns the deployment default into an ordinary entry,
+      // which is what makes it editable and deletable afterwards.
+      await settings.update({ blocklistUrls: [...current, target] });
+      await warmBlocklists(env, ctx);
+      return json(blocklistPayload(settings.get(), env, ctx));
+    }
+
+    // DELETE /api/blocklists?url=... -> unsubscribe; the last one turns the
+    // remote blocklist off entirely (a deliberate state, not an error).
+    if (request.method === 'DELETE') {
+      const target = url.searchParams.get('url') || '';
+      const current = effectiveBlocklistUrls(settings.get(), env);
+      if (!current.includes(target)) return json({ error: 'not subscribed' }, { status: 404 });
+      await settings.update({ blocklistUrls: current.filter((u) => u !== target) });
+      await warmBlocklists(env, ctx);
+      return json(blocklistPayload(settings.get(), env, ctx));
+    }
   }
 
   // ---- config backup: export / import ----

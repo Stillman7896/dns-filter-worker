@@ -132,6 +132,39 @@ They are surfaced in the dashboard under **Rules → Allow** as read-only rows
 tagged *blocklist*; deleting them there is refused by the API because the
 source of truth is the list file itself.
 
+### Subscriptions
+
+A deployment can subscribe to several documents at once (up to
+`MAX_BLOCKLIST_URLS` = 10, https only). They are parsed independently and
+merged into one set, so an entry blocks as soon as any subscription carries it
+— and dropping one subscription frees only that document's entries. Each
+`@@` exception applies to the whole union.
+
+Which documents run is a tri-state, stored in `settings:main` as
+`blocklistUrls`:
+
+| Value       | Meaning                                                            |
+|-------------|--------------------------------------------------------------------|
+| `null`      | not saved yet — the `BLOCKLIST_URL` deploy variable is the one entry |
+| an array    | exactly those URLs; the deploy variable is ignored                  |
+| `[]`        | no remote blocklist at all (a deliberate state, not a fallback)     |
+
+The default runs as an ordinary row of the subscription list — editable and
+deletable like any other — and saving the list persists the default alongside
+it. The dashboard's **Filter lists** tab manages all of this: add/remove URLs,
+one **Reload** button that revalidates every subscription against its origin
+(conditional fetch, an unchanged document costs a single 304), and a warning
+label when the merged `total` passes `BLOCKLIST_ENTRY_LIMIT` (1,000,000)
+entries — beyond that the free plan's isolate memory can be exhausted. Each
+row shows its own entry count, exception count, last fetch time and fetch
+error, so a dead host is visible without guessing which one it was.
+
+Loading is per-subscription and stale-while-revalidate: a fresh copy answers
+with no network work, a cold colo fetches once, and a failed refresh keeps the
+last good copy. Only when **no** document could be loaded at all does the
+resolver return `503`. A change to the URL set rotates the config epoch, so an
+answer cached under the previous set is never replayed.
+
 ## Storage design (and why not one key per rule)
 
 **KV has *unlimited* keys per namespace**, so key count is never the limit.
@@ -210,7 +243,9 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 | `/api/rules`      | List / add (POST `{domain,kind}`) / delete                              |
 | `/api/rules/bulk` | Bulk import `{kind, domains}`                                           |
 | `/api/test`       | Run full pipeline for a domain (mirrors live filtering)                |
-| `/api/settings`   | Get (GET: settings + resolved provider + preset list) / save (POST `{rebindProtection, idnBlock, tldBlock, keywordBlock, regexBlock, logPassed, logRetentionDays, upstreamPreset, upstreamUrl, upstreamRelay}`) |
+| `/api/settings`   | Get (GET: settings + resolved provider + preset list + `blocklist` payload) / save (POST `{rebindProtection, idnBlock, tldBlock, keywordBlock, regexBlock, blocklistUrls, logPassed, logRetentionDays, upstreamPreset, upstreamUrl, upstreamRelay}`) |
+| `/api/blocklists` | List (GET: subscriptions + `total`/`entryLimit`/`maxUrls`) / add (POST `{url}`) / remove (DELETE `?url=`) subscriptions |
+| `/api/blocklists/refresh` | Revalidate every subscription against its origin (POST) |
 | `/api/routes`     | List / add (POST `{domain,value,ttl?}`) / delete (`?domain=`) response routes |
 | `/api/upstream/test` | Send one real query to a candidate provider: `{ok, ms, rcode, answers, sample}` or `{ok:false, error}` |
 | `/api/filters/tlds` | List (GET) / add (POST `{value}`) / remove (DELETE `?value=`) blocked TLDs |
@@ -324,7 +359,8 @@ with a fixed record instead of asking upstream:
 
 ## Runtime configuration
 
-The blocklist URL is still a deploy-time variable:
+`BLOCKLIST_URL` is the **default subscription**: the one document this
+deployment starts with until a list is saved from the dashboard.
 
 ```toml
 [vars]
@@ -335,13 +371,16 @@ BLOCKLIST_URL = "https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main
 wrangler deploy --var BLOCKLIST_URL:https://example.com/mylist.txt
 ```
 
+It is a `null`-able tri-state: `null` (never saved) uses this variable, a
+saved array replaces it, `[]` turns the remote blocklist off. When the list is
+saved the variable's URL is kept as an ordinary first row, so nothing the
+operator configured disappears silently. Its edge cache key derives from the
+URL itself, so switching either never serves a stale cached copy. The built-in
+default (`DEFAULT_BLOCKLIST_URL`) is used when the variable is unset.
+
 `UPSTREAM_FALLBACK_URL` (optional) names the fallback DoH endpoint for
 failover; the dashboard's `upstreamFallbackUrl` setting outranks it.
 See *Upstream failover* above.
-
-Its edge cache key derives from `BLOCKLIST_URL`, so switching the URL never
-serves a stale cached copy. The default lives in `blocklist.js`
-(`DEFAULT_BLOCKLIST_URL`).
 
 ## Deploy
 
@@ -413,6 +452,7 @@ row carries a source badge: *custom* rows live in KV and can be deleted there;
 | `tldBlock`         | `false` | `settings:main` (JSON blob)  |
 | `keywordBlock`     | `false` | `settings:main` (JSON blob)  |
 | `regexBlock`       | `false` | `settings:main` (JSON blob)  |
+| `blocklistUrls`    | `null` (deploy var) | `settings:main` (subscription list) |
 | `logPassed`        | `true`  | `settings:main` (JSON blob)  |
 | `logRetentionDays` | `30`    | `settings:main` (JSON blob)  |
 | `upstreamPreset`   | `''` (deploy var, else Quad9) | `settings:main` |
@@ -421,7 +461,10 @@ row carries a source badge: *custom* rows live in KV and can be deleted there;
 | `upstreamFailover` | `true`  | `settings:main` (retry on fallback) |
 | `upstreamFallbackUrl` | `''` | `settings:main` (custom fallback provider) |
 
-Managed from the **Settings** tab. Persisted to KV (same namespace as rules),
+Managed from the **Settings** tab, except `blocklistUrls` (the subscription
+list, managed entirely in **Filter lists**) — `regexBlock` is also switchable
+from the header of its **Filter lists** section, next to the patterns it gates.
+Persisted to KV (same namespace as rules),
 so they survive deploys and are shared across every colo.
 
 **Propagation:** each isolate caches settings for 30 s and reads are

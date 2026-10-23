@@ -7,7 +7,7 @@ import { RuleStore } from '../rules.js';
 import { RouteStore } from '../routing.js';
 import { TextSetStore, normalizeKeyword, normalizeRegex } from '../lists.js';
 import { SettingsStore } from '../settings.js';
-import { Blocklist } from '../blocklist.js';
+import { Blocklist, DEFAULT_BLOCKLIST_URL, MAX_BLOCKLIST_URLS } from '../blocklist.js';
 import { buildQuery, buildResponse, FakeKV, v4rdata } from './helpers.js';
 
 /**
@@ -943,4 +943,143 @@ test('upstream test: sends a probe query and reports latency + sample answer', a
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// ---- blocklist subscriptions ---------------------------------------------------
+
+test('blocklists: the deploy default is one ordinary, deletable entry', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  ctx.blocklist = new Blocklist();
+  ctx.blocklist.putSource(DEFAULT_BLOCKLIST_URL, 'a.test\nb.test\n@@e.test\n');
+
+  const res = await call(ctx, env, '/api/blocklists', { cookie });
+  assert.equal(res.status, 200);
+  const j = await res.json();
+  assert.deepEqual(j.subscriptions, [{
+    url: DEFAULT_BLOCKLIST_URL,
+    entries: 2,
+    exceptions: 1,
+    loadedAt: ctx.blocklist.loadedAt,
+    error: null,
+    source: 'deploy',
+  }]);
+  assert.equal(j.total, 2, 'total is what the memory warning reads');
+  assert.equal(j.totalExceptions, 1);
+  assert.equal(j.maxUrls, MAX_BLOCKLIST_URLS);
+  assert.equal(j.entryLimit, 1_000_000);
+
+  // The same payload rides along with the settings the dashboard boots from.
+  const boot = await (await call(ctx, env, '/api/settings', { cookie })).json();
+  assert.equal(boot.blocklist.total, 2, 'GET /api/settings carries the panel payload');
+});
+
+test('blocklists: POST subscribes, promotes the default, and refuses bad input', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  /** @param {string} url */
+  const add = (url) => call(ctx, env, '/api/blocklists', { method: 'POST', cookie, body: { url } });
+
+  const first = await add('https://two.test/list');
+  assert.equal(first.status, 200);
+  const j = await first.json();
+  assert.equal(j.subscriptions.length, 2, 'the deploy entry survives the save');
+  assert.ok(j.subscriptions.every((/** @type {{source: string}} */ s) => s.source === 'saved'),
+    'saving the list turns the deployment default into an ordinary entry');
+  assert.deepEqual(
+    JSON.parse(kv.data.get('settings:main') ?? '{}').blocklistUrls,
+    [DEFAULT_BLOCKLIST_URL, 'https://two.test/list'],
+    'the whole effective list is persisted',
+  );
+
+  const dup = await add('https://two.test/list');
+  assert.equal(dup.status, 400);
+  assert.match((await dup.json()).error, /already subscribed/);
+
+  const plain = await add('http://two.test/list');
+  assert.equal(plain.status, 400, 'https only');
+  assert.match((await plain.json()).error, /https/);
+
+  const empty = await add('   ');
+  assert.equal(empty.status, 400);
+
+  for (let i = 0; i < MAX_BLOCKLIST_URLS - 2; i++) await add(`https://l${i}.test/list`);
+  const over = await add('https://one-too-many.test/list');
+  assert.equal(over.status, 400);
+  assert.match((await over.json()).error, new RegExp(`at most ${MAX_BLOCKLIST_URLS}`));
+  assert.equal(
+    (await (await call(ctx, env, '/api/blocklists', { cookie })).json()).subscriptions.length,
+    MAX_BLOCKLIST_URLS,
+  );
+});
+
+test('blocklists: DELETE unsubscribes — the last one turns the remote list off', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  await call(ctx, env, '/api/blocklists', { method: 'POST', cookie, body: { url: 'https://two.test/list' } });
+
+  const drop = await call(ctx, env, `/api/blocklists?url=${encodeURIComponent(DEFAULT_BLOCKLIST_URL)}`, {
+    method: 'DELETE', cookie,
+  });
+  assert.equal(drop.status, 200);
+  let j = await drop.json();
+  assert.deepEqual(j.subscriptions.map((/** @type {{url: string}} */ s) => s.url), ['https://two.test/list']);
+
+  const missing = await call(ctx, env, '/api/blocklists?url=https://nope.test/list', { method: 'DELETE', cookie });
+  assert.equal(missing.status, 404);
+
+  const last = await call(ctx, env, `/api/blocklists?url=${encodeURIComponent('https://two.test/list')}`, {
+    method: 'DELETE', cookie,
+  });
+  j = await last.json();
+  assert.deepEqual(j.subscriptions, [], 'no remote blocklist left — a deliberate state');
+  assert.equal(JSON.parse(kv.data.get('settings:main') ?? '{}').blocklistUrls.length, 0);
+  assert.equal(
+    (await (await call(ctx, env, '/api/blocklists', { cookie })).json()).subscriptions.length,
+    0,
+    'and it stays empty on the next read',
+  );
+});
+
+test('blocklists: refresh is 501 without the worker hook, 200 with it', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+
+  const bare = await call(ctx, env, '/api/blocklists/refresh', { method: 'POST', cookie });
+  assert.equal(bare.status, 501);
+  assert.match((await bare.json()).error, /refresh not available/);
+
+  /** @type {boolean[]} */ const calls = [];
+  ctx.blocklist = new Blocklist();
+  ctx.blocklistRefresh = async (force) => { calls.push(force === true); };
+  ctx.blocklist.putSource(DEFAULT_BLOCKLIST_URL, 'warm.test\n');
+
+  const reloaded = await call(ctx, env, '/api/blocklists/refresh', { method: 'POST', cookie });
+  assert.equal(reloaded.status, 200);
+  assert.deepEqual(calls, [true], 'a manual reload forces revalidation');
+  assert.equal((await reloaded.json()).total, 1);
+});
+
+test('settings: blocklistUrls validation in the patch', async () => {
+  const kv = new FakeKV();
+  const { ctx, env, cookie } = await login(kv);
+  /** @param {unknown} body */
+  const post = (body) => call(ctx, env, '/api/settings', { method: 'POST', cookie, body });
+
+  const notArray = await post({ blocklistUrls: 'https://a.test/list' });
+  assert.equal(notArray.status, 400);
+  assert.match((await notArray.json()).error, /array/);
+
+  const badRow = await post({ blocklistUrls: ['http://a.test/list'] });
+  assert.equal(badRow.status, 400, 'one unusable row must not be silently dropped on save');
+  assert.match((await badRow.json()).error, /https/);
+
+  const dupe = await post({ blocklistUrls: ['https://a.test/list', 'https://a.test/list'] });
+  assert.equal(dupe.status, 400);
+  assert.match((await dupe.json()).error, /unique/);
+
+  const reset = await post({ blocklistUrls: null });
+  assert.equal(reset.status, 200);
+  assert.equal((await reset.json()).settings.blocklistUrls, null, 'null hands control back to the variable');
+  assert.equal(JSON.parse(kv.data.get('settings:main') ?? '{}').blocklistUrls, null);
 });
