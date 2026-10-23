@@ -973,3 +973,24 @@ test('deleting the last subscription turns the remote blocklist off for queries'
     'nothing to block with — the query is forwarded');
   assert.equal(d1.rows.at(-1)?.status, 'none');
 });
+
+test('healthz: a failed blocklist load is reported, not thrown', async () => {
+  const env = mkEnv({ kv: new FakeKV(), d1: new FakeD1() });
+  const cookie = await loginCookie(env);
+  const saved = await saveSettings(env, cookie, { blocklistUrls: ['https://dead.test/list'] });
+  assert.equal(saved.status, 200);
+
+  const res = await worker.fetch(new Request('https://worker.test/healthz'), env);
+  assert.equal(res.status, 503, 'degraded health answers with a JSON body instead of a bare 500');
+  const hz = await res.json();
+  assert.equal(hz.ok, false);
+  assert.deepEqual(hz.problems.length, 1);
+  assert.match(hz.problems[0], /^blocklist unavailable: /);
+  assert.equal(hz.dashboardConfigured, true, 'the probe still states what the deployment has');
+  assert.equal(hz.blocklistUrls[0], 'https://dead.test/list');
+
+  // /dns-query fails for exactly that reason — the probe is where it shows.
+  const dns = await dohGet(env, buildQuery('public.foo.com'));
+  assert.equal(dns.status, 503);
+  assert.equal(await dns.text(), 'blocklist unavailable');
+});

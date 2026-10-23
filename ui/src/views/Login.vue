@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue';
 import { state, login, boot, runOp } from '../store.js';
+import { ApiError } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 
 const password = ref('');
@@ -25,12 +26,27 @@ async function submit() {
     });
     password.value = '';
   } catch (e) {
-    error.value = e.status === 401 ? 'That password did not match.' : e.message;
+    // 401 from the password itself vs 401 because the cookie never stuck.
+    error.value = e.status === 401 && e.code !== 'no-cookie' ? 'That password did not match.' : e.message;
   }
 }
 
+/** boot() never rejects — it records its outcome in `state.phase` — so a plain
+ *  runOp around it would report success while the page still says nothing is
+ *  configured. Re-throw the phase as an ApiError so the toast cannot lie. */
 async function recheck() {
-  await runOp('auth.recheck', { verb: 'Check setup again', ok: 'Configuration found', fn: () => boot() }).catch(() => {});
+  await runOp('auth.recheck', {
+    verb: 'Check setup again',
+    ok: 'Configuration found — enter the password below',
+    fn: async () => {
+      await boot();
+      if (state.phase === 'unconfigured') {
+        throw new ApiError('No dashboard password is configured on this worker.', 503, 'unconfigured');
+      }
+      if (state.phase === 'boot') throw new ApiError(state.bootError || 'The worker did not answer.');
+      return state.phase;
+    },
+  }).catch(() => {});
 }
 </script>
 
@@ -42,14 +58,17 @@ async function recheck() {
         <p class="hint mt-2 leading-relaxed">
           The worker answers every dashboard request with
           <span class="st">503</span> until <span class="st">DASHBOARD_PASSWORD</span> is set.
-          Add it to <span class="st">wrangler.toml</span> under <span class="st">[vars]</span> and
-          deploy, then check again.
+          <span class="st">/healthz</span> reports
+          <span class="st">dashboardConfigured</span>, and now also why it is degraded.
         </p>
+
         <div class="mt-4 rounded-md border border-line bg-raised px-3 py-2.5 st text-[12.5px] leading-relaxed overflow-x-auto">
-          <span class="text-muted"># wrangler.toml</span><br />
-          <span>[vars]</span><br />
+          <span class="text-muted"># recommended — stays out of the repo, no redeploy</span><br />
+          <span class="text-beacon">wrangler secret put DASHBOARD_PASSWORD</span><br /><br />
+          <span class="text-muted"># or in wrangler.toml [vars] — then run npm run deploy</span><br />
           <span class="text-beacon">DASHBOARD_PASSWORD</span> = "choose-a-secret"
         </div>
+
         <AppButton
           variant="solid"
           block
@@ -59,8 +78,10 @@ async function recheck() {
         >
           Check again
         </AppButton>
+
         <p class="hint mt-3">
-          Optional — without it only the DNS resolver and <span class="st">/healthz</span> stay available.
+          Optional — without it only the DNS resolver and <span class="st">/healthz</span> stay
+          available; every <span class="st">/api/*</span> call answers <span class="st">503</span>.
         </p>
       </template>
 

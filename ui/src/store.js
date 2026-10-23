@@ -200,10 +200,28 @@ export async function boot() {
   }
 }
 
+/**
+ * Sign in, then re-boot. `boot()` never throws, so a cookie the browser
+ * refused to store would otherwise be reported as a successful sign-in that
+ * silently lands back on the same form.
+ * @param {string} password
+ */
 export async function login(password) {
   await api.login(password);
   state.signingOut = false;
   await boot();
+  if (state.phase === 'ready') return;
+  if (state.phase === 'unconfigured') {
+    throw new ApiError('No dashboard password is configured on this worker.', 503, 'unconfigured');
+  }
+  if (state.phase === 'auth') {
+    throw new ApiError(
+      'The password was accepted but the session cookie did not come back — the cookie is `Secure`, so the page must be served over https (http://localhost is exempt).',
+      401,
+      'no-cookie',
+    );
+  }
+  throw new ApiError(state.bootError || 'The worker did not answer after signing in.');
 }
 
 export async function signOut() {

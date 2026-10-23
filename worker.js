@@ -629,6 +629,21 @@ async function ensureReady(env, ctx) {
   }
 }
 
+/**
+ * Await `work` and turn a rejection into a one-line problem, so a health probe
+ * reports *why* it is degraded instead of throwing past the reader.
+ * @param {Promise<unknown>} work @param {string} label
+ * @returns {Promise<string|null>}
+ */
+async function settle(work, label) {
+  try {
+    await work;
+    return null;
+  } catch (e) {
+    return `${label}: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 // ---- Worker entry ----
 
 export default {
@@ -656,13 +671,23 @@ export default {
 
     // ---- health ----
     if (url.pathname === '/healthz') {
-      await Promise.all([ensureBlocklist(env, ctx), refreshStores()]);
+      // Health must answer even when degraded: a failed blocklist load or
+      // store refresh is reported in the body instead of escaping as an
+      // opaque 500 — /dns-query fails for exactly the same reason, so the
+      // probe is where that reason has to be visible.
+      const problems = (
+        await Promise.all([
+          settle(ensureBlocklist(env, ctx), 'blocklist unavailable'),
+          settle(refreshStores(), 'stores unavailable'),
+        ])
+      ).filter((p) => p !== null);
       const settings = settingsStore.get();
       const upstream = resolveUpstream(settings, env);
       const fallback = resolveFallback(upstream, settings, env);
       const urls = effectiveBlocklistUrls(settings, env);
       return Response.json({
-        ok: true,
+        ok: problems.length === 0,
+        problems,
         blocklistSize: blocklist.size,
         blocklistExceptions: blocklist.exceptionSize,
         blocklistSources: blocklist.listSources(),
@@ -680,7 +705,7 @@ export default {
         fallback: fallback ? { label: fallback.label, url: fallback.url, source: fallback.source } : null,
         dashboardConfigured:
           typeof env.DASHBOARD_PASSWORD === 'string' && env.DASHBOARD_PASSWORD.length > 0,
-      });
+      }, { status: problems.length === 0 ? 200 : 503 });
     }
 
     // ---- root redirect for browsers ----
