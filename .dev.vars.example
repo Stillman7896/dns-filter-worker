@@ -1,0 +1,4 @@
+# Local development secrets: copy to `.dev.vars` (git-ignored).
+# In production set it as a Worker secret instead:
+#   wrangler secret put DASHBOARD_PASSWORD
+DASHBOARD_PASSWORD=choose-a-secret

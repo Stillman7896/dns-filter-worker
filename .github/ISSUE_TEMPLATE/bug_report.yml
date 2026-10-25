@@ -1,0 +1,67 @@
+name: Bug report
+description: Something does not work the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please keep it to one problem, and **do not paste
+        `DASHBOARD_PASSWORD` or a session cookie** — redact tokens before attaching
+        anything. Security issues go to [SECURITY.md](../blob/main/SECURITY.md), not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happens
+      description: What you did, what you expected, what you got instead.
+      placeholder: |
+        1. Added the domain ... to the denylist
+        2. Queried it with ...
+        3. It resolved normally instead of being blocked
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Resolver / filtering
+        - Blocklist subscriptions
+        - Dashboard UI
+        - Logs
+        - Deploy / configuration
+        - Documentation
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA, or the version you deployed.
+      placeholder: v2.0.0 / 3f5efd9
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: DNS client
+      description: Which client is asking (browser, AdGuard Home, router, `dig`, `curl`, ...) and how it is pointed at the Worker.
+      placeholder: Firefox 142 with https://<worker>.workers.dev/dns-query
+    validations:
+      required: false
+  - type: textarea
+    id: healthz
+    attributes:
+      label: /healthz output
+      description: Paste the JSON from `https://<your-worker>/healthz` (it contains no secrets).
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Worker logs
+      description: Any error or `wrangler tail` output. Redact secrets.
+      render: shell
+    validations:
+      required: false

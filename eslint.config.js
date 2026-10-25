@@ -40,6 +40,13 @@ export default [
     },
   },
   {
+    // Tooling runs in node, but Playwright callbacks are evaluated in the browser.
+    files: ['tools/**/*.js'],
+    languageOptions: {
+      globals: { ...globals.node, ...browserGlobals },
+    },
+  },
+  {
     files: ['test/**/*.js'],
     languageOptions: {
       globals: { ...globals.node },
