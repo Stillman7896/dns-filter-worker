@@ -191,7 +191,10 @@ export async function boot() {
     await Promise.all([loadLogs(), loadStats()]);
     state.phase = 'ready';
   } catch (e) {
-    if (e.status === 503) state.phase = 'unconfigured';
+    // Only the worker's own "no password set" 503 means unconfigured; a 503
+    // from a worker that is degrading (CPU, memory, upstream) must be reported
+    // as a failure, or the panel sends the user hunting for the wrong problem.
+    if (e.status === 503 && e.code === 'unconfigured') state.phase = 'unconfigured';
     else if (e.status === 401) state.phase = 'auth';
     else {
       state.phase = 'boot';

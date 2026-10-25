@@ -1,8 +1,10 @@
 <script setup>
 import { computed } from 'vue';
-import { state, VIEWS, setRoute, initStore, signOut, pendingCount } from './store.js';
+import { state, VIEWS, setRoute, initStore, signOut, pendingCount, boot, runOp } from './store.js';
+import { ApiError } from './api.js';
 import { themeMode, cycleTheme, THEME_LABEL, THEME_NEXT } from './theme.js';
 import ToastHost from './components/ToastHost.vue';
+import AppButton from './components/AppButton.vue';
 import Login from './views/Login.vue';
 import Overview from './views/Overview.vue';
 import Rules from './views/Rules.vue';
@@ -35,6 +37,21 @@ const THEME_ICON = {
 };
 
 initStore();
+
+const ORIGIN = location.origin;
+
+/** Re-run boot() and report the real outcome — boot() itself never throws. */
+async function retryBoot() {
+  await runOp('boot.retry', {
+    verb: 'Reconnect',
+    ok: 'Worker answered',
+    fn: async () => {
+      await boot();
+      if (state.phase !== 'boot') return state.phase;
+      throw new ApiError(state.bootError || 'the worker did not answer.');
+    },
+  }).catch(() => {});
+}
 </script>
 
 <template>
@@ -130,10 +147,40 @@ initStore();
         <template v-else-if="state.phase === 'ready'">
           <component :is="page" :key="state.route" />
         </template>
+        <template v-else-if="state.phase === 'boot' && state.bootError">
+          <div class="max-w-2xl mx-auto pt-6 rise-in">
+            <div class="panel shadow-[var(--shadow-card)] p-6 sm:p-7">
+              <h1 class="text-[19px] font-semibold tracking-tight">The worker did not answer</h1>
+              <p class="hint mt-2 leading-relaxed">{{ state.bootError }}</p>
+
+              <p class="hint mt-4 leading-relaxed">
+                If its own configuration did this — too many blocklists, one giant list, past the
+                free plan's CPU or memory budget — every request dies together, including
+                <span class="st">/api/*</span>. The reset hatch sits beside
+                <span class="st">/healthz</span> and runs before any blocklist or store work, so it
+                still answers:
+              </p>
+              <div class="mt-3 rounded-md border border-line bg-raised px-3 py-2.5 st text-[12.5px] leading-relaxed overflow-x-auto">
+                <div class="text-beacon">curl -X POST {{ ORIGIN }}/healthz/reset \</div>
+                <div class="text-beacon pl-4">-H "Authorization: Bearer &lt;password&gt;"</div>
+              </div>
+              <p class="hint mt-3 leading-relaxed">
+                Wipes settings, custom rules and filter lists; deployment variables and the query
+                log stay. Needs <span class="st">DASHBOARD_PASSWORD</span> — the same password as
+                the dashboard. (Documents over 400k entries / 24 MB are refused before parsing now,
+                so this should not recur.)
+              </p>
+
+              <AppButton variant="solid" block class="mt-4" @click="retryBoot">
+                Try again
+              </AppButton>
+            </div>
+          </div>
+        </template>
         <template v-else>
           <div class="h-40 grid place-items-center text-muted gap-3">
             <span class="block w-5 h-5 rounded-full border-2 border-beacon border-t-transparent spin" aria-hidden="true" />
-            <p class="text-[13px]">{{ state.bootError || 'Contacting the worker…' }}</p>
+            <p class="text-[13px]">Contacting the worker…</p>
           </div>
         </template>
       </main>
