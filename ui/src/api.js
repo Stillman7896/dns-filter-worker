@@ -85,6 +85,9 @@ export const api = {
   removeBlocklist: (url) => request('/api/blocklists', { method: 'DELETE', query: { url } }),
   reloadBlocklists: () => request('/api/blocklists/refresh', { method: 'POST' }),
 
+  // escape hatch: clears settings + custom rules straight on the worker
+  resetWorker: (password) => request('/healthz/reset', { method: 'POST', body: { password } }),
+
   // audit log
   logs: (query) => request('/api/logs', { query }),
   deleteLogs: (query) => request('/api/logs', { method: 'DELETE', query }),

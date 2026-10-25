@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed } from 'vue';
-import { state, runOp, loadLists, loadBlocklists, setRoute } from '../store.js';
+import { state, runOp, boot, loadLists, loadBlocklists, setRoute } from '../store.js';
 import { api } from '../api.js';
 import AppButton from '../components/AppButton.vue';
 import ConfirmButton from '../components/ConfirmButton.vue';
@@ -168,6 +168,25 @@ async function reloadBlocklists() {
   }).catch(() => {});
 }
 
+/** Escape hatch for a deployment whose own configuration broke it: the reset
+ *  route lives beside /healthz and needs only the dashboard password, so it
+ *  works even when /api/* no longer answers. */
+async function resetWorker() {
+  const pw = window.prompt(
+    'Wipes settings, routes and custom rules on the worker.\nDeployment variables and the query log stay.\n\nDashboard password:'
+  );
+  if (pw === null) return;
+  await runOp('lists.resetWorker', {
+    verb: 'Reset worker',
+    ok: 'Worker reset — settings and custom rules cleared',
+    fn: async () => {
+      const r = await api.resetWorker(pw);
+      await boot();
+      return r;
+    },
+  }).catch(() => {});
+}
+
 // ---- regex engine toggle (mirrors Settings.toggle) -------------------------
 
 async function toggleRegex(value) {
@@ -286,9 +305,19 @@ async function toggleRegex(value) {
         <p class="hint st">
           {{ blTotal.toLocaleString() }} entries held in memory
         </p>
-        <p v-if="overLimit" class="st text-[12.5px] text-block" role="alert">
-          More than {{ blLimit.toLocaleString() }} entries — the free plan can run the isolate out of memory.
-        </p>
+        <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+          <p v-if="overLimit" class="st text-[12.5px] text-block" role="alert">
+            More than {{ blLimit.toLocaleString() }} entries — the free plan can run the isolate out of memory.
+          </p>
+          <AppButton
+            small
+            busy-key="lists.resetWorker"
+            title="Wipe settings, routes and custom rules on the worker — the last resort when it can no longer answer the dashboard."
+            @click="resetWorker"
+          >
+            Reset worker
+          </AppButton>
+        </div>
       </div>
     </section>
 

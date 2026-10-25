@@ -6,6 +6,7 @@ import {
   Blocklist,
   DEFAULT_BLOCKLIST_URL,
   MAX_BLOCKLIST_URLS,
+  MAX_SOURCE_ENTRIES,
   effectiveBlocklistUrls,
   normalizeBlocklistUrls,
   parseBlocklist,
@@ -255,4 +256,21 @@ test('effectiveBlocklistUrls: a saved list replaces the variable and is normaliz
     ['https://s.test/list'],
     'the variable is ignored once the user saved a list; bad rows dropped',
   );
+});
+
+test('putSource: a document over the entry cap is refused and marked, previous copy stays', () => {
+  const bl = new Blocklist();
+  bl.putSource('https://l.test/one', 'keep.test\n');
+  assert.equal(bl.size, 1);
+
+  const rows = [];
+  for (let i = 0; i <= MAX_SOURCE_ENTRIES; i++) rows.push(`e${i}.test`);
+  bl.putSource('https://l.test/one', rows.join('\n'));
+
+  assert.equal(bl.size, 1, 'the oversized parse never reaches the union');
+  const src = bl.listSources().find((s) => s.url === 'https://l.test/one');
+  assert.ok(src, 'the source is still listed');
+  assert.match(String(src.error), /entry cap/, 'the refusal is visible on the source');
+  assert.equal(bl.sourceFresh('https://l.test/one', 60_000), true, 'marked fresh: no re-parse on every request');
+  assert.ok(bl.sourceLoaded('https://l.test/one'));
 });

@@ -85,14 +85,14 @@ async function warmBlocklists(env, ctx) {
 }
 
 /** @param {Env} env @returns {boolean} */
-function isConfigured(env) {
+export function isConfigured(env) {
   return typeof env.DASHBOARD_PASSWORD === 'string' && env.DASHBOARD_PASSWORD.length > 0;
 }
 
 /** Constant-time-ish string compare.
  * @param {unknown} a @param {unknown} b @returns {boolean}
  */
-function safeEqual(a, b) {
+export function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
   if (a.length !== b.length) return false;
   let diff = 0;
@@ -438,6 +438,13 @@ export async function handleApi(request, env, url, ctx) {
       if (current.includes(target)) return json({ error: 'that blocklist is already subscribed' }, { status: 400 });
       if (current.length >= MAX_BLOCKLIST_URLS) {
         return json({ error: `at most ${MAX_BLOCKLIST_URLS} blocklists can be subscribed` }, { status: 400 });
+      }
+
+      const held = ctx.blocklist ? ctx.blocklist.size : 0;
+      if (held >= BLOCKLIST_ENTRY_LIMIT) {
+        return json({
+          error: `already holding ${held.toLocaleString()} entries — that is the free plan budget. Remove a list first (or use the reset hatch in /healthz/reset).`,
+        }, { status: 400 });
       }
 
       // Saving the list turns the deployment default into an ordinary entry,

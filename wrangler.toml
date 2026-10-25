@@ -29,7 +29,7 @@ binding = "ASSETS"
 #                 fall through to assets + SPA fallback -> HTML -> null JSON)
 # A trailing client tag on the DoH endpoint (/dns-query/<tag>) must also reach
 # the script, so the suffix path needs its own glob: deep paths need `*`.
-run_worker_first = ["/api/*", "/dns-query", "/dns-query/*", "/healthz", "/"]
+run_worker_first = ["/api/*", "/dns-query", "/dns-query/*", "/healthz", "/healthz/*", "/"]
 not_found_handling = "single-page-application"
 html_handling = "auto-trailing-slash"
 

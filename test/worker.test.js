@@ -4,6 +4,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import worker from '../worker.js';
+import { MAX_SOURCE_BYTES } from '../blocklist.js';
 import { summariseAnswers } from '../dns.js';
 import { buildQuery, buildResponse, v4rdata, FakeKV } from './helpers.js';
 
@@ -993,4 +994,104 @@ test('healthz: a failed blocklist load is reported, not thrown', async () => {
   const dns = await dohGet(env, buildQuery('public.foo.com'));
   assert.equal(dns.status, 503);
   assert.equal(await dns.text(), 'blocklist unavailable');
+});
+
+// ---- reset hatch ---------------------------------------------------------------
+
+test('healthz/reset: wrong password leaves the configuration alone', async () => {
+  const kv = new FakeKV({ 'settings:main': '{"blocklistUrls":["https://big.test/list"]}' });
+  const env = mkEnv({ kv, d1: new FakeD1() });
+
+  const res = await worker.fetch(new Request('https://worker.test/healthz/reset', {
+    method: 'POST',
+    body: JSON.stringify({ password: 'nope' }),
+  }), env);
+  assert.equal(res.status, 401);
+  assert.ok(await kv.get('settings:main'), 'a wrong token must never wipe state');
+});
+
+test('healthz/reset: unarmed when DASHBOARD_PASSWORD is missing', async () => {
+  const kv = new FakeKV({ 'settings:main': '{}' });
+  const env = mkEnv({ kv, password: '' });
+
+  const res = await worker.fetch(new Request('https://worker.test/healthz/reset', {
+    method: 'POST',
+    body: JSON.stringify({ password: 'anything' }),
+  }), env);
+  assert.equal(res.status, 403);
+  assert.ok(await kv.get('settings:main'));
+});
+
+test('healthz/reset: one authenticated call wipes settings, rules and legacy rows', async () => {
+  const kv = new FakeKV({
+    'settings:main': '{"blocklistUrls":["https://big.test/list"]}',
+    'rules:data': 'deny\tbad.example.com',
+    'routes:data': 'nas.home.lan\ta\t192.168.1.20\t300',
+    'keywords:data': 'tracker',
+    'regex:data': 'cdn\\d+',
+    'tlds:data': 'zip',
+    'data:version': '42',
+    'rule:old.example.com': 'deny',
+  });
+  const env = mkEnv({ kv, d1: new FakeD1() });
+
+  const res = await worker.fetch(new Request('https://worker.test/healthz/reset', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer pw' },
+    body: '{}',
+  }), env);
+  assert.equal(res.status, 200, 'Bearer form works for curl one-liners');
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.ok(body.cleared.includes('settings:main'));
+  assert.ok(body.cleared.includes('rule:old.example.com'), 'legacy rows go too or they resurrect on read');
+
+  // `data:version` is regenerated metadata (the empty-blob write bumps it), not
+  // configuration, so only the config keys are asserted gone.
+  for (const key of ['settings:main', 'rules:data', 'routes:data', 'keywords:data', 'regex:data', 'tlds:data', 'rule:old.example.com']) {
+    // Stores may legitimately re-persist an *empty* blob right after (the
+    // legacy import does); what must never survive is old configuration.
+    const v = await kv.get(key);
+    assert.ok(v === null || v === '', `${key} cleared (got ${JSON.stringify(v)})`);
+  }
+
+  // defaults in force immediately: no TTL wait, and the resolver still answers
+  const hz = await worker.fetch(new Request('https://worker.test/healthz'), env);
+  const health = await hz.json();
+  assert.equal(health.ok, true, 'the worker boots on factory defaults again');
+  assert.equal(health.customRules, 0);
+  assert.equal(health.resetArmed, true);
+});
+
+test('blocklist: an oversized document is refused before parsing and marked on the source', async () => {
+  const kv = new FakeKV();
+  const env = mkEnv({ kv, d1: new FakeD1() });
+  const oversized = 'big.test\n' + 'x'.repeat(MAX_SOURCE_BYTES);
+  const savedFetch = globalThis.fetch;
+  /** @param {string|Request|URL} input @param {RequestInit} [init] */
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === 'https://huge.test/list') return new Response(oversized, { status: 200 });
+    if (url === UPSTREAM_URL) {
+      const q = new Uint8Array(/** @type {ArrayBuffer} */ (init && init.body));
+      return new Response(buildResponse(q, [{ type: 1, rdata: v4rdata('93.184.216.34') }]));
+    }
+    throw new Error('unexpected fetch: ' + url);
+  };
+
+  try {
+    const cookie = await loginCookie(env);
+    const saved = await saveSettings(env, cookie, { blocklistUrls: ['https://huge.test/list'] });
+    assert.equal(saved.status, 200);
+
+    // The refusal must not break answering: the query passes through unfiltered.
+    const dns = await dohGet(env, buildQuery('public.foo.com'));
+    assert.equal(dns.status, 200, 'refusing a document never takes the resolver down');
+
+    const hz = await (await worker.fetch(new Request('https://worker.test/healthz'), env)).json();
+    assert.equal(hz.blocklistSize, 0, 'the oversized parse never reaches the union');
+    assert.match(String(hz.blocklistSources[0].error), /per-list cap/, 'the reason is visible on /healthz');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
 });

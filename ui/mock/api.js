@@ -169,6 +169,39 @@ function authed(req) {
 
 export function mockApi(req, res, next) {
   const url = new URL(req.url, 'http://localhost');
+
+  // Mirrors worker.js /healthz/reset: same password check, same factory
+  // effect. Lives outside /api/* because the hatch must work when /api is dead.
+  if (url.pathname === '/healthz/reset') {
+    void (async () => {
+      if (req.method !== 'POST') return json(res, 405, { error: 'Method Not Allowed' });
+      const body = await readBody(req);
+      if (!body || body.password !== PASSWORD) return json(res, 401, { error: 'wrong reset token' });
+      fixtures.rules = [];
+      fixtures.routes = [];
+      fixtures.keywords = [];
+      fixtures.regex = [];
+      fixtures.tlds = [];
+      fixtures.settings = { ...fixtures.settings, blocklistUrls: null };
+      fixtures.blocklist.subscriptions = [
+        {
+          url: 'https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/pro-plus/domains',
+          entries: 120_000,
+          exceptions: 980,
+          loadedAt: 0,
+          error: null,
+          source: 'deploy',
+        },
+      ];
+      return json(res, 200, {
+        ok: true,
+        cleared: ['settings:main', 'rules:data', 'routes:data', 'keywords:data', 'regex:data', 'tlds:data', 'data:version'],
+        note: 'settings and custom rules cleared; deployment variables untouched',
+      });
+    })();
+    return;
+  }
+
   if (!url.pathname.startsWith('/api/')) return next();
 
   const run = async () => {

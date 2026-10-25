@@ -14,8 +14,8 @@
 import { DATA_VERSION_KEY, readSharedVersion, noteSharedVersion } from './lists.js';
 import { toAscii } from './idn.js';
 
-const RULES_KEY = 'rules:data';
-const LEGACY_PREFIX = 'rule:';
+export const RULES_KEY = 'rules:data';
+export const LEGACY_RULE_PREFIX = 'rule:';
 const CACHE_TTL_MS = 30_000;
 
 /** @param {string} raw @returns {Map<string, 'allow'|'deny'>} */
@@ -119,7 +119,7 @@ export class RuleStore {
     try {
       let cursor;
       do {
-        const page = await this.kv.list({ prefix: LEGACY_PREFIX, cursor });
+        const page = await this.kv.list({ prefix: LEGACY_RULE_PREFIX, cursor });
         cursor = page.list_complete ? undefined : page.cursor;
         const keys = page.keys.map((k) => k.name);
         for (let i = 0; i < keys.length; i += 20) {
@@ -128,7 +128,7 @@ export class RuleStore {
           for (let j = 0; j < batch.length; j++) {
             const kind = values[j];
             if (kind === 'allow' || kind === 'deny') {
-              map.set(batch[j].slice(LEGACY_PREFIX.length), kind);
+              map.set(batch[j].slice(LEGACY_RULE_PREFIX.length), kind);
             }
           }
         }

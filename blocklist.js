@@ -23,9 +23,20 @@ export const MAX_BLOCKLIST_URLS = 10;
 /**
  * Above this many entries in memory the Cloudflare Workers free plan can run
  * the isolate out of its 128 MB memory and the deployment starts dying with
- * OOM / "script exceeded memory limit" — the dashboard warns at this line.
+ * OOM / "script exceeded memory limit" — the dashboard warns at this line and
+ * refuses new subscriptions while it is breached.
  */
 export const BLOCKLIST_ENTRY_LIMIT = 1_000_000;
+
+/**
+ * One list larger than this many entries is usually a mistake (hosts-style vs
+ * user-URL lists) and its parse alone can exceed the free-plan CPU budget
+ * before it even counts toward the memory cap — it is rejected outright.
+ */
+export const MAX_SOURCE_ENTRIES = 400_000;
+
+/** Byte cap for one document, checked before any parse work. */
+export const MAX_SOURCE_BYTES = 24 * 1024 * 1024;
 
 /**
  * Validate a subscription list: https URLs only, trimmed, de-duplicated, capped
@@ -197,11 +208,29 @@ export class Blocklist {
 
   /**
    * Parse `text` as the document behind `url` and merge it into the union.
+   * A document that would blow the free-plan CPU/memory budget is rejected:
+   * the previous copy (if any) stays in service and the source is marked with
+   * the reason instead, so the failure is visible and the next request does
+   * not re-parse the same oversized text (loadedAt is touched to keep it out
+   * of the hot revalidation path for the normal stale window).
    * @param {string} url
    * @param {string} text
    */
   putSource(url, text) {
     const parsed = parseBlocklist(text);
+    const count = parsed.domains.size + parsed.exceptions.size;
+    if (count > MAX_SOURCE_ENTRIES) {
+      const prior = this.sources.get(url);
+      const reason = `list exceeds the ${MAX_SOURCE_ENTRIES.toLocaleString()} entry cap (${count.toLocaleString()}) — kept the previous copy`;
+      if (prior) {
+        prior.error = reason;
+        prior.loadedAt = Date.now();
+      } else {
+        this.sources.set(url, { domains: new Set(), exceptions: new Set(), loadedAt: Date.now(), error: reason });
+      }
+      this.rebuild();
+      return;
+    }
     this.sources.set(url, { domains: parsed.domains, exceptions: parsed.exceptions, loadedAt: Date.now(), error: null });
     this.rebuild();
   }
@@ -217,6 +246,21 @@ export class Blocklist {
       s.loadedAt = Date.now();
       s.error = null;
     }
+  }
+
+  /**
+   * The document was fetched but refused before parsing (too many bytes): the
+   * copy already in service stays, the reason is recorded for the dashboard,
+   * and the freshness marker moves so a known-bad document is not fetched and
+   * re-measured on every request.
+   * @param {string} url
+   * @param {string} reason
+   */
+  sourceRejected(url, reason) {
+    const s = this.sources.get(url);
+    if (!s) return;
+    s.error = reason;
+    s.loadedAt = Date.now();
   }
 
   /**

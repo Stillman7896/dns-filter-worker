@@ -10,15 +10,15 @@
 // come from dashboard settings in KV. `env.UPSTREAM_URL` is the fallback for a
 // deployment with no provider picked; `env.BLOCKLIST_URL` is still a var.
 
-import { Blocklist, effectiveBlocklistUrls } from './blocklist.js';
-import { RuleStore } from './rules.js';
-import { SettingsStore } from './settings.js';
-import { RouteStore, routeRecords } from './routing.js';
-import { TextSetStore, normalizeKeyword, normalizeRegex } from './lists.js';
+import { Blocklist, effectiveBlocklistUrls, MAX_SOURCE_BYTES, BLOCKLIST_ENTRY_LIMIT, MAX_BLOCKLIST_URLS } from './blocklist.js';
+import { RuleStore, RULES_KEY, LEGACY_RULE_PREFIX } from './rules.js';
+import { SettingsStore, SETTINGS_KEY } from './settings.js';
+import { RouteStore, routeRecords, ROUTES_KEY } from './routing.js';
+import { TextSetStore, normalizeKeyword, normalizeRegex, DATA_VERSION_KEY } from './lists.js';
 import { runQueryFilters, privateAnswerIP, BLOCKED_QUERY_STATUSES, RegexEngine } from './filters.js';
 import { resolveUpstream, resolveFallback } from './upstream.js';
 import { odohForward } from './odoh.js';
-import { handleApi } from './dashboard.js';
+import { handleApi, isConfigured, safeEqual } from './dashboard.js';
 import {
   Buf,
   parseQuestion,
@@ -112,6 +112,40 @@ async function blocklistUrls(env) {
 }
 
 /**
+ * Free-plan ceiling guard: a document over MAX_SOURCE_BYTES costs more to split
+ * and parse than the entire per-request CPU budget. It is refused *before* the
+ * parse, and whatever copy is already answering queries stays in service.
+ * @param {string} blUrl @param {string} text @returns {boolean} true when safe to parse
+ */
+function withinSourceBudget(blUrl, text) {
+  if (text.length <= MAX_SOURCE_BYTES) return true;
+  const mb = (text.length / 1048576).toFixed(1);
+  blocklist.sourceRejected(
+    blUrl,
+    `document is ${mb} MB, over the ${MAX_SOURCE_BYTES / 1048576} MB per-list cap — parse skipped to stay inside the CPU budget`
+  );
+  return false;
+}
+
+/**
+ * Reset credential: `Authorization: Bearer <pw>`, `X-Reset-Token: <pw>`, or a
+ * `{"password": "<pw>"}` body. The dashboard password doubles as the reset
+ * token, so the hatch needs no second secret to manage.
+ * @param {Request} request @returns {Promise<string>}
+ */
+async function resetToken(request) {
+  const auth = request.headers.get('authorization') || '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7);
+  const header = request.headers.get('x-reset-token');
+  if (header) return header;
+  try {
+    const body = await request.json();
+    if (body && typeof body.password === 'string') return body.password;
+  } catch { /* not a JSON body */ }
+  return '';
+}
+
+/**
  * Conditional fetch of ONE blocklist document: revalidates on its stored ETag,
  * refreshes the edge copy with a new freshness marker, and parses a changed
  * body into that subscription's set.
@@ -131,6 +165,7 @@ async function fetchBlocklistSource(blUrl, prev, ctx) {
     blocklist.touchSource(blUrl);
   } else if (res.ok) {
     text = await res.text();
+    if (!withinSourceBudget(blUrl, text)) return; // refused before it costs a parse
     blocklist.putSource(blUrl, text);
   } else {
     throw new Error(`blocklist HTTP ${res.status} for ${blUrl}`);
@@ -168,7 +203,10 @@ async function ensureBlocklistSource(blUrl, force, ctx) {
     const cached = await matchCache(cacheKey);
     const etag = cached?.headers.get('etag') || null;
     await fetchBlocklistSource(blUrl, { etag, text: null }, ctx);
-    if (!blocklist.sourceLoaded(blUrl) && cached) blocklist.putSource(blUrl, await cached.text());
+    if (!blocklist.sourceLoaded(blUrl) && cached) {
+      const text = await cached.text();
+      if (withinSourceBudget(blUrl, text)) blocklist.putSource(blUrl, text);
+    }
     return;
   }
 
@@ -177,6 +215,7 @@ async function ensureBlocklistSource(blUrl, force, ctx) {
   const cached = await matchCache(cacheKey);
   if (cached) {
     const text = await cached.text();
+    if (!withinSourceBudget(blUrl, text)) return;
     const fetchedAt = Number(cached.headers.get(FETCHED_AT_HEADER)) || 0;
     const etag = cached.headers.get('etag');
     blocklist.putSource(blUrl, text);
@@ -283,6 +322,19 @@ async function refreshStores() {
     keywordStore.refresh(),
     regexStore.refresh(),
     tldStore.refresh(),
+  ]);
+}
+
+/** Every store re-read right now: the reset path must not wait out a TTL window. */
+/** @returns {Promise<void>} */
+async function forceRefreshStores() {
+  await Promise.all([
+    settingsStore.refresh(true),
+    ruleStore.refresh(true),
+    routeStore.refresh(true),
+    keywordStore.refresh(true),
+    regexStore.refresh(true),
+    tldStore.refresh(true),
   ]);
 }
 
@@ -669,6 +721,55 @@ export default {
       });
     }
 
+    // ---- escape hatch: wipe the KV configuration without the dashboard ----
+    // Defense for a deployment whose own configuration blew its CPU or memory
+    // budget: /api/* is unreachable then, but this route touches no store and
+    // needs only the dashboard password, so one curl restores a worker that
+    // boots again. Deployment variables and the D1 query log are left alone.
+    if (url.pathname === '/healthz/reset' && request.method === 'POST') {
+      if (!isConfigured(env)) {
+        return Response.json({ error: 'reset is not armed: set DASHBOARD_PASSWORD to use it' }, { status: 403 });
+      }
+      const token = await resetToken(request);
+      if (!token || !safeEqual(token, /** @type {string} */ (env.DASHBOARD_PASSWORD))) {
+        return Response.json({ error: 'wrong reset token' }, { status: 401 });
+      }
+      if (!env.RULES) return Response.json({ error: 'no KV binding to reset' }, { status: 400 });
+
+      const cleared = [];
+      for (const key of [SETTINGS_KEY, RULES_KEY, ROUTES_KEY, 'keywords:data', 'regex:data', 'tlds:data', DATA_VERSION_KEY]) {
+        try {
+          await env.RULES.delete(key);
+          cleared.push(key);
+        } catch { /* keep clearing the rest */ }
+      }
+
+      // Legacy one-key-per-rule rows are re-imported on the next read and would
+      // quietly undo the reset, so they go as well.
+      /** @type {string[]} */ const legacy = [];
+      try {
+        /** @type {string|undefined} */ let cursor;
+        do {
+          const page = await env.RULES.list({ prefix: LEGACY_RULE_PREFIX, cursor });
+          for (const k of page.keys) legacy.push(k.name);
+          cursor = page.list_complete ? undefined : (page.cursor ?? undefined);
+        } while (cursor);
+      } catch { /* no list support: the blob key above is the one that matters */ }
+      for (const name of legacy) {
+        try {
+          await env.RULES.delete(name);
+          cleared.push(name);
+        } catch { /* best effort */ }
+      }
+
+      await forceRefreshStores();
+      return Response.json({
+        ok: true,
+        cleared,
+        note: 'settings and custom rules cleared; deployment variables untouched',
+      });
+    }
+
     // ---- health ----
     if (url.pathname === '/healthz') {
       // Health must answer even when degraded: a failed blocklist load or
@@ -703,6 +804,9 @@ export default {
         upstream,
         upstreamUrl: upstream.url,
         fallback: fallback ? { label: fallback.label, url: fallback.url, source: fallback.source } : null,
+        blocklistUrlLimit: MAX_BLOCKLIST_URLS,
+        blocklistEntryLimit: BLOCKLIST_ENTRY_LIMIT,
+        resetArmed: isConfigured(env),
         dashboardConfigured:
           typeof env.DASHBOARD_PASSWORD === 'string' && env.DASHBOARD_PASSWORD.length > 0,
       }, { status: problems.length === 0 ? 200 : 503 });

@@ -155,7 +155,15 @@ it. The dashboard's **Filter lists** tab manages all of this: add/remove URLs,
 one **Reload** button that revalidates every subscription against its origin
 (conditional fetch, an unchanged document costs a single 304), and a warning
 label when the merged `total` passes `BLOCKLIST_ENTRY_LIMIT` (1,000,000)
-entries — beyond that the free plan's isolate memory can be exhausted. Each
+entries — beyond that the free plan's isolate memory can be exhausted. The
+same budget is enforced on the worker, not just signalled: a single document
+over `MAX_SOURCE_ENTRIES` (400,000) or `MAX_SOURCE_BYTES` (24 MB) is refused
+before its parse (the previous copy keeps answering, the reason is shown on
+the subscription row and `/healthz`), and a new subscription is refused while
+the merged total is already at the entry limit. Those two lines are the CPU
+story — the free plan's 10 ms budget is spent parsing documents, so the caps
+stop one runaway list from taking the resolver (and the dashboard API) down
+with it. Each
 row shows its own entry count, exception count, last fetch time and fetch
 error, so a dead host is visible without guessing which one it was.
 
@@ -254,7 +262,30 @@ wrangler kv:bulk delete --namespace-id=<ID> --prefix=rule: # then remove
 | `/api/logs`       | Search + paginate logs (GET, `?client=` / `?untagged=1`); delete filtered/all (DELETE) |
 | `/api/logs/:id`   | Delete a single log row                                                |
 | `/api/session`    | Login (sets session cookie)                                             |
-| `/healthz`        | Stats, effective settings, resolved URLs                                |
+| `/healthz`        | Stats, effective settings, resolved URLs (503 + `problems[]` when degraded) |
+| `/healthz/reset`  | Factory-reset hatch (POST, password-gated) — see below                  |
+
+### Escape hatch: `/healthz/reset`
+
+A deployment can configure itself into a corner (too many blocklists, one
+monster list) until every request dies on the CPU or memory budget — including
+the dashboard API that would let you undo it. `POST /healthz/reset` exists for
+exactly that: it runs before any store or blocklist work, needs only the
+dashboard password, and wipes the KV configuration (settings, custom rules,
+routes, filter lists, legacy rule rows). Deployment variables and the D1 query
+log are untouched. The dashboard password doubles as the token, so no second
+secret is involved:
+
+```sh
+curl -X POST https://<worker>.workers.dev/healthz/reset \
+  -H 'Authorization: Bearer <DASHBOARD_PASSWORD>'
+# or:  --data '{"password":"<DASHBOARD_PASSWORD>"}'
+```
+
+It is disabled (403) when no `DASHBOARD_PASSWORD` is set, and the same action
+is a **Reset worker** button in the dashboard's Filter lists tab. The hatch is
+deliberately off `/api/*`: it must work while the rest of the worker is on
+fire.
 
 ## Upstream resolver
 
