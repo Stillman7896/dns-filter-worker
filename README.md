@@ -283,9 +283,11 @@ curl -X POST https://<worker>.workers.dev/healthz/reset \
 ```
 
 It is disabled (403) when no `DASHBOARD_PASSWORD` is set, and the same action
-is a **Reset worker** button in the dashboard's Filter lists tab. The hatch is
-deliberately off `/api/*`: it must work while the rest of the worker is on
-fire.
+is a **Reset worker** button in the dashboard's Filter lists tab. When the
+worker stops answering altogether, the dashboard's failure screen prints this
+exact curl command — that is the only screen such a worker can still show. The
+hatch is deliberately off `/api/*`: it must work while the rest of the worker
+is on fire.
 
 ## Upstream resolver
 
