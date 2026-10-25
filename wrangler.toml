@@ -1,4 +1,7 @@
-name = "dns-filter-worker"
+# Workers are addressed by name; renaming one creates a *new* Worker and leaves
+# the old one running. Releases before v2.0.0 used "dns-filter-worker" — see
+# docs/operations.md#upgrading before changing this on an existing deployment.
+name = "sinkker"
 main = "worker.js"
 compatibility_date = "2024-09-23"
 

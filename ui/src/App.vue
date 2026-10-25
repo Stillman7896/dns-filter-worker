@@ -58,15 +58,19 @@ async function retryBoot() {
   <div class="min-h-dvh flex flex-col">
     <header class="sticky top-0 z-40 bg-canvas/92 backdrop-blur-sm border-b border-line">
       <div class="w-full max-w-6xl mx-auto flex items-center gap-3 px-4 sm:px-6 md:px-8 h-14">
-        <a href="#/overview" class="flex items-center gap-2.5 group" aria-label="DNS Filter control">
-          <svg class="w-6 h-6 text-beacon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <circle cx="7" cy="12" r="2.2" fill="currentColor" />
-            <path d="M11.5 7.4a6.5 6.5 0 0 1 0 9.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
-            <path d="M15 5.2a10 10 0 0 1 0 13.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" opacity="0.55" />
+        <a href="#/overview" class="flex items-center gap-2.5 group" aria-label="Sinkker control">
+          <!-- brand/mark.svg, inline so it can inherit the beacon colour -->
+          <svg class="w-[26px] h-[26px] text-beacon" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+            <g stroke="currentColor" stroke-width="3" stroke-linecap="round">
+              <path d="M5 5.5h22" />
+              <path d="M9.5 12.5h13" opacity="0.72" />
+              <path d="M12.5 19.5h7" opacity="0.5" />
+            </g>
+            <circle cx="16" cy="25.6" r="2.6" fill="currentColor" />
           </svg>
           <span class="flex items-baseline gap-2">
-            <span class="text-[15px] font-semibold tracking-tight">DNS Filter</span>
-            <span class="hidden sm:inline text-[12.5px] text-muted">resolver control</span>
+            <span class="text-[15px] font-semibold tracking-tight">Sinkker</span>
+            <span class="hidden sm:inline text-[12.5px] text-muted">DNS sinkhole</span>
           </span>
         </a>
 

@@ -36,7 +36,7 @@ async function exportConfig() {
       const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
       const a = document.createElement('a');
       a.href = url;
-      a.download = `dns-filter-${stamp}.json`;
+      a.download = `sinkker-${stamp}.json`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 4000);
       return data;
