@@ -121,6 +121,9 @@ function json(body, init = {}) {
     headers: {
       'Content-Type': 'application/json',
       'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
       ...(init.headers || {}),
     },
   });
