@@ -318,14 +318,21 @@ test('settings: GET defaults, POST patch incl. retention validation', async () =
   assert.equal(s0.idnBlock, false);
   assert.equal(s0.logPassed, true);
   assert.equal(s0.logRetentionDays, 30);
+  assert.equal(s0.blockedResponse, 'nxdomain');
 
   const post = await call(ctx, env, '/api/settings', {
-    method: 'POST', cookie, body: { idnBlock: true, logRetentionDays: 7, logPassed: false },
+    method: 'POST', cookie, body: { idnBlock: true, logRetentionDays: 7, logPassed: false, blockedResponse: 'refused' },
   });
   const s1 = (await post.json()).settings;
   assert.equal(s1.idnBlock, true);
   assert.equal(s1.logPassed, false);
   assert.equal(s1.logRetentionDays, 7);
+  assert.equal(s1.blockedResponse, 'refused');
+
+  const badResponse = await call(ctx, env, '/api/settings', {
+    method: 'POST', cookie, body: { blockedResponse: 'invalid_mode' },
+  });
+  assert.equal(badResponse.status, 400);
 
   const clamped = await call(ctx, env, '/api/settings', {
     method: 'POST', cookie, body: { logRetentionDays: 99999 },

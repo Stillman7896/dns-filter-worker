@@ -139,6 +139,40 @@ export function buildNxdomainResponse(queryBuf) {
   return out;
 }
 
+/** @param {Uint8Array} queryBuf @param {string} [responseType] @param {number} [qtype] @returns {Buf} */
+export function buildBlockedResponse(queryBuf, responseType = 'nxdomain', qtype = RR.A) {
+  if (responseType === 'refused') return buildRefusedResponse(queryBuf);
+  if (responseType === 'nodata') {
+    const end = questionEnd(queryBuf);
+    if (end < 0) return buildRefusedResponse(queryBuf);
+    const flags = (queryBuf[2] << 8) | queryBuf[3];
+    const head = Buf.from(queryBuf.subarray(0, end));
+    head.writeUInt16BE(0x8000 | 0x0400 | 0x0080 | (flags & 0x0100), 2);
+    head.writeUInt16BE(1, 4);
+    head.writeUInt16BE(0, 6);
+    head.writeUInt16BE(0, 8);
+    head.writeUInt16BE(0, 10);
+    return head;
+  }
+  if (responseType === 'null_ip') {
+    if (questionEnd(queryBuf) < 0) return buildRefusedResponse(queryBuf);
+    const q = parseQuestion(queryBuf);
+    const name = q ? q.name : 'blocked.local';
+    // The query type decides the answer: an AAAA query must not be handed a
+    // 4-byte A record (some clients reject the mismatch outright).
+    const isAaaa = (q && q.qtype === RR.AAAA) || qtype === RR.AAAA;
+    const rdata = isAaaa ? NULL_IPV6 : NULL_IPV4;
+    return buildAnswerResponse(queryBuf, [{ name, type: isAaaa ? RR.AAAA : RR.A, rdata, ttl: NULL_IP_TTL }]);
+  }
+  return buildNxdomainResponse(queryBuf);
+}
+
+/** TTL for a synthesized null-address answer: short enough to re-check soon. */
+const NULL_IP_TTL = 300;
+/** Rdata for a null-address block, shared and never mutated after creation. */
+const NULL_IPV4 = new Buf(4); // 0.0.0.0
+const NULL_IPV6 = new Buf(16); // ::
+
 // ---- Synthesized answers (domain response routing, upstream probe) ----
 
 /** DNS RR type numbers this worker can synthesize. */

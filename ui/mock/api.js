@@ -47,6 +47,7 @@ const fixtures = {
     upstreamRelay: '',
     upstreamFailover: true,
     upstreamFallbackUrl: '',
+    blockedResponse: 'null_ip',
     // null = the deployment BLOCKLIST_URL entry (mirrors the worker tri-state)
     blocklistUrls: null,
   },

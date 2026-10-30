@@ -239,6 +239,81 @@ test('answer-level rebinding: upstream private IP -> NXDOMAIN + logged rebind', 
   globalThis.__answers = undefined;
 });
 
+test('blockedResponse: refused / nodata / null_ip change what a blocked name gets', async () => {
+  const q = buildQuery('ads.blocklist.test');
+  const q6 = buildQuery('ads.blocklist.test', { qtype: 28 });
+
+  /** @param {string} mode @param {Uint8Array} query */
+  const blockedWith = async (mode, query) => {
+    const env = mkEnv({
+      d1: new FakeD1(),
+      kv: new FakeKV({ 'settings:main': JSON.stringify({ blockedResponse: mode }) }),
+    });
+    return new Uint8Array(await (await dohGet(env, query)).arrayBuffer());
+  };
+  /** @param {Uint8Array} buf @param {number} offset */
+  const u16 = (buf, offset) => (buf[offset] << 8) | buf[offset + 1];
+  // Synthesized answers carry the owner name uncompressed, so the first record
+  // starts len("ads.blocklist.test") + root byte past the echoed question.
+  const recA = q.length + 'ads.blocklist.test'.split('.').reduce((n, l) => n + l.length + 1, 1);
+  const recAAAA = q6.length + 'ads.blocklist.test'.split('.').reduce((n, l) => n + l.length + 1, 1);
+
+  const refused = await blockedWith('refused', q);
+  assert.equal(rcode(refused), 5, 'REFUSED');
+  assert.equal(refused.length, q.length, 'no records');
+
+  const nodata = await blockedWith('nodata', q);
+  assert.equal(rcode(nodata), 0, 'NOERROR');
+  assert.equal(ancount(nodata), 0, 'no records');
+  assert.equal(nodata.length, q.length, 'question only');
+  assert.deepEqual([...nodata.slice(12, q.length)], [...q.slice(12)], 'question bytes intact');
+
+  // Null IP: an A query answers 0.0.0.0, an AAAA query answers :: — never the
+  // other family's record, which some clients reject outright.
+  const nullA = await blockedWith('null_ip', q);
+  assert.equal(rcode(nullA), 0);
+  assert.equal(ancount(nullA), 1);
+  assert.equal(u16(nullA, recA), 1, 'A record');
+  assert.equal(u16(nullA, recA + 8), 4, '4-byte rdata');
+  assert.deepEqual([...nullA.slice(recA + 10)], [0, 0, 0, 0], 'rdata 0.0.0.0');
+
+  const nullAAAA = await blockedWith('null_ip', q6);
+  assert.equal(ancount(nullAAAA), 1);
+  assert.equal(u16(nullAAAA, recAAAA), 28, 'AAAA record');
+  assert.equal(u16(nullAAAA, recAAAA + 8), 16, '16-byte rdata');
+  assert.deepEqual([...nullAAAA.slice(recAAAA + 10)], Array(16).fill(0), 'rdata ::');
+});
+
+test('blockedResponse: saving a new mode changes the answer for an already-cached name', async () => {
+  const d1 = new FakeD1();
+  const env = mkEnv({ d1, kv: new FakeKV() });
+  const q = buildQuery('ads.blocklist.test');
+
+  const first = new Uint8Array(await (await dohGet(env, q)).arrayBuffer());
+  assert.equal(rcode(first), 3, 'default NXDOMAIN');
+
+  const login = await worker.fetch(new Request('https://worker.test/api/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'pw' }),
+  }), env);
+  const cookie = /** @type {string} */ (login.headers.get('set-cookie')).split(';')[0];
+
+  const saved = await worker.fetch(new Request('https://worker.test/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify({ blockedResponse: 'null_ip' }),
+  }), env);
+  assert.equal(saved.status, 200);
+
+  // The first answer is cached for BLOCKED_MAX_AGE; the new mode has to win
+  // anyway (the epoch rotates on the setting, so the cache key does too).
+  const next = new Uint8Array(await (await dohGet(env, q)).arrayBuffer());
+  assert.equal(rcode(next), 0, 'NOERROR after the save');
+  assert.equal(ancount(next), 1);
+  assert.deepEqual([...next.slice(next.length - 4)], [0, 0, 0, 0], 'rdata 0.0.0.0');
+});
+
 test('non-IN qclass: refused before any store access, not logged', async () => {
   const d1 = new FakeD1();
   const env = mkEnv({ d1 });

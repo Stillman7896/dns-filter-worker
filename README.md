@@ -51,6 +51,8 @@ household or a small office.
   private address in an answer (including cloud metadata `169.254.169.254`) is
   dropped before the client sees it.
 - **IDN homograph blocking** for punycode lookalike domains, one toggle.
+- **Choose the blocked answer**: NXDOMAIN, REFUSED, a null IP (`0.0.0.0` / `::`)
+  or NODATA — one setting for every filter, applied without a redeploy.
 - **Response routes**: answer a name yourself — point `nas.home.lan` at a LAN
   address, or alias one name onto another with a CNAME.
 

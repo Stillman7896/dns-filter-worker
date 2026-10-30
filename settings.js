@@ -12,6 +12,9 @@
 export const SETTINGS_KEY = 'settings:main';
 export const CACHE_TTL_MS = 30_000;
 
+/** Every accepted blockedResponse value, in dashboard order. */
+export const BLOCKED_RESPONSE_TYPES = Object.freeze(['nxdomain', 'refused', 'null_ip', 'nodata']);
+
 /** @type {FilterSettings} */
 export const DEFAULT_SETTINGS = Object.freeze({
   rebindProtection: true, // block private/internal IPs in answers + internal hostnames
@@ -26,6 +29,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   upstreamRelay: '',      // relay URI template for an ODoH provider
   upstreamFailover: true, // retry a fallback DoH server when the primary fails
   upstreamFallbackUrl: '', // custom fallback DoH URL; '' = built-in alternate provider
+  blockedResponse: 'nxdomain', // blocked query response type: nxdomain, refused, null_ip, nodata
   // Blocklist subscriptions (see blocklist.js):
   //   null  -> not chosen yet: the single URL from env.BLOCKLIST_URL
   //   []    -> the user deleted every entry: no remote list at all

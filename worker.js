@@ -22,7 +22,7 @@ import { handleApi, isConfigured, safeEqual } from './dashboard.js';
 import {
   Buf,
   parseQuestion,
-  buildNxdomainResponse,
+  buildBlockedResponse,
   buildRefusedResponse,
   buildAnswerResponse,
   minTtl,
@@ -441,6 +441,10 @@ function configEpoch(settings, upstream, fallback) {
     (settings.tldBlock ? 1 : 0) +
     (settings.keywordBlock ? 1 : 0) +
     (settings.regexBlock ? 1 : 0) +
+    // The blocked answer itself is cached, so changing its shape (NXDOMAIN vs
+    // null IP ...) must rotate the epoch — otherwise a cached NXDOMAIN would
+    // keep answering for up to BLOCKED_MAX_AGE after the setting changed.
+    '|br:' + settings.blockedResponse +
     // Changing provider must never serve answers cached from the old one.
     '|' + upstream.kind + '|' + upstream.url + '|' + upstream.relay +
     // Failover changes which server answers, so it rotates the epoch too.
@@ -610,7 +614,7 @@ async function handleQuery(queryBuf, env, ctx, client = null) {
   if (BLOCKED_QUERY_STATUSES.has(verdict.status)) {
     await bg(ctx, logQuery(env, q.name, verdict.status, verdict.filter, q.qtype, retention, client));
     const maxAge = verdict.filter === 'denylist' ? RULE_MAX_AGE : BLOCKED_MAX_AGE;
-    return respond(buildNxdomainResponse(queryBuf), key, maxAge, ctx);
+    return respond(buildBlockedResponse(queryBuf, settings.blockedResponse, q.qtype), key, maxAge, ctx);
   }
 
   // allow | none -> forward upstream
@@ -623,7 +627,7 @@ async function handleQuery(queryBuf, env, ctx, client = null) {
         await bg(ctx, logQuery(env, q.name, 'rebind', 'rebind', q.qtype, retention, client));
         // Every answer can differ here; never cache the verdict (TTL only
         // tells the client not to re-ask before re-resolving).
-        return respond(buildNxdomainResponse(queryBuf), '', RULE_MAX_AGE, ctx);
+        return respond(buildBlockedResponse(queryBuf, settings.blockedResponse, q.qtype), '', RULE_MAX_AGE, ctx);
       }
     }
     if (logPassed) {

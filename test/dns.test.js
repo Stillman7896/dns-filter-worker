@@ -3,9 +3,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   Buf, parseQuestion, buildNxdomainResponse, buildRefusedResponse,
+  buildBlockedResponse, summariseAnswers, RR,
   minTtl, base64urlDecode, ednsDo,
 } from '../dns.js';
 import { buildQuery, buildResponse, v4rdata } from './helpers.js';
+
+/** @param {Uint8Array} buf */
+const rcode = (buf) => buf[3] & 0x0f;
+/** @param {Uint8Array} buf */
+const ancount = (buf) => (buf[6] << 8) | buf[7];
 
 test('Buf: BE accessors and construction', () => {
   const b = Buf.from(new Uint8Array([0x12, 0x34, 0x56, 0x78]));
@@ -123,4 +129,50 @@ test('base64urlDecode: round-trip and garbage handling', () => {
   assert.ok(decoded, 'base64urlDecode returned null');
   assert.deepEqual([...decoded], [...query]);
   assert.equal(base64urlDecode('!!not-base64!!'), null);
+});
+
+test('buildBlockedResponse: default is NXDOMAIN, question echoed intact', () => {
+  const query = buildQuery('ads.blocked');
+  const resp = buildBlockedResponse(query);
+  assert.equal(resp[2] & 0x80, 0x80, 'QR bit');
+  assert.equal(resp[3] & 0x0f, 3, 'NXDOMAIN rcode');
+  assert.equal(ancount(resp), 0);
+  assert.deepEqual([...resp.slice(12, query.length)], [...query.slice(12)], 'question preserved');
+});
+
+test('buildBlockedResponse: refused and nodata shapes', () => {
+  const refused = buildBlockedResponse(buildQuery('x.test'), 'refused');
+  assert.equal(rcode(refused), 5);
+  assert.equal(ancount(refused), 0);
+
+  const nodata = buildBlockedResponse(buildQuery('x.test'), 'nodata');
+  assert.equal(rcode(nodata), 0, 'NODATA is NOERROR');
+  assert.equal(nodata[2] & 0x04, 0x04, 'AA bit set');
+  assert.equal(ancount(nodata), 0);
+
+  assert.equal(buildBlockedResponse(buildQuery('x.test'), 'bogus')[3] & 0x0f, 3, 'unknown type -> NXDOMAIN');
+});
+
+test('buildBlockedResponse: null_ip answers A with 0.0.0.0, AAAA with ::', () => {
+  const a = buildBlockedResponse(buildQuery('null.blocked', { qtype: RR.A }), 'null_ip');
+  assert.equal(a[2] & 0x80, 0x80);
+  assert.equal(ancount(a), 1);
+  const sa = summariseAnswers(a);
+  assert.ok(sa, 'summariseAnswers parsed the null answer');
+  assert.equal(sa.rcode, 0);
+  assert.equal(sa.count, 1);
+  assert.equal(sa.sample, '0.0.0.0');
+
+  const aaaa = buildBlockedResponse(buildQuery('null.blocked', { qtype: RR.AAAA }), 'null_ip');
+  const sa6 = summariseAnswers(aaaa);
+  assert.ok(sa6, 'summariseAnswers parsed the null AAAA answer');
+  assert.equal(sa6.count, 1);
+  assert.equal(sa6.sample, '0:0:0:0:0:0:0:0');
+});
+
+test('buildBlockedResponse: a truncated query degrades to REFUSED instead of a broken answer', () => {
+  const junk = new Uint8Array(5); // no complete header, let alone a question
+  assert.equal(buildBlockedResponse(junk, 'nodata')[3] & 0x0f, 5);
+  assert.equal(buildBlockedResponse(junk, 'null_ip')[3] & 0x0f, 5);
+  assert.equal(buildBlockedResponse(junk, 'refused')[3] & 0x0f, 5);
 });

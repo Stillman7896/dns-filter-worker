@@ -46,6 +46,48 @@ const TOGGLES = [
 const retention = ref(state.settings ? String(state.settings.logRetentionDays) : '30');
 const retentionError = ref('');
 
+// ---- blocked query response --------------------------------------------------
+
+const blockedResponseOptions = [
+  { value: 'nxdomain', label: 'NXDOMAIN — the name does not exist' },
+  { value: 'refused', label: 'REFUSED — this resolver will not answer' },
+  { value: 'null_ip', label: 'Null IP — 0.0.0.0 / ::' },
+  { value: 'nodata', label: 'NODATA — NOERROR, no records' },
+];
+
+const BLOCKED_RESPONSE_HINTS = {
+  nxdomain: 'the client is told the name does not exist. What most ad-blockers do.',
+  refused: 'the client is told this resolver will not answer. Cheap and unambiguous.',
+  null_ip: 'the name answers 0.0.0.0 / ::, so the connection fails at once.',
+  nodata: 'NOERROR with no records: the name exists but has no address of that type.',
+};
+
+const blockedResponse = ref(state.settings?.blockedResponse || 'nxdomain');
+const blockedResponseHint = computed(
+  () => BLOCKED_RESPONSE_HINTS[blockedResponse.value] || BLOCKED_RESPONSE_HINTS.nxdomain,
+);
+const blockedResponseDirty = computed(
+  () => blockedResponse.value !== (state.settings?.blockedResponse || 'nxdomain'),
+);
+
+async function saveBlockedResponse() {
+  const value = blockedResponse.value;
+  const previous = state.settings.blockedResponse;
+  if (value === previous) return;
+  state.settings.blockedResponse = value; // optimistic; reverted if the worker refuses
+  try {
+    const r = await runOp('set.blockedResponse', {
+      verb: 'Save settings',
+      ok: `Blocked queries now answer ${value}`,
+      fn: () => api.saveSettings({ blockedResponse: value }),
+    });
+    blockedResponse.value = r.settings.blockedResponse || value;
+  } catch {
+    state.settings.blockedResponse = previous;
+    blockedResponse.value = previous;
+  }
+}
+
 const ready = computed(() => Boolean(state.settings));
 const retentionValid = computed(() => Number.isInteger(Number(retention.value)) && Number(retention.value) >= 0 && Number(retention.value) <= 3650);
 
@@ -634,6 +676,37 @@ async function removeRoute(route) {
             </div>
           </template>
         </div>
+      </section>
+
+      <!-- Blocked queries -->
+      <section class="panel px-5 py-4">
+        <h2 class="text-[15px] font-medium">Blocked queries</h2>
+        <p class="hint mt-1">What this resolver sends back for a name that a filter stopped.</p>
+
+        <div class="mt-4 flex flex-wrap items-end gap-3">
+          <label class="flex flex-col gap-1.5 min-w-0">
+            <span class="label">Response</span>
+            <select
+              v-model="blockedResponse"
+              class="field w-full sm:w-80"
+              aria-describedby="blocked-response-hint"
+            >
+              <option v-for="o in blockedResponseOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
+            </select>
+          </label>
+          <AppButton
+            variant="solid"
+            busy-key="set.blockedResponse"
+            :disabled="!blockedResponseDirty"
+            @click="saveBlockedResponse"
+          >
+            Save response
+          </AppButton>
+        </div>
+
+        <p id="blocked-response-hint" class="hint mt-2.5" aria-live="polite">
+          {{ blockedResponseHint }} Routes are unaffected — they always answer with their own record.
+        </p>
       </section>
 
       <!-- Query log -->

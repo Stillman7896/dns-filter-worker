@@ -70,6 +70,7 @@ and is shared across every colo.
 | `upstreamRelay` | `''` | `settings:main` |
 | `upstreamFailover` | `true` | `settings:main` |
 | `upstreamFallbackUrl` | `''` | `settings:main` |
+| `blockedResponse` | `'nxdomain'` | `settings:main` |
 
 **Propagation:** each isolate caches settings for 30 s and reads are zero-I/O on
 the DNS hot path — after the first load, a query never touches KV for settings.
@@ -92,6 +93,25 @@ Blunt "block everything" mode: any label starting with `xn--`, or any label
 containing non-ASCII bytes (raw UTF-8 from non-compliant clients) is blocked.
 A one-bit toggle — there is no partial/smart mode.
 
+### Blocked query response (`blockedResponse`, default `nxdomain`)
+
+What the resolver sends back for a name that a filter stopped — the answer is
+synthesized locally, no upstream is contacted:
+
+| Value | Wire answer | Notes |
+|---|---|---|
+| `nxdomain` | RCODE 3, no records | The default; what most ad-blockers do. |
+| `refused` | RCODE 5, no records | Cheap and unambiguous; some clients retry elsewhere. |
+| `null_ip` | RCODE 0 with `0.0.0.0` (A) or `::` (AAAA), TTL 300 | The connection fails at once. The record family follows the query, so an AAAA query never gets an A record. |
+| `nodata` | RCODE 0, no records | The name "exists" without a record of that type. |
+
+It applies to every block layer — blocklist, deny rules, blocked TLDs,
+keywords, regex, IDN and rebinding — plus the non-`IN` class reject. It does
+**not** apply to routes: a response route always answers with its own record,
+and an upstream failure still answers SERVFAIL. The chosen value is part of the
+answer-cache key, so switching it takes effect on the next query rather than
+after `BLOCKED_MAX_AGE` (300 s) expires.
+
 ## Endpoints
 
 | Path | Description |
@@ -102,7 +122,7 @@ A one-bit toggle — there is no partial/smart mode.
 | `/api/rules` | List / add (POST `{domain,kind}`) / delete |
 | `/api/rules/bulk` | Bulk import `{kind, domains}` |
 | `/api/test` | Run full pipeline for a domain (mirrors live filtering) |
-| `/api/settings` | Get (GET: settings + resolved provider + preset list + `blocklist` payload) / save (POST `{rebindProtection, idnBlock, tldBlock, keywordBlock, regexBlock, blocklistUrls, logPassed, logRetentionDays, upstreamPreset, upstreamUrl, upstreamRelay}`) |
+| `/api/settings` | Get (GET: settings + resolved provider + preset list + `blocklist` payload) / save (POST `{rebindProtection, idnBlock, tldBlock, keywordBlock, regexBlock, blocklistUrls, logPassed, logRetentionDays, upstreamPreset, upstreamUrl, upstreamRelay, upstreamFailover, upstreamFallbackUrl, blockedResponse}`) |
 | `/api/blocklists` | List (GET: subscriptions + `total`/`entryLimit`/`maxUrls`) / add (POST `{url}`) / remove (DELETE `?url=`) |
 | `/api/blocklists/refresh` | Revalidate every subscription against its origin (POST) |
 | `/api/routes` | List / add (POST `{domain,value,ttl?}`) / delete (`?domain=`) |

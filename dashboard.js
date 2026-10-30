@@ -16,7 +16,7 @@ import {
   MAX_BLOCKLIST_URLS,
   BLOCKLIST_ENTRY_LIMIT,
 } from './blocklist.js';
-import { clampRetention, DEFAULT_SETTINGS } from './settings.js';
+import { clampRetention, DEFAULT_SETTINGS, BLOCKED_RESPONSE_TYPES } from './settings.js';
 import {
   UPSTREAM_PRESETS,
   findPreset,
@@ -173,6 +173,15 @@ function settingsPatch(source, current = {}) {
       return { error: `blocklist URLs must be unique https:// links (max ${MAX_BLOCKLIST_URLS})` };
     }
     patch.blocklistUrls = urls === null ? null : clean;
+  }
+
+  if ('blockedResponse' in source) {
+    const val = source.blockedResponse;
+    if (typeof val === 'string' && BLOCKED_RESPONSE_TYPES.includes(val)) {
+      patch.blockedResponse = /** @type {BlockedResponseType} */ (val);
+    } else {
+      return { error: `blockedResponse must be one of ${BLOCKED_RESPONSE_TYPES.join(', ')}` };
+    }
   }
 
   const upstream = upstreamPatch(source);

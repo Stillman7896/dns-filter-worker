@@ -53,6 +53,9 @@ interface Env {
   DASHBOARD_PASSWORD?: string;
 }
 
+/** How a blocked query is answered (see buildBlockedResponse in dns.js). */
+type BlockedResponseType = 'nxdomain' | 'refused' | 'null_ip' | 'nodata';
+
 /** Persistent filter settings blob (stored as settings:main KV JSON). */
 interface FilterSettings {
   rebindProtection: boolean;
@@ -72,6 +75,8 @@ interface FilterSettings {
   upstreamFailover: boolean;
   /** Custom fallback DoH URL; '' uses a built-in alternate provider. */
   upstreamFallbackUrl: string;
+  /** What a blocked query answers with: 'nxdomain' | 'refused' | 'null_ip' | 'nodata'. */
+  blockedResponse: BlockedResponseType;
   /**
    * Subscribed blocklist URLs. null = not chosen yet (the BLOCKLIST_URL
    * variable decides), [] = every remote list was deleted, [urls] = the list

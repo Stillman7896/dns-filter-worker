@@ -3,6 +3,16 @@
 Notable changes, newest first. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- **Blocked query response** setting (`blockedResponse`): pick what a stopped
+  name answers with — `nxdomain` (default), `refused`, `null_ip`
+  (`0.0.0.0` / `::`) or `nodata` — from Settings in the dashboard. It covers
+  every block layer and the non-`IN` class reject, leaves response routes alone,
+  and is part of the answer-cache key so a change takes effect on the next query.
+
 ## 2.0.0 — 2026-10-25
 
 The community release. Renamed from `dns-filter-worker` to **Sinkker** and
