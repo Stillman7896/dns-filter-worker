@@ -304,6 +304,68 @@ test('settings: an unusable provider combination is refused, not saved', async (
   assert.equal((await customOk.json()).upstream.url, 'https://doh.internal/dns-query');
 });
 
+test('settings: saving one field on a cold isolate keeps every other stored value', async () => {
+  // The isolate that handles the save has not read settings yet, so its cache
+  // holds DEFAULT_SETTINGS. Merging a patch into that cache would persist the
+  // defaults and silently reset every other toggle.
+  const stored = {
+    rebindProtection: false,
+    idnBlock: true,
+    logPassed: false,
+    logRetentionDays: 7,
+    blockedResponse: 'null_ip',
+    upstreamPreset: 'google',
+  };
+  const kv = new FakeKV({ 'settings:main': JSON.stringify(stored) });
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  const saved = await call(ctx, env, '/api/settings', {
+    method: 'POST',
+    cookie,
+    body: { upstreamPreset: 'custom', upstreamUrl: 'https://doh.example.net/dns-query' },
+  });
+  assert.equal(saved.status, 200);
+
+  const s = (await saved.json()).settings;
+  assert.equal(s.upstreamPreset, 'custom');
+  assert.equal(s.upstreamUrl, 'https://doh.example.net/dns-query');
+  for (const [key, value] of Object.entries(stored)) {
+    if (key === 'upstreamPreset') continue;
+    assert.deepEqual(s[key], value, `${key} survives a partial save (response)`);
+  }
+
+  // What KV holds is what the next isolate will serve — the response alone
+  // proving nothing if the write went out with defaults.
+  const blob = JSON.parse(kv.data.get('settings:main') ?? '{}');
+  for (const [key, value] of Object.entries(stored)) {
+    if (key === 'upstreamPreset') continue;
+    assert.deepEqual(blob[key], value, `${key} survives a partial save (stored)`);
+  }
+  assert.equal(blob.upstreamPreset, 'custom');
+});
+
+test('settings: a save is refused, KV untouched, when the blob cannot be read', async () => {
+  const kv = new FakeKV({ 'settings:main': JSON.stringify({ idnBlock: true }) });
+  const ctx = mkCtx(kv);
+  const env = { DASHBOARD_PASSWORD: PASSWORD };
+  const cookie = cookieFrom(await call(ctx, env, '/api/session', {
+    method: 'POST', body: { password: PASSWORD },
+  }));
+
+  kv.fail.get = true;
+  const res = await call(ctx, env, '/api/settings', {
+    method: 'POST', cookie, body: { idnBlock: false },
+  });
+  assert.equal(res.status, 503);
+  assert.match((await res.json()).error, /nothing was saved/);
+  assert.equal(kv.stats.puts, 0, 'no write at all');
+  assert.equal(JSON.parse(kv.data.get('settings:main') ?? '{}').idnBlock, true, 'stored blob intact');
+});
+
 test('settings: GET defaults, POST patch incl. retention validation', async () => {
   const kv = new FakeKV();
   const ctx = mkCtx(kv);

@@ -374,13 +374,21 @@ export async function handleApi(request, env, url, ctx) {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'bad json' }, { status: 400 }); }
 
+      // Validate against what is actually stored, not this isolate's cache: a
+      // cold isolate holds DEFAULT_SETTINGS and update() merges into whatever
+      // it was validated against. One read, reused by update()'s TTL stamp.
+      await settings.refresh(true);
       const { patch, error } = settingsPatch(body, settings.get());
       if (error) return json({ error }, { status: 400 });
       if (!patch || Object.keys(patch).length === 0) {
         return json({ error: 'no valid settings provided' }, { status: 400 });
       }
 
-      await settings.update(patch);
+      try {
+        await settings.update(patch);
+      } catch {
+        return json({ error: 'settings could not be read from KV — nothing was saved' }, { status: 503 });
+      }
       return json({
         ok: true,
         settings: settings.get(),
@@ -423,6 +431,9 @@ export async function handleApi(request, env, url, ctx) {
   // ---- blocklist subscriptions: several remote lists, merged in memory ----
   if (path === '/api/blocklists' || path === '/api/blocklists/refresh') {
     if (!settings) return json({ error: 'settings not available' }, { status: 501 });
+    // The subscription list lives in settings; read KV before deriving it so a
+    // cold isolate doesn't answer (or save) from DEFAULT_SETTINGS.
+    await settings.refresh();
 
     if (request.method === 'GET') {
       await warmBlocklists(env, ctx);
@@ -554,10 +565,16 @@ export async function handleApi(request, env, url, ctx) {
     }
 
     if (body.settings && typeof body.settings === 'object') {
+      // Same rule as POST /api/settings: validate and merge against stored values.
+      await settings.refresh(true);
       const { patch, error } = settingsPatch(body.settings, settings.get());
       if (error) return json({ error }, { status: 400 });
       if (patch && Object.keys(patch).length) {
-        await settings.update(patch);
+        try {
+          await settings.update(patch);
+        } catch {
+          return json({ error: 'settings could not be read from KV — nothing was saved' }, { status: 503 });
+        }
         summary.settings = true;
       }
     }

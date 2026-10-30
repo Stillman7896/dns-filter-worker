@@ -53,7 +53,12 @@ export class SettingsStore {
     this.cache = { ...DEFAULT_SETTINGS };
     this.loaded = false;
     this.cachedAt = 0;
+    /** @type {Promise<boolean>|null} */
     this.loading = null;
+    // True only while the cache is backed by a *successful* read. `update()`
+    // gates on it: merging into a cache that was never read (a cold isolate
+    // holds DEFAULT_SETTINGS) would persist those defaults over real settings.
+    this.lastOk = false;
   }
 
   /**
@@ -66,6 +71,7 @@ export class SettingsStore {
     this.cache = { ...DEFAULT_SETTINGS };
     this.loaded = false;
     this.cachedAt = 0;
+    this.lastOk = false;
     // A load still in flight belongs to the PREVIOUS binding: let it settle on
     // its own (drop the promise reference), refresh() below will start fresh.
     this.loading = null;
@@ -74,18 +80,22 @@ export class SettingsStore {
   /**
    * Ensure settings are loaded. Cheap no-op while cached (no I/O on the
    * DNS hot path). force=true bypasses the TTL cache.
+   * @param {boolean} [force]
+   * @returns {Promise<boolean>} true if the cache is backed by a successful
+   *   read (now or within the TTL), false if the read failed — callers that
+   *   write must treat false as "cache is not trustworthy".
    */
   async refresh(force = false) {
     const now = Date.now();
     // Guard on cachedAt (not `loaded`) so a failed load throttles retries too.
-    if (this.cachedAt && !force && now - this.cachedAt < CACHE_TTL_MS) return;
+    if (this.cachedAt && !force && now - this.cachedAt < CACHE_TTL_MS) return this.lastOk;
 
     if (!this.loading) {
       const kv = this.kv; // snapshot: a bind() mid-load must not receive these results
       this.loading = (async () => {
         try {
           const raw = await kv.get(SETTINGS_KEY, 'text');
-          if (this.kv !== kv) return; // binding changed: a newer refresh owns the cache
+          if (this.kv !== kv) return false; // binding changed: a newer refresh owns the cache
           if (raw) {
             let parsed = {};
             try { parsed = JSON.parse(raw); } catch { /* fall back to defaults */ }
@@ -95,18 +105,22 @@ export class SettingsStore {
             this.cache = { ...DEFAULT_SETTINGS };
           }
           this.loaded = true;
+          this.lastOk = true;
+          return true;
         } catch {
           // Read FAILED -> keep whatever we already have; only fall back to
           // defaults on a cold start. Otherwise a transient error would
           // silently reset a user's toggles (e.g. turn idnBlock off).
           if (!this.loaded) this.cache = { ...DEFAULT_SETTINGS };
+          this.lastOk = false;
+          return false;
         } finally {
           if (this.kv === kv) this.cachedAt = Date.now(); // only stamp our own binding
           this.loading = null;
         }
       })();
     }
-    await this.loading;
+    return (await this.loading) === true;
   }
 
   /** Zero-IO sync read (call refresh() first). */
@@ -114,13 +128,28 @@ export class SettingsStore {
     return this.cache;
   }
 
-  /** Persist a partial update; applies immediately in this isolate. */
-  /** @param {Partial<FilterSettings>} patch */
+  /**
+   * Persist a partial update; applies immediately in this isolate.
+   *
+   * The write is a read-modify-write, so it must start from settings that were
+   * actually read: the cache of a fresh isolate is DEFAULT_SETTINGS, and every
+   * other store in this codebase force-refreshes before saving for the same
+   * reason. Without the refresh, saving one field (e.g. an upstream URL) would
+   * write defaults over the whole blob and silently reset every other toggle.
+   * A failed read aborts the write instead of clobbering the stored settings.
+   * @param {Partial<FilterSettings>} patch
+   */
   async update(patch) {
+    // A write is a read-modify-write, so it insists on a cache backed by a real
+    // read: lastOk=false means the cache is either a cold isolate's defaults or
+    // stale after a failed read. Retry once, ignoring the failure throttle.
+    const trusted = this.lastOk || (await this.refresh(true));
+    if (!trusted) throw new Error('settings could not be read');
     const next = { ...this.get(), ...patch };
     await this.kv.put(SETTINGS_KEY, JSON.stringify(next));
     this.cache = next;
     this.cachedAt = Date.now();
     this.loaded = true;
+    this.lastOk = true;
   }
 }

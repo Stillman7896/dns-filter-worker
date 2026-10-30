@@ -322,6 +322,26 @@ test('SettingsStore: cold read failure -> defaults; warm failure -> keep current
   assert.equal(cold.get().idnBlock, true, 'transient error must not reset toggles');
 });
 
+test('SettingsStore: update() reads first, so a cold cache never overwrites', async () => {
+  const kv = new FakeKV({ 'settings:main': JSON.stringify({ idnBlock: true, logRetentionDays: 7 }) });
+  const ss = new SettingsStore(kv); // cold: nothing loaded yet
+  await ss.update({ logPassed: false });
+
+  const blob = JSON.parse(kv.data.get('settings:main') ?? '{}');
+  assert.equal(blob.idnBlock, true, 'untouched toggle survives');
+  assert.equal(blob.logRetentionDays, 7, 'untouched value survives');
+  assert.equal(blob.logPassed, false, 'patched value written');
+
+  // A failed read must abort the write instead of persisting defaults.
+  const kv2 = new FakeKV({ 'settings:main': JSON.stringify({ idnBlock: true }) });
+  const cold = new SettingsStore(kv2);
+  kv2.fail.get = true;
+  assert.equal(await cold.refresh(true), false, 'failed read reports an untrusted cache');
+  await assert.rejects(() => cold.update({ idnBlock: false }), /could not be read/);
+  assert.equal(kv2.stats.puts, 0, 'no write at all');
+  assert.equal(JSON.parse(kv2.data.get('settings:main') ?? '{}').idnBlock, true);
+});
+
 test('clampRetention: bounds and type checks', () => {
   assert.equal(clampRetention(0), 0);
   assert.equal(clampRetention(30), 30);

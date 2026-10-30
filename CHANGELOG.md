@@ -13,6 +13,16 @@ versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every block layer and the non-`IN` class reject, leaves response routes alone,
   and is part of the answer-cache key so a change takes effect on the next query.
 
+### Fixed
+
+- **Saving one setting no longer resets the rest.** `POST /api/settings` and
+  config import merged the patch into the isolate's in-memory cache without
+  reading KV first, so a save that landed on a freshly started isolate — any
+  upstream/DoH change or toggle flip — wrote `DEFAULT_SETTINGS` over every other
+  stored value. The write path now reads before merging, and refuses to save
+  (503) instead of overwriting settings it could not read. `SettingsStore.update()`
+  refuses too, so no caller can reintroduce it.
+
 ## 2.0.0 — 2026-10-25
 
 The community release. Renamed from `dns-filter-worker` to **Sinkker** and
