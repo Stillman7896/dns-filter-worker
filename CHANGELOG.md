@@ -5,6 +5,8 @@ versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 2.1.0 — 2026-10-30
+
 ### Added
 
 - **Blocked query response** setting (`blockedResponse`): pick what a stopped

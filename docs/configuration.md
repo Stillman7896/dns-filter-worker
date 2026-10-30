@@ -77,6 +77,12 @@ the DNS hot path — after the first load, a query never touches KV for settings
 A save updates the writing isolate immediately; other isolates pick it up within
 ~30 s.
 
+**Saving** is a merge: the dashboard sends only the fields it changed and the
+Worker reads `settings:main`, applies the patch and writes the blob back, so
+changing the upstream URL never touches the filter switches. Because that write
+is a read-modify-write, it is refused with `503` ("nothing was saved") when the
+stored blob cannot be read — overwriting it with defaults would be worse.
+
 ### DNS rebinding protection (`rebindProtection`, default ON)
 
 - **Name level**: blocks `localhost`, `*.local`, `*.lan`, `*.home`, `*.internal`,
